@@ -1,0 +1,3659 @@
+#!/usr/bin/ucode -S
+// aeolus-agent: the Aeolus agent on an OpenWrt AP (0040).
+//
+// It enrolls, polls for its config, renders it into UCI, has the manager
+// check that, applies it with an automatic revert, and reports what it did
+// and how it is. procd runs it (/etc/init.d/aeolus) and restarts it.
+//
+//	aeolus-agent          run
+//	aeolus-agent facts    print what it would enroll with
+//	aeolus-agent ping     check it can reach the manager
+
+'use strict';
+
+import * as fs from 'fs';
+import * as uloop from 'uloop';
+import * as math from 'math';
+import { sha256, sha256_file } from 'digest';
+import { openlog, syslog, LOG_PID, LOG_DAEMON, LOG_INFO, LOG_WARNING, LOG_ERR } from 'log';
+import { cursor } from 'uci';
+import { connect } from 'ubus';
+import { render, clamp, PACKAGES, CLAMP, VLAN_END, FT_DIR, iface_name, without_keys } from 'aeolus.render';
+import { text, file } from 'aeolus.uciexport';
+import * as uplinks from 'aeolus.uplink';   // not uplink: a local of that name would hide it
+import * as pcap from 'aeolus.pcap';
+import * as own_nets from 'aeolus.others';   // the AP's own Wi-Fi networks, not Aeolus's (0137)
+import * as btad from 'aeolus.btad';   // what the AP's Bluetooth radio hears (0157)
+import * as sshkeys from 'aeolus.sshkeys';   // the SSH keys Aeolus puts on the AP (0197)
+import * as sentoff from 'aeolus.sentoff';   // what Aeolus sent a client off for (0255)
+import * as wifinames from 'aeolus.wifinames';   // netifd's Wi-Fi status through a radio being set up again (0301)
+import * as trust from 'aeolus.trust';   // what airscan is to trust (0304)
+import * as livewatch from 'aeolus.livewatch';   // the live daemon's minutes, watched (0307)
+import * as fwcrash from 'aeolus.fwcrash';
+import * as mixedlibs from 'aeolus.mixedlibs';   // two builds of a library in one process (0317)   // a radio's firmware that crashed (0310)
+
+// uclient is how the agent reaches its manager. A sysupgrade onto an image
+// without it keeps the agent's files and not the module (0080): loaded here
+// rather than imported, its absence keeps the agent from the manager and no
+// more, and the agent stays up to put it back (stranded, below). One
+// installed for another ucode than the image's does not load (2026-10-24:
+// OpenWrt's snapshot build on a port image of an older ucode): why is kept,
+// and what came back is tested, not only whether loading it threw.
+let uclient = null, uclient_why = null;
+try {
+	uclient = require('uclient');
+	if (!uclient?.new) {
+		uclient = null;
+		uclient_why = 'it loads as nothing';
+	}
+} catch (e) {
+	uclient_why = e?.message ?? ('' + e);
+}
+
+const AGENT = 'aeolus-agent/1';
+const DIR = '/etc/aeolus';
+const TOKEN = DIR + '/token';
+const CERT = DIR + '/manager.crt';
+const RUNNING = DIR + '/version';
+const PENDING = DIR + '/pending';
+const BACKUP = DIR + '/backup';
+const CONFIRM = 90;        // seconds to reach the manager again after an apply
+const WIFI_WAIT = 150;     // seconds for the Wi-Fi to come back after an apply, a radar check included
+const STATE_EVERY = 300;   // seconds between state reports
+const COLLECT_EVERY = 60;  // seconds between two runs of the garbage collector, at the least
+const PROBES = '/var/run/aeolus/probes.json';   // what the prober found (0059)
+const PROBES_STALE = 60;   // seconds after which the prober's results are too old to report
+const CONNECTIONS = '/var/run/aeolus/connections.json';   // each client's attempt to come online, as aeolus-journey records it (0118)
+const TRACE = '/var/run/aeolus/trace.json';         // the clients the manager says to trace, for aeolus-journey (0144)
+const CAPTURES = '/var/run/aeolus/captures';              // a capture of each attempt that failed, a file each, as aeolus-journey keeps them (0135)
+const REMOVED = '/etc/aeolus/removed';   // each of the AP's own networks taken out at Aeolus's asking, as it was, a file each (0137)
+const PACKAGES_TOOL = '/usr/libexec/aeolus-packages';   // its packages, through the manager (0069)
+const PACKAGES_DONE = '/usr/lib/aeolus/packages';      // gone after a sysupgrade, until they are back
+const RESTORE_EVERY = 3600;   // seconds between tries to install them again
+const STRANDED_FIRST = 60;    // seconds before the first try to install uclient again, where the agent has started without it
+const GI_TOOL = '/usr/libexec/aeolus-gi';   // the 802.11ax guard interval, which OpenWrt has no option for (0089)
+const POWER_TOOL = '/usr/libexec/aeolus-power';   // the transmit power Aeolus sets, held live (0349)
+const WIRE_LIB = '/usr/share/ucode/aeolus/wiretest.uc';   // with it, the client test can be made over the wire (0128)
+const TIME = '/var/run/aeolus/time.json';   // ntpd's word on the clock, from its hotplug (0069)
+const KEYS_VERSION = DIR + '/keys.version';  // the per-user keys the AP has (0070)
+const RRM_KEY = DIR + '/rrm.key';   // the key radio neighbours sign their hellos with (0073)
+const AUTH_KEYS = '/etc/dropbear/authorized_keys';   // whom dropbear lets in as root (0197)
+const SSH_KEPT = DIR + '/ssh_keys';   // the keys in it that are Aeolus's, as JSON (0197)
+const RRM = '/var/run/aeolus/rrm.json';   // what radio resource management found (0073)
+const STEER = '/var/run/aeolus/steer.json';   // what the steering daemon asked of clients, and what came of it (0138)
+const POLL_NOW = '/var/run/aeolus/poll';      // there when aeolus-live has heard, on the AP's line, that something waits for it (0145, 0148)
+const RINGS = '/var/run/aeolus/rings';        // whether aeolus-journey reads hostapd's rings (0146): 'read', 'restart' where hostapd must start anew to have them, or 'none'
+const STEER_STALE = 60;                       // seconds after which that is old: the daemon writes at every look, five seconds apart
+const FWCRASH = '/var/run/aeolus/fwcrash.json';   // what the kernel's log said of firmware crashes, kept past its ring (0310)
+const BLE = '/var/run/aeolus/ble.json';       // how the lending of the Bluetooth radio to Home Assistant does (0156)
+const BLE_STALE = 30;                         // seconds after which that is old: the daemon writes every second
+const AIRSCAN_CLIENTS = '/tmp/airscan/clients.json';   // the clients the scan radio hears, each with the BSSID it talks through (airscan, 0160)
+const BLE_DEVICES = '/var/run/aeolus/ble-devices.json';   // the devices that daemon hears (0157), written every ten seconds
+const KEYS_WAIT = 40;      // seconds the manager may hold a request for keys
+// Fleet updates (0079): the agent updates itself from the manager.
+const AGENT_JSON = DIR + '/agent.json';       // the bundle this AP last confirmed it runs
+const AGENT_TRIAL = DIR + '/agent.trial';     // an update on trial: hash= and version= lines
+const AGENT_PREV = DIR + '/agent.prev';       // the files the last update replaced
+const AGENT_RESULT = DIR + '/agent.result';   // the last update that failed or was rolled back
+const AGENT_STAGE = '/tmp/aeolus-agent.new';  // where an update is fetched and checked
+const ROLLBACK = '/usr/libexec/aeolus-rollback';
+const ROLLBACK_COPY = '/tmp/aeolus-rollback.sh';
+const TRIAL_FOR = 300;     // seconds a new agent has to confirm itself, an apply's Wi-Fi wait included
+const CONFIRM_AFTER = 30;  // seconds a new agent runs before it confirms itself
+const RETRY_AFTER = 3600;  // seconds before a bundle that failed is tried again
+
+let bus = connect();
+let wifi_names = wifinames.keeper();   // what netifd's Wi-Fi status last said of each radio it is not setting up (0301)
+
+// The log goes to syslog as "aeolus": what happens at info, a held config at
+// warning, and what went wrong at error. logread -e aeolus shows it.
+openlog('aeolus', LOG_PID, LOG_DAEMON);
+
+function log(fmt, ...args) {
+	syslog(LOG_INFO, fmt, ...args);
+}
+
+function note(fmt, ...args) {
+	syslog(LOG_WARNING, fmt, ...args);
+}
+
+function fail(fmt, ...args) {
+	syslog(LOG_ERR, fmt, ...args);
+}
+
+function read(path) {
+	let v = fs.readfile(path);
+	return v == null ? null : trim(v);
+}
+
+// mono is steady time in seconds, which the calendar's setting does not
+// move: what a wait is timed by. A C-360 has no clock that keeps time
+// while it is off, and NTP sets its clock forward some while after it
+// starts; a wait timed by the calendar then ended at once, and an apply
+// made at start was reverted though the manager answered (2026-10-15).
+function mono() {
+	let c = clock(true);
+	return c[0] + c[1] / 1e9;
+}
+
+// collect runs the garbage collector, where a minute has gone since it last
+// ran. ucode -S runs with it off, and what refers to itself, as a function
+// kept in what it makes does, would never be freed. It is called only at the
+// top of the agent's loops, where nothing is half made, and never started
+// with gc('start'): started, it may run inside a function filter() or map()
+// calls and free the array being made, which then comes back null (airscan,
+// 2026-10-16). A timer of its own would not do: each request runs uloop
+// within it, wherever the request is made from.
+let collected = 0;
+function collect() {
+	let t = mono();
+	if (t - collected < COLLECT_EVERY)
+		return;
+	collected = t;
+	gc('collect');
+}
+
+// store writes a file whole, through a temporary one, so it is never half
+// written. mode is set before it takes the file's place.
+function store(path, data, mode) {
+	let tmp = path + '.new';
+	if (fs.writefile(tmp, data) == null)
+		return false;
+	if (mode != null)
+		fs.chmod(tmp, mode);
+	return fs.rename(tmp, path);
+}
+
+function run(cmd) {
+	let p = fs.popen(cmd, 'r');
+	if (!p)
+		return '';
+	let out = p.read('all') ?? '';
+	p.close();
+	return trim(out);
+}
+
+function settings() {
+	let a = cursor().get_all('aeolus', 'agent') ?? {};
+	return { url: rtrim(a.url ?? '', '/'), uplink: a.uplink, poll: int(a.poll ?? '60') || 60 };
+}
+
+// http makes one request to the manager, trusting only its pinned
+// certificate (0033).
+function http(method, path, body, token, extra, timeout) {
+	let base = settings().url;
+	if (!base)
+		return { status: 0, error: 'no manager URL (aeolus.agent.url)' };
+	if (!uclient)
+		return { status: 0, error: 'ucode-mod-uclient is not installed' };
+	let res = { status: 0, body: '' };
+	let uc;
+	uc = uclient.new(base + path, null, {
+		header_done: function() {
+			res.status = uc.status().status;
+			res.headers = uc.get_headers() ?? {};
+		},
+		data_read: function() {
+			let chunk;
+			while (length(chunk = uc.read() ?? ''))
+				res.body += chunk;
+		},
+		data_eof: function() {
+			uloop.end();
+		},
+		error: function(cb, code) {
+			res.error = 'connection error ' + code;
+			uloop.end();
+		},
+	});
+	if (!uc)
+		return { status: 0, error: 'bad manager URL' };
+	if (!uc.ssl_init({ ca_files: [CERT], verify: true })) {
+		uc.free();
+		return { status: 0, error: 'cannot set up TLS' };
+	}
+	uc.set_timeout(timeout ?? 20000);
+	if (!uc.connect()) {
+		uc.free();
+		return { status: 0, error: 'cannot connect to ' + base };
+	}
+	let headers = { 'User-Agent': AGENT, ...(extra ?? {}) };
+	if (token)
+		headers['Authorization'] = 'Bearer ' + token;
+	let args = { headers: headers };
+	if (body != null) {
+		headers['Content-Type'] = 'application/json';
+		args.post_data = sprintf('%J', body);
+	}
+	if (!uc.request(method, args)) {
+		uc.free();
+		return { status: 0, error: 'cannot send the request' };
+	}
+	uloop.run();
+	uc.disconnect();
+	uc.free();
+	if (length(res.body)) {
+		try {
+			res.json = json(res.body);
+		}
+		catch (e) {}
+	}
+	return res;
+}
+
+function describe(r) {
+	return r.error ?? sprintf('HTTP %d %s', r.status, r.json?.error ?? '');
+}
+
+// mgmt is the status of the interface with the AP's default route. An
+// interface whose routes go in a table of their own, such as the one tunnels
+// start from on a VLAN (0063), has a default route only there, and is not it.
+function mgmt() {
+	for (let i in bus.call('network.interface', 'dump')?.interface ?? [])
+		if (!i.ip4table)
+			for (let r in i.route ?? [])
+				if (r.target == '0.0.0.0' && r.mask == 0)
+					return i;
+	return null;
+}
+
+// mgmt_device is the device that holds the default route: the one the AP
+// reaches the manager through, and the MAC the DHCP server sees (0040).
+function mgmt_device() {
+	return mgmt()?.l3_device ?? 'br-lan';
+}
+
+// mgmt_interface is the interface that holds the default route, as netifd
+// names it ("lan"): the tunnels' underlay (0054).
+function mgmt_interface() {
+	return mgmt()?.interface;
+}
+
+// has_vxlan and has_nft_bridge say whether the packages VXLAN tunnels need
+// are installed (0054). The agent never installs them itself. A stock netifd
+// loads its protocols only when it starts, so vxlan counts only once netifd
+// knows it: after the network was restarted since it was installed (0057),
+// or reloaded, where netifd reads new ones then (port 0063, 0269).
+function has_vxlan() {
+	return !!fs.stat('/lib/netifd/proto/vxlan.sh');
+}
+
+function vxlan_loaded() {
+	return bus.call('network', 'get_proto_handlers')?.vxlan != null;
+}
+
+// has_bss_transition says whether hostapd has 802.11v (0057). A running BSS's
+// ubus object offers bss_transition_request only then; wpad-basic has none.
+// With no BSS running, it is not known: null.
+function has_bss_transition() {
+	let bss = filter(bus.list() ?? [], o => match(o, /^hostapd\.phy/))[0];
+	let methods = bss ? bus.list(bss)?.[0] : null;
+	return methods ? 'bss_transition_request' in methods : null;
+}
+
+// installed says whether an OpenWrt package is installed: by apk, or by
+// opkg before OpenWrt 25.12 (0083). pkg is one of the agent's own names.
+function installed(pkg) {
+	return system(`{ apk info -e ${pkg} || opkg status ${pkg} | grep -q '^Status:.* installed'; } >/dev/null 2>&1`) == 0;
+}
+
+function has_nft_bridge() {
+	return installed('kmod-nft-bridge');
+}
+
+// has_prober says whether the prober can run: it needs ucode's socket
+// module (0059), which the installer adds.
+function has_prober() {
+	return !!fs.stat('/usr/lib/ucode/socket.so');
+}
+
+// has_veth says whether kmod-veth is installed, which a network with a
+// fallback needs for a VLAN transport (0061).
+function has_veth() {
+	return installed('kmod-veth');
+}
+
+// has_eap says whether hostapd can do 802.1X, which WPA Enterprise needs
+// (0098): OpenWrt's hostapd says what it was built with by -v<feature>.
+function has_eap() {
+	return system('/usr/sbin/hostapd -veap >/dev/null 2>&1') == 0;
+}
+
+// has_ustp says whether ustp, the RSTP daemon, is installed, which spanning
+// tree needs (0095).
+function has_ustp() {
+	return !!fs.stat('/sbin/ustpd');
+}
+
+// has_udebug says whether hostapd's rings can be handed out and read here:
+// the service that hands them out, and ucode's reader of them, which a
+// capture of a failed attempt takes its radio's frames from (0146).
+function has_udebug() {
+	return !!fs.stat('/usr/sbin/udebugd') && !!fs.stat('/usr/lib/ucode/udebug.so');
+}
+
+// has_tcpdump says whether tcpdump is here, which a capture someone starts
+// is taken with (0148): installed ahead, so that the first is not kept
+// waiting for it.
+function has_tcpdump() {
+	return !!fs.stat('/usr/bin/tcpdump') || !!fs.stat('/usr/sbin/tcpdump');
+}
+
+// nap sleeps for so many ms, and no longer than until aeolus-live says that
+// something waits for this AP (0145): an action someone asked for, which is
+// then fetched at once and not at the next poll. It says whether it was so
+// woken.
+function nap(ms) {
+	for (let left = ms; left > 0; left -= 100) {
+		if (fs.access(POLL_NOW)) {
+			fs.unlink(POLL_NOW);
+			return true;
+		}
+		sleep(min(left, 100));
+	}
+	return false;
+}
+
+// needed is the packages the config needs that the AP lacks (0095), as the
+// renderer last found them, and asked when the agent last tried to have
+// each installed, so one that will not install is tried hourly.
+let needed = [];
+let asked = {};
+
+// want installs those, in the background; once one is in, the packages tool
+// starts the agent again, to render with it.
+function want() {
+	if (!fs.access(PACKAGES_TOOL))
+		return;
+	for (let pkg in needed) {
+		if (time() - (asked[pkg] ?? -RESTORE_EVERY) < RESTORE_EVERY)
+			continue;
+		asked[pkg] = time();
+		log('installing %s, which the config asks for', pkg);
+		system('setsid ' + PACKAGES_TOOL + ' add ' + pkg + ' </dev/null >/dev/null 2>&1 &');
+	}
+}
+
+// write_clamp makes the MSS clamp's file from the network config (0054) and
+// says whether it changed, so the caller can have fw4 load it. With no
+// tunnel to clamp, the table it loaded before is removed too.
+function write_clamp(network, aeolus) {
+	let text = clamp(network, aeolus);
+	if (read(CLAMP) == trim(text))
+		return false;
+	store(CLAMP, text);
+	if (index(text, 'maxseg') < 0)
+		system('nft delete table bridge aeolus >/dev/null 2>&1');
+	return true;
+}
+
+// wake_prober has the prober read its plan now rather than within 10
+// seconds: a network with a fallback has no transport until the prober
+// attaches one (0061). Radio resource management takes up its settings too
+// (0073). A SIGHUP is the same number on every architecture.
+function wake_prober() {
+	for (let i in ['prober', 'rrm'])
+		bus.call('service', 'signal', { name: 'aeolus', instance: i, signal: 1 });
+}
+
+// heal_tunnels restarts the network where a reload left a VXLAN tunnel up
+// as netifd has it but gone from the kernel (C-360, 2026-10-10). Rebuilding
+// a bridge, as taking its uplink's bond apart did (0096), makes its VLAN
+// devices again, and the kernel deletes the tunnels on the old ones with
+// them; netifd keeps its own record of each, so neither the reload nor an
+// ifup makes them again, and a network on such a tunnel has no transport.
+// A restart makes everything again, in order. A tunnel netifd is still
+// setting up is given 15 seconds first. It says whether it restarted.
+function heal_tunnels() {
+	let tunnels = [];
+	cursor().foreach('network', 'interface', s => {
+		if (s.proto == 'vxlan' && s.disabled != '1')
+			push(tunnels, s['.name']);
+	});
+	let gone = () => filter(tunnels, name => {
+		let st = bus.call('network.interface.' + name, 'status');
+		return st?.up && st.l3_device && match(st.l3_device, /^[A-Za-z0-9._-]+$/) && !fs.stat(`/sys/class/net/${st.l3_device}`);
+	});
+	let missing = [];
+	for (let i = 0; i < 6 && length(tunnels); i++) {
+		sleep(i ? 3000 : 1000);
+		missing = gone();
+		if (!length(missing))
+			return false;
+	}
+	if (!length(missing))
+		return false;
+	note('the reload left tunnel %s up in netifd but gone from the kernel; restarting the network to make it again', join(', ', missing));
+	system('/etc/init.d/network restart >/dev/null 2>&1');
+	wake_prober();
+	return true;
+}
+
+// hold_radios sets, in the background, what Aeolus holds the radios to
+// with iw: the 802.11ax guard interval of each network that is up (0089),
+// and the transmit power set for each radio (0349). An interface hostapd
+// makes anew gets them from the net hotplug, once its network is up. After
+// an apply (applied), the power is looked at again 20 and 60 seconds on:
+// netifd sets a radio whose settings it reloads to its own power, some
+// seconds after, and keeps its interfaces (v0.321.0, 2026-11-11).
+function hold_radios(applied) {
+	if (fs.access(GI_TOOL))
+		system(`setsid ${GI_TOOL} </dev/null >/dev/null 2>&1 &`);
+	if (fs.access(POWER_TOOL))
+		system(`setsid ${POWER_TOOL}${applied ? ' -a' : ''} </dev/null >/dev/null 2>&1 &`);
+}
+
+function macs() {
+	let out = [];
+	let add = (m) => {
+		if (m && match(m, /^[0-9a-f]{2}(:[0-9a-f]{2}){5}$/) && m != '00:00:00:00:00:00' &&
+		    !(int(substr(m, 0, 2), 16) & 1) && index(out, m) < 0)
+			push(out, m);
+	};
+	for (let n in fs.lsdir('/sys/class/net') ?? []) {
+		// Not the monitor interfaces aeolus-journey made for its captures
+		// (0135): their addresses are made up, and no one's. Nor one the
+		// kernel made up as it made the device (addr_assign_type 1), as a
+		// tunnel's: it is another each time the device is made again (0122).
+		if (match(n, /^aemon[0-9]+$/) || read(`/sys/class/net/${n}/addr_assign_type`) == '1')
+			continue;
+		add(read(`/sys/class/net/${n}/address`));
+	}
+	// Each radio's own address, whether an interface of it is there or not
+	// (0313): the scan radio's is its client tests' and airscan's, whose
+	// interfaces come and go; said only while one was there, the AP's facts
+	// changed, and its config was made again, with each test.
+	for (let phy in fs.lsdir('/sys/class/ieee80211') ?? [])
+		add(lc(read(`/sys/class/ieee80211/${phy}/macaddress`) ?? ''));
+	// In the addresses' order: the interfaces' says nothing, and changes as
+	// a radio's phy is named again.
+	return slice(sort(out), 0, 32);
+}
+
+// ap_vlan says whether a radio's driver makes AP/VLAN interfaces, which
+// hostapd puts a per-user key's clients in their VLAN with (0070, 0082):
+// ath11k's radios have none. null when iw is missing or lists no modes.
+function ap_vlan(phy) {
+	let modes = null;
+	for (let line in split(run(`iw phy ${phy} info 2>/dev/null`), '\n')) {
+		if (match(line, /^[ \t]*Supported interface modes:/)) {
+			modes = [];
+			continue;
+		}
+		if (modes == null)
+			continue;
+		let m = match(line, /^[ \t]+\* (.+)$/);
+		if (!m)
+			break;
+		push(modes, trim(m[1]));
+	}
+	return modes == null ? null : index(modes, 'AP/VLAN') >= 0;
+}
+
+function radio_list() {
+	let out = [];
+	cursor().foreach('wireless', 'wifi-device', s => {
+		let phy = run(`iwinfo nl80211 phyname ${s['.name']}`);
+		let ok = match(phy, /^phy[0-9]+$/);
+		let info = ok ? bus.call('iwinfo', 'info', { device: phy }) : null;
+		push(out, {
+			radio: s['.name'], band: s.band, htmodes: info?.htmodes ?? [],
+			ap_vlan: ok ? ap_vlan(phy) : null,
+			// a radio another service owns, which Aeolus leaves alone (0081)
+			reserved: s.airscan == '1',
+		});
+	});
+	return out;
+}
+
+// facts is what the AP enrolls with (0033, 0040).
+function facts() {
+	let b = bus.call('system', 'board') ?? {};
+	return {
+		mac: read(`/sys/class/net/${mgmt_device()}/address`),
+		macs: macs(),
+		hostname: read('/proc/sys/kernel/hostname'),
+		model: b.model,
+		board: b.board_name,
+		openwrt: b.release?.version,
+		radios: radio_list(),
+	};
+}
+
+// posix_tz finds a time zone's POSIX string in LuCI's table, if it is there.
+function posix_tz(zone) {
+	if (!zone)
+		return null;
+	// Aeolus's own table, which every AP has alike, else LuCI's (0074).
+	for (let path in ['/usr/share/ucode/aeolus/zones.uc', '/usr/share/ucode/luci/zoneinfo.uc'])
+		for (let line in split(fs.readfile(path) ?? '', '\n')) {
+			let m = match(line, /^[ \t]*'([^']+)': '([^']*)',?$/);
+			if (m && m[1] == zone)
+				return m[2];
+		}
+	return null;
+}
+
+// CSA160 keeps what the AP's hostapd last said of a switch to 160 MHz
+// (0329), with the wpad it was said of: a radio being started, as at boot,
+// has no network to ask, and a render then would start it otherwise than
+// the next, restarting it once more.
+const CSA160 = '/etc/aeolus/csa160.json';
+const WPAD = '/usr/sbin/wpad';
+
+// csa160 says the AP's hostapd can switch a radio started narrower to
+// 160 MHz, and advertises 160 MHz only once it is there (0329): its
+// networks' get_features says csa160 (port 0102, hostapd patch 895). Stock
+// hostapd strips [VHT160] below 160 MHz and refuses the switch; one that
+// kept it below 160 dropped some clients' uplink to HE-MCS 0 at range
+// (openwrt#22435, an iPhone 15 Pro). Where no network answers, what was last
+// said of this wpad.
+function csa160() {
+	// By its SHA-256: two builds of wpad can have one size and time, as
+	// OpenWrt sets a file's time from its source's (-130 and -131's did).
+	let key = sha256_file(WPAD) ?? '';
+	let was = null;
+	try {
+		was = json(fs.readfile(CSA160) ?? 'null');
+	} catch (e) {
+	}
+	for (let o in filter(bus.list() ?? [], o => match(o, /^hostapd\.phy/))) {
+		let f = bus.call(o, 'get_features');
+		if (type(f) != 'object')
+			continue;
+		let yes = f.csa160 == true;
+		if (was?.key != key || was?.csa160 != yes)
+			fs.writefile(CSA160, sprintf('%J', { key: key, csa160: yes }));
+		return yes;
+	}
+	return was?.key == key && was?.csa160 == true;
+}
+
+// render_facts is what the renderer needs to know of the AP. ap is its ID,
+// as the manager gives it with the config; its segment MACs are made from
+// it (0060).
+function render_facts(intent, ap) {
+	let radios = {};
+	for (let r in radio_list())
+		radios[r.radio] = { htmodes: r.htmodes, ap_vlan: r.ap_vlan };
+	return {
+		uplink: settings().uplink, management: mgmt_interface(), radios: radios,
+		timezone: posix_tz(intent.system?.tz), vxlan: vxlan_loaded(), nft_bridge: has_nft_bridge(),
+		bss_transition: has_bss_transition(), ap: ap, prober: has_prober(), veth: has_veth(),
+		ustp: has_ustp(), eap: has_eap(), udebug: has_udebug(), tcpdump: has_tcpdump(),
+		// Whether a radio can start narrower than 160 MHz and be widened
+		// (0329).
+		csa160: csa160(),
+		// The clock a test network is on by (0179).
+		now: time(),
+	};
+}
+
+// A clock before this, in Unix seconds, is one not yet set (render.uc's
+// CLOCK_SET): it turns no test network off, as it turned none on.
+const CLOCK_SET = 1700000000;
+
+// tests_due turns off a test network whose time is up (0179), by the AP's
+// own clock, whether or not the manager can be reached: its SSIDs, which
+// carry when they go off, are disabled at once. The next config the AP
+// renders leaves the network out.
+function tests_due() {
+	let now = time();
+	if (now < CLOCK_SET)
+		return;
+	let c = cursor(), off = {};
+	for (let k, v in c.get_all('wireless') ?? {})
+		if (v['.type'] == 'wifi-iface' && match(v.aeolus_until ?? '', /^[0-9]+$/) && +v.aeolus_until <= now && v.disabled != '1') {
+			c.set('wireless', k, 'disabled', '1');
+			off[v.ssid ?? k] = true;
+		}
+	if (!length(keys(off)))
+		return;
+	c.commit('wireless');
+	system('ubus call network reload >/dev/null 2>&1');
+	log('test network off, its time up: %s', join(', ', sort(keys(off))));
+}
+
+function current() {
+	let c = cursor();
+	let out = {};
+	for (let p in PACKAGES)
+		out[p] = c.get_all(p) ?? {};
+	return out;
+}
+
+// wireless_status is netifd's account of the radios, or null where netifd's
+// network.wireless object is gone. OpenWrt 25.12's netifd publishes it from
+// ucode once, at start, and doesn't publish it again; on the office AP it
+// went while netifd ran on (2026-10-06), and Aeolus there saw no radios,
+// clients or neighbours until the network was restarted. A call that fails
+// otherwise is taken for no radios, as before. A radio netifd is setting up
+// again is seen as it last was, where its interfaces are still there
+// (0301): netifd lists them without names meanwhile, and the radio as not
+// up, though they run on.
+function wireless_status() {
+	let st = bus.call('network.wireless', 'status');
+	if (st == null && match(bus.error() ?? '', /not found/i))
+		return null;
+	return wifi_names.view(st ?? {});
+}
+
+// coming_up is the Wi-Fi interfaces netifd has named for a radio it has up
+// that are not there yet (0253), sorted: as while a radio on a DFS channel
+// listens for radar, before hostapd makes its other networks.
+function coming_up() {
+	let out = [];
+	for (let r, d in wireless_status() ?? {})
+		if (d.up)
+			for (let i in d.interfaces ?? [])
+				if (i.ifname && !fs.access(`/sys/class/net/${i.ifname}`))
+					push(out, i.ifname);
+	return sort(out);
+}
+
+// facts_again says what the AP is, again, where that has changed since it
+// last said (0122): a radio gained, a scan radio another service now owns,
+// the modes a newer driver gives, a newer OpenWrt. It looks every
+// FACTS_EVERY seconds, sooner until it has said once, and says only what
+// two looks running agree on, so a radio that is restarting is not taken
+// for one that is gone. A look while a radio's networks are still being
+// made is no look (0253), for up to COMING_UP seconds of the same ones
+// missing: a radar check is a minute, ten on weather radar channels, and a
+// network that never comes, as one hostapd left out, holds nothing back
+// for good.
+const FACTS_EVERY = 300;
+const COMING_UP = 900;
+let facts_said = null, facts_seen = null, facts_next = 0, facts_wait = null;
+
+function facts_again(token) {
+	if (time() < facts_next)
+		return;
+	facts_next = time() + (facts_said == null ? 60 : FACTS_EVERY);
+	let f = facts();
+	// A look that could not read the board, or a radio's modes, is half a
+	// look and no change: ubus gone, or a driver being loaded again.
+	if (!f.board || length(filter(f.radios, r => !length(r.htmodes))))
+		return;
+	let missing = join(' ', coming_up());
+	if (missing == '')
+		facts_wait = null;
+	else {
+		if (facts_wait?.missing != missing)
+			facts_wait = { missing: missing, since: time() };
+		if (time() - facts_wait.since < COMING_UP)
+			return;
+	}
+	let now = sprintf('%J', f);
+	let steady = now == facts_seen;
+	facts_seen = now;
+	if (!steady || now == facts_said)
+		return;
+	let r = http('POST', '/v1/ap/facts', f, token);
+	// An older manager has no such route, and is not asked again.
+	if (r.status == 200 || r.status == 404) {
+		facts_said = now;
+		if (r.json?.changed)
+			log('facts: the manager has what this AP is now');
+	}
+	else if (r.status != 429)
+		fail('facts: %s', describe(r));
+}
+
+function running_version() {
+	let v = read(RUNNING);
+	return v != null && match(v, /^[0-9]+$/) ? int(v) : null;
+}
+
+function enroll() {
+	let r = http('POST', '/v1/enroll', facts());
+	if (r.status == 201 && r.json?.token) {
+		store(TOKEN, r.json.token, 384);   // 0600: only root reads the token
+		// An AP the manager knew, back with a new token, as after a reflash,
+		// waits as it was for a person to let it back in (0223).
+		if (r.json.waiting)
+			log('enrolled again as %s; it waits for a person to let it back in', r.json.ap);
+		else
+			log('enrolled as %s; it waits in Landing Zone until a person adopts it', r.json.ap);
+		return 0;
+	}
+	fail('enrollment: %s', describe(r));
+	if (r.status == 409)
+		return 3600;   // a manager before 0223: a person must remove the old entry (0038)
+	if (r.status == 503)
+		return 600;    // Landing Zone is full
+	return 60;
+}
+
+// confirm waits until the manager answers again, or gives up (0008).
+function confirm() {
+	let deadline = mono() + CONFIRM;
+	sleep(5000);
+	while (mono() < deadline) {
+		if (http('GET', '/healthz').status == 200)
+			return true;
+		sleep(10000);
+	}
+	return false;
+}
+
+function revert(pending) {
+	for (let p in pending.packages ?? []) {
+		let b = fs.readfile(`${BACKUP}/${p}`);
+		if (b != null)
+			store('/etc/config/' + p, b);
+	}
+	system('reload_config');
+	if (write_clamp(cursor().get_all('network'), cursor().get_all('aeolus')))
+		system('/etc/init.d/firewall reload >/dev/null 2>&1');
+	wake_prober();
+	if (index(pending.packages ?? [], 'network') >= 0)
+		heal_tunnels();
+	hold_radios(true);
+	fs.unlink(PENDING);
+	fail('reverted to the config before version %s', pending.version);
+}
+
+function report_applied(version, hash, ok, error, token) {
+	let r = http('POST', '/v1/ap/applied', { version: version, hash: hash, ok: ok, error: error ?? '' }, token);
+	if (r.status != 200)
+		fail('reporting the apply: %s', describe(r));
+}
+
+// wifi_down lists the Wi-Fi networks that are not up: each interface netifd
+// lists for a radio that is on, by its SSID and radio (0057); null where
+// netifd can't say (wireless_status). A radio netifd is setting up again
+// is as it last was, where its interfaces are still there (0301); with
+// unsettled, all its networks are listed instead, as not back yet, which
+// is what an apply waits out.
+function wifi_down(unsettled) {
+	let out = [];
+	let st = wireless_status();
+	if (st == null)
+		return null;
+	for (let r in sort(keys(st))) {
+		if (st[r].disabled)
+			continue;
+		let wait = unsettled && st[r].pending == true;
+		for (let i in st[r].interfaces ?? [])
+			if (!i.config?.disabled && (wait || !i.ifname || read(`/sys/class/net/${i.ifname}/operstate`) != 'up'))
+				push(out, `${i.config?.ssid ?? i.ifname} (${r})`);
+	}
+	return out;
+}
+
+// wifi_missing counts the Wi-Fi networks that should be up and are not, by
+// the config and the kernel alone, for when netifd can't say
+// (wireless_status): the AP networks /etc/config/wireless has on radios
+// that are on, less the AP interfaces that are up. It names none of them.
+// Without it, an apply made while netifd's object was gone went unchecked,
+// and the C-360 kept a config that had failed two of its radios
+// (2026-10-10).
+function wifi_missing() {
+	let c = cursor();
+	let off = {};
+	c.foreach('wireless', 'wifi-device', d => { off[d['.name']] = d.disabled == '1'; });
+	let want = 0;
+	c.foreach('wireless', 'wifi-iface', i => {
+		if ((i.mode ?? 'ap') == 'ap' && i.disabled != '1' && off[i.device] === false)
+			want++;
+	});
+	// The AP interfaces, as iw has them; a key's or the RADIUS server's VLAN
+	// interface is of another type, AP/VLAN.
+	let up = 0, name = null;
+	for (let line in split(run('iw dev 2>/dev/null'), '\n')) {
+		let m = match(line, /^\s*Interface (\S+)/);
+		if (m)
+			name = m[1];
+		else if (name && match(line, /^\s*type AP$/) && read(`/sys/class/net/${name}/operstate`) == 'up')
+			up++;
+	}
+	return max(0, want - up);
+}
+
+// wifi_back waits for the Wi-Fi to come back after an apply, a radar check
+// (DFS) included, and returns the networks that did not, leaving out those
+// that were already down before it. Where netifd couldn't say which were
+// down, before the apply or now, it goes by how many are missing against
+// how many were, missing: both as wifi_missing counts them, since netifd
+// also lists what is no AP network, and one of those already down would
+// stand in for an AP network that failed.
+function wifi_back(before, missing) {
+	let deadline = mono() + WIFI_WAIT;
+	let down;
+	while (true) {
+		down = wifi_down(true);
+		if (down != null && before != null)
+			down = filter(down, n => index(before, n) < 0);
+		else {
+			let n = wifi_missing();
+			down = n > missing ? [ sprintf('%d more of its networks than before; netifd cannot say which', n - missing) ] : [];
+		}
+		if (!length(down) || mono() >= deadline)
+			return down;
+		sleep(5000);
+	}
+}
+
+// HOSTAPD_NOISE is what hostapd logs as an error that says nothing of a
+// config it refused, so is no reason given for one. Each is a pattern of
+// the line.
+const HOSTAPD_NOISE = [
+	// At an FT roam hostapd tries the new key at authentication, and
+	// mac80211 refuses a key for a station not yet associated; hostapd
+	// sets it again after association, and the roam goes on (porting's
+	// B137). Once a roam.
+	/nl80211: kernel reports: key addition failed/,
+];
+
+// hostapd_error is hostapd's last errors, which say why it refused a config:
+// the line it could not read, then how many there were. Its noise is left
+// out (HOSTAPD_NOISE).
+function hostapd_error() {
+	let out = [];
+	for (let line in split(run('logread -e hostapd | grep daemon.err | tail -n 20'), '\n')) {
+		let m = match(line, /hostapd: (.*)$/);
+		if (m && !length(filter(HOSTAPD_NOISE, re => match(m[1], re))))
+			push(out, m[1]);
+	}
+	out = slice(out, -2);
+	return length(out) ? substr(join('; ', out), 0, 300) : null;
+}
+
+// fw_crash_state is what the kernel's log says of radios whose firmware
+// crashed (0310), and said before, kept in FWCRASH past the log's ring
+// until the AP starts again: each crash, how long ago, and whether its
+// radio came back, by the radios of its device. Came back is
+// what is seen now, whatever the log said: a recovery can stall with
+// nothing said, and a radio lost can be bound again, as airscan's heal did
+// the Garage's scan radio 50 s after its crash (2026-11-05 01:19). A
+// serving radio came back where hostapd serves on its device again, a
+// minute after, and no run of failed commands goes on; the scan radio,
+// where airscan has scanned with it since.
+function fw_crash_state() {
+	// All of them: a run of failed commands, every few seconds, would put
+	// the crash itself out of a tail; the log holds 128 KB at most.
+	let up = +(split(read('/proc/uptime') ?? '0', ' ')[0]);
+	let was = read(FWCRASH), kept = null;
+	try {
+		kept = was ? json(was) : null;
+	}
+	catch (e) {
+		kept = null;
+	}
+	let p = fwcrash.merge(kept, fwcrash.parse(split(run(sprintf("logread | grep -E '%s'", fwcrash.GREP)), '\n')), up);
+	if (!length(p.crashes) && !length(p.restarts) && !length(p.wmi))
+		return null;
+	let keep = sprintf('%J', p);
+	if (keep != was)
+		store(FWCRASH, keep, 0o644);
+	let device_of = {}, radio_of = {};
+	for (let phy in fs.lsdir('/sys/class/ieee80211') ?? []) {
+		let dev = fs.readlink(`/sys/class/ieee80211/${phy}/device`);
+		if (dev)
+			device_of[phy] = lc(replace(dev, /^.*\//, ''));
+	}
+	for (let name, s in cursor().get_all('wireless') ?? {}) {
+		if (s['.type'] != 'wifi-device' || !s.path)
+			continue;
+		// A SoC's second radio on one device is its path and "+1" (OpenWrt's
+		// naming): the device is one.
+		let r = radio_of[lc(replace(replace(s.path, /^.*\//, ''), /\+[0-9]+$/, ''))] ??= { radios: [], bands: [] };
+		push(r.radios, name);
+		// A scan radio (0126) serves no band: airscan holds it.
+		if (s.airscan == '1')
+			r.scan = true;
+		else if (s.band)
+			push(r.bands, s.band);
+	}
+	let said = fwcrash.said(p, up, device_of, radio_of);
+	// What serves, and what scans, now.
+	let serving = {};
+	for (let o in bus.list() ?? []) {
+		let m = match(o, /^hostapd\.(.+)$/);
+		let phy = m ? read(`/sys/class/net/${m[1]}/phy80211/name`) : null;
+		if (phy && device_of[phy])
+			serving[device_of[phy]] = true;
+	}
+	// What the scan radio itself did last: not Bluetooth's scans, which
+	// airscan makes on another radio.
+	let scanned = 0, last = bus.call('airscan', 'status')?.last ?? {};
+	for (let k in [ 'bss', 'clients', 'spectral' ])
+		if (type(last[k]) == 'int' && last[k] > scanned)
+			scanned = last[k];
+	let now = time();
+	for (let c in said) {
+		c.recovered = !c.failing && !!(c.scan ? scanned > now - c.ago + 30 : (serving[c.device] && c.ago > 60));
+		delete c.failing;
+	}
+	return said;
+}
+
+// mixed_libs_state is the libraries a process on the AP holds two builds of
+// at once (0317), as its maps say: one installed for another image than the
+// AP's, as OpenWrt's snapshot builds beside a port image's libubox were on
+// 2026-11-05, when the agents that held both waited for good. Each process's
+// maps are read and let go, and kept only where they hold two.
+function mixed_libs_state() {
+	let procs = [];
+	for (let pid in fs.lsdir('/proc') ?? []) {
+		if (!match(pid, /^[0-9]+$/))
+			continue;
+		let maps = fs.readfile(`/proc/${pid}/maps`);
+		if (!maps || !mixedlibs.two(maps))
+			continue;
+		let name = mixedlibs.name_of(fs.readfile(`/proc/${pid}/cmdline`));
+		if (name)
+			push(procs, { name: name, maps: maps });
+	}
+	let m = mixedlibs.mixed(procs);
+	return length(m) ? m : null;
+}
+
+// keep_own keeps a section of the AP's own Wi-Fi config before Aeolus
+// takes it out (0137): as it was, key and all, in a file only root reads,
+// under a line that says why, and how to have it back. Aeolus has no copy
+// of it and could not put it back. It says whether it was kept.
+function keep_own(s, why) {
+	let at = time(), t = localtime(at);
+	let when = sprintf('%04d-%02d-%02d %02d:%02d:%02d', t.year, t.mon, t.mday, t.hour, t.min, t.sec);
+	fs.mkdir(DIR, 0o755);
+	fs.mkdir(REMOVED, 0o700);
+	// Root's alone, whoever made it.
+	fs.chmod(REMOVED, 0o700);
+	return store(sprintf('%s/%d-%s.uci', REMOVED, at, replace(s['.name'], /[^A-Za-z0-9_]/g, '_')), own_nets.kept(s, when, why), 0o600);
+}
+
+// keep_replaced keeps each of the AP's own sections a config takes the
+// place of (0137, what render says it replaced), before the config is
+// written: nothing goes that is not kept. It says whether all were.
+function keep_replaced(replaced, version) {
+	let w = cursor().get_all('wireless') ?? {};
+	for (let r in replaced) {
+		let s = w[r.section];
+		if (s && !keep_own(s, sprintf('Taken out of /etc/config/wireless by Aeolus, whose network %s takes its place, in version %d', r.network, version)))
+			return false;
+	}
+	return true;
+}
+
+// apply writes the checked packages, reloads, and keeps them only if the
+// manager can still be reached (0008, 0040), and if a change to the Wi-Fi
+// brought back every network that was up before it (0057).
+// ft_ready gives each BSS of a network with 802.11r the config has its key
+// holders' file where it has none yet, empty, before the Wi-Fi is set up
+// again (0224). hostapd reads the file as the BSS starts: one not there is
+// an error it logs ("rxkh file ... not found"), where an empty one is only
+// no holders yet. ft_write fills it once the manager has said who they are,
+// and has hostapd read it again.
+function ft_ready() {
+	let w = cursor().get_all('wireless') ?? {};
+	for (let name in sort(keys(w))) {
+		let s = w[name];
+		if (s['.type'] != 'wifi-iface' || !match(s.aeolus_ft ?? '', /^[a-z][a-z0-9-]*$/) || !match(name, /^[A-Za-z0-9_]+$/))
+			continue;
+		let path = `${FT_DIR}/${name}`;
+		if (fs.stat(path))
+			continue;
+		if (!fs.stat(FT_DIR)) {
+			fs.mkdir(FT_DIR, 448);
+			if (fs.chown(FT_DIR, 0, 'network'))
+				fs.chmod(FT_DIR, 488);
+		}
+		if (store(path, '', 384) && fs.chown(path, 0, 'network'))
+			fs.chmod(path, 416);
+	}
+}
+
+function apply(out, version, hash) {
+	if (!length(out.changed))
+		return { ok: true };
+	// The AP's own networks this config takes the place of are kept first.
+	if (length(out.replaced) && !keep_replaced(out.replaced, version))
+		return { ok: false, error: 'the AP\'s own network this config takes the place of could not be kept in ' + REMOVED + '; nothing was applied' };
+	fs.mkdir(BACKUP);
+	for (let p in out.changed) {
+		let cur = fs.readfile('/etc/config/' + p);
+		if (cur != null)
+			store(`${BACKUP}/${p}`, cur, 0o600);
+	}
+	let wifi = index(out.changed, 'wireless') >= 0;
+	let before = wifi ? wifi_down() : [];
+	// How many were already missing, for where netifd can't name them, now
+	// or after the apply.
+	let missing = wifi ? wifi_missing() : 0;
+	let pending = { version: version, hash: hash, packages: out.changed };
+	store(PENDING, sprintf('%J', pending));
+	for (let p in out.changed)
+		store('/etc/config/' + p, file(out.config[p]));
+	log('applying version %d: %s', version, join(', ', out.changed));
+	for (let r in out.replaced ?? [])
+		log('version %d: network %s takes the place of the AP\'s own section %s', version, r.network, r.section);
+	let clamped = write_clamp(out.config.network, out.config.aeolus);
+	// A new 802.11r network's BSSes find their key holders' file there.
+	if (wifi)
+		ft_ready();
+	system('reload_config');
+	// fw4 loads the clamp's file; it reloads by itself when its own config
+	// changed, so only a changed file alone needs a reload here.
+	if (clamped && index(out.changed, 'firewall') < 0)
+		system('/etc/init.d/firewall reload >/dev/null 2>&1');
+	wake_prober();
+	if (index(out.changed, 'network') >= 0)
+		heal_tunnels();
+	hold_radios(true);
+	if (!confirm()) {
+		revert(pending);
+		return { ok: false, error: sprintf('lost the manager within %d seconds of applying; reverted', CONFIRM) };
+	}
+	let down = wifi ? wifi_back(before, missing) : [];
+	if (wifi && wireless_status() == null)
+		note('netifd lost its network.wireless object: the Wi-Fi after applying version %d was checked by counting its networks; restarting the network brings the object back', version);
+	if (length(down)) {
+		let why = hostapd_error();
+		revert(pending);
+		return { ok: false, error: sprintf('the Wi-Fi did not come back within %d seconds: %s%s; reverted',
+			WIFI_WAIT, join(', ', slice(down, 0, 6)), why ? ` (hostapd: ${why})` : '') };
+	}
+	fs.unlink(PENDING);
+	return { ok: true };
+}
+
+// recover finishes an apply that was cut short, by a crash or a reboot.
+function recover(token) {
+	let p = read(PENDING);
+	if (p == null)
+		return;
+	let pending = json(p);
+	log('an apply of version %s did not finish; confirming it', pending.version);
+	if (confirm()) {
+		fs.unlink(PENDING);
+		store(RUNNING, '' + pending.version);
+		report_applied(pending.version, pending.hash, true, null, token);
+		return;
+	}
+	revert(pending);
+	report_applied(pending.version, pending.hash, false, 'lost the manager after applying; reverted', token);
+}
+
+// keep_rrm_key keeps the key radio neighbours sign their hellos with
+// (0073), readable by root alone, while the manager sends it beside the
+// config; without it, radio resource management stays off. A new key is
+// kept before its config is applied. It goes only once a config without it
+// runs: one that is refused or reverted leaves the AP on a config that
+// still needs the key.
+function keep_rrm_key(poll) {
+	let key = poll.rrm?.key;
+	if (type(key) == 'string' && match(key, /^[0-9a-f]{64}$/)) {
+		if (read(RRM_KEY) != key)
+			store(RRM_KEY, key + '\n', 384);
+	} else if (running_version() == poll.version && fs.access(RRM_KEY))
+		fs.unlink(RRM_KEY);
+}
+
+// keep_ssh_keys puts the SSH keys Aeolus sets on the AP (0197): those of
+// system.ssh_keys and the manager's own, which comes beside the config,
+// in dropbear's authorized_keys after any put there by hand. Only the
+// ones Aeolus wrote before are ever taken away, so no one is locked out
+// by it. dropbear reads the file at each login: nothing restarts.
+function keep_ssh_keys(poll) {
+	let keys = [ ...(poll.config?.system?.ssh_keys ?? []) ];
+	if (type(poll.ssh?.manager) == 'string')
+		push(keys, poll.ssh.manager);
+	let before = [];
+	try {
+		before = json(read(SSH_KEPT) ?? '[]');
+	} catch (e) {
+	}
+	let now = fs.readfile(AUTH_KEYS);
+	let m = sshkeys.merge(now, type(before) == 'array' ? before : [], keys);
+	if (m.text != (now ?? '')) {
+		fs.mkdir('/etc/dropbear', 0o700);
+		if (!store(AUTH_KEYS, m.text, 0o600)) {
+			fail('could not write %s', AUTH_KEYS);
+			return;
+		}
+		log('SSH keys: %d of Aeolus\'s on the AP', length(m.managed));
+	}
+	if (sprintf('%J', m.managed) != sprintf('%J', before))
+		store(SSH_KEPT, sprintf('%J', m.managed), 0o600);
+}
+
+// Each exact render is checked and applied at most once per run, so a
+// refused or reverted config is not retried every poll.
+let attempted = {};
+
+// The management interface the config was last rendered with, and the one
+// the last look found (0210): where it moves, the config renders again.
+let rendered_mgmt = null, mgmt_seen = null;
+
+function converge(poll, token) {
+	let version = poll.version;
+	let intent = poll.config;
+	let facts = render_facts(intent, poll.ap);
+	let out = render(intent, current(), facts);
+	rendered_mgmt = facts.management;
+	for (let e in out.errors)
+		fail('render: %s', e);
+	needed = out.needs ?? [];
+	want();
+	// After a start the whole config comes again, even unchanged. Where it
+	// renders to what runs already, there is nothing to check or apply; where
+	// a newer agent renders more, that is checked and applied as any change.
+	// Where the manager says this version did not apply here (failed), as
+	// when the AP could not render it after a sysupgrade and runs it from
+	// before, what renders to what runs is checked and said applied, or the
+	// manager's word that it failed stands till the next version (0235).
+	if (!length(out.changed) && version == running_version() && !poll.failed)
+		return;
+	let uci = join('\n', map(PACKAGES, p => text(p, p == 'wireless' ? without_keys(out.config[p]) : out.config[p]))) + '\n';
+	let key = version + ':' + sha256(uci);
+	if (attempted[key])
+		return;
+	// What this AP's own renderer refuses is never applied, whatever the
+	// manager's check makes of the UCI: the renderer knows the AP, such as a
+	// driver with no AP/VLAN interfaces, on which hostapd would fail every
+	// network of the radio (the C-360, 2026-10-10). The manager hears why.
+	if (length(out.errors)) {
+		attempted[key] = true;
+		fail('version %d is not applied: this AP cannot render it', version);
+		report_applied(version, sha256(uci), false, substr('this AP cannot render it: ' + join('; ', out.errors), 0, 2000), token);
+		return;
+	}
+	let check = http('POST', '/v1/ap/render', { version: version, uci: uci }, token);
+	if (check.status != 200) {
+		fail('render check: %s', describe(check));
+		return;
+	}
+	if (check.json.result == 'stale')
+		return;
+	attempted[key] = true;
+	if (check.json.result != 'ok') {
+		fail('version %d was refused:', version);
+		for (let p in check.json.problems ?? [])
+			fail('  %s', p);
+		return;
+	}
+	let result = apply(out, version, check.json.hash);
+	report_applied(version, check.json.hash, result.ok, result.error, token);
+	if (result.ok) {
+		store(RUNNING, '' + version);
+		log('running version %d', version);
+	}
+}
+
+// steering_state says what usteer is doing (0050, 0051): whether it is
+// installed and running, its band steering settings, and for each SSID on
+// each band, its clients and the clients usteer moved off it and onto it.
+function steering_state() {
+	// Whether hostapd has 802.11v is said with usteer or without: Aeolus's
+	// own steering asks by it (0138), and an AP need not have usteer.
+	if (!fs.stat('/sbin/usteerd'))
+		return { installed: false, running: false, interval: 0, bss_transition: has_bss_transition() };
+	let cfg = bus.call('usteer', 'get_config');
+	if (!cfg)
+		return { installed: true, running: false, interval: 0, bss_transition: has_bss_transition() };
+	let bss = [];
+	let info = bus.call('usteer', 'local_info') ?? {};
+	for (let name in sort(keys(info))) {
+		let n = info[name];
+		push(bss, {
+			ssid: n.ssid ?? '',
+			band: n.freq > 5925 ? '6g' : n.freq > 3000 ? '5g' : '2g',
+			clients: n.n_assoc ?? 0,
+			steered_away: n.roam_events?.source ?? 0,
+			steered_in: n.roam_events?.target ?? 0,
+		});
+	}
+	return {
+		installed: true,
+		running: true,
+		interval: cfg.band_steering_interval ?? 0,
+		ssids: slice(cfg.ssid_list ?? [], 0, 64),
+		bss: slice(bss, 0, 64),
+		bss_transition: has_bss_transition(),
+	};
+}
+
+// fastest is the fastest of a port's link modes, in Mbit/s, as netifd lists
+// them ("10000baseT-F"), or null where it lists none (0093).
+function fastest(modes) {
+	let best = null;
+	for (let m in modes ?? []) {
+		let n = match(m, /^([0-9]+)base/);
+		if (n && (best == null || int(n[1]) > best))
+			best = int(n[1]);
+	}
+	return best;
+}
+
+// port_state is one port as netifd has it: whether it is up, whether it has
+// a link and at what speed ("1000F"), and the fastest it can go, and the
+// fastest the far end offers it (0093), which together say why a link is
+// slower than the port.
+function port_state(d) {
+	return {
+		up: !!d.up, carrier: !!d.carrier, speed: d.carrier ? d.speed ?? '' : '',
+		max: fastest(d['link-supported']), partner_max: d.carrier ? fastest(d['link-partner-advertising']) : null,
+	};
+}
+
+// probes reads what the prober found (0059), if it is recent: by VNI, how
+// each tunnel is doing, and the ports the loop guard took off their tunnels.
+// poll_ms is how long the manager took to answer the last config poll it
+// answered, in ms: the last step of the AP's own way out (0142).
+let poll_ms = null;
+
+function probes() {
+	let p = null;
+	try {
+		p = json(read(PROBES) ?? 'null');
+	} catch (e) {
+	}
+	if (type(p?.at) != 'int' || time() - p.at > PROBES_STALE)
+		return null;
+	return p;
+}
+
+// bond_state is a bond's mode and its member ports, each with its link and
+// the LACP aggregator it is in (0093), or null for a port that is not a
+// bond: the C-360's uplink is bond0, of eth0 and eth1, made by its image.
+function bond_state(p, devs, on) {
+	let slaves = read(`/sys/class/net/${p}/bonding/slaves`);
+	if (slaves == null)
+		return null;
+	let num = (path) => {
+		let v = read(path);
+		return v != null && match(v, /^[0-9]+$/) ? int(v) : null;
+	};
+	let members = [];
+	for (let s in split(slaves, /[ \t]+/)) {
+		if (s == '')
+			continue;
+		let m = port_state(devs[s] ?? {});
+		m.name = s;
+		m.mii = read(`/sys/class/net/${s}/bonding_slave/mii_status`);
+		m.aggregator = num(`/sys/class/net/${s}/bonding_slave/ad_aggregator_id`);
+		m.neighbor = on[s];
+		push(members, m);
+	}
+	return {
+		mode: split(read(`/sys/class/net/${p}/bonding/mode`) ?? '', ' ')[0],
+		aggregator: num(`/sys/class/net/${p}/bonding/ad_aggregator`),
+		members: slice(members, 0, 8),
+	};
+}
+
+// STP_STATES are the kernel's bridge port states, as a port's brif/state
+// file numbers them; ustp puts RSTP's discarding as blocking (0095).
+const STP_STATES = ['disabled', 'listening', 'learning', 'forwarding', 'blocking'];
+
+// ports_state lists the Ethernet ports of the bridge the uplink is in
+// (0053), in the bridge's order: each port's state (port_state), which is
+// the uplink, for a bond its members (0093), and where the bridge runs
+// spanning tree, each port's state in it (0095). Where the uplink is two
+// ports, its bond taken apart, both are the uplink, and the one the AP's
+// traffic takes is the path out; each Ethernet port under the uplink says
+// the switch port its LLDP names (0096). The ports are those
+// the bridge's config lists, as the renderer reads them; the running bridge
+// holds the Wi-Fi interfaces too. A tunnel port has left that bridge for its
+// tunnels' (0058), on its own or by an 802.1Q device Aeolus made of it, and
+// follows the others, by name. The VLAN end of a network's veth pair (0061)
+// is in that bridge too, and is not a port.
+function ports_state() {
+	let uplink = settings().uplink;
+	let members = [];
+	let br = null;
+	let bridges = [];
+	let vlans = {};   // an 802.1Q device Aeolus made -> the port under it
+	cursor().foreach('network', 'device', d => {
+		let ports = type(d.ports) == 'array' ? d.ports : d.ports ? [d.ports] : [];
+		if (d.type == 'bridge' && index(ports, uplink) >= 0) {
+			members = filter(ports, e => !match(e, VLAN_END));
+			br = d.name;
+		}
+		else if (d.type == 'bridge' && match(d['.name'], /^aeolus_[0-9]+_br$/))
+			push(bridges, ports);
+		else if (d.type == '8021q' && match(d['.name'], /^aeolus_port_/) && d.name && d.ifname)
+			vlans[d.name] = d.ifname;
+	});
+	let tunnel_ports = [];
+	for (let ports in bridges)
+		for (let e in ports) {
+			let p = vlans[e] ?? (match(e, /^aeolus_/) ? null : e);
+			if (p != null && index(members, p) < 0 && index(tunnel_ports, p) < 0)
+				push(tunnel_ports, p);
+		}
+	members = [...members, ...sort(tunnel_ports)];
+	let devs = bus.call('network.device', 'status') ?? {};
+	let stp = br && match(br, /^[A-Za-z0-9._-]+$/) && (read(`/sys/class/net/${br}/bridge/stp_state`) ?? '0') != '0';
+	let ups = uplinks.ports(cursor());
+	let path = length(ups) > 1 ? uplinks.path_out(ups) : null;
+	let on = {};
+	for (let port, n in probes()?.uplink?.ports ?? {})
+		if (type(n) == 'object')
+			on[port] = { system: n.system, port: n.port };
+	let out = [];
+	for (let p in members) {
+		let o = port_state(devs[p] ?? {});
+		o.name = p;
+		o.uplink = index(ups, p) >= 0;
+		if (path && p == path)
+			o.path = true;
+		o.neighbor = on[p];
+		o.bond = bond_state(p, devs, on);
+		let s = stp ? read(`/sys/class/net/${br}/brif/${p}/state`) : null;
+		if (s != null && match(s, /^[0-4]$/))
+			o.stp = STP_STATES[int(s)];
+		push(out, o);
+	}
+	return slice(out, 0, 32);
+}
+
+// neighbour says whether the AP has lately heard from an address on a
+// device, by its neighbour table: true where it answered, false where it
+// stopped answering, null where it was never asked.
+function neighbour(addr, dev) {
+	if (!match(addr ?? '', /^[0-9.]+$/) || !match(dev ?? '', /^[A-Za-z0-9_.-]+$/))
+		return null;
+	let words = split(trim(split(run(`ip -4 neigh show ${addr} dev ${dev}`), '\n')[0] ?? ''), /[ \t]+/);
+	let state = words[length(words) - 1];
+	if (state in ['REACHABLE', 'STALE', 'DELAY', 'PROBE', 'PERMANENT', 'NOARP'])
+		return true;
+	if (state in ['FAILED', 'INCOMPLETE'])
+		return false;
+	return null;
+}
+
+// vxlan_state says what the AP's tunnels are doing (0054): whether the
+// packages they need are there, the MTU its uplink carries now, which the
+// tunnels run over (0056), and for each tunnel Aeolus made, its VNI, peer,
+// port and MTU, the VLAN it starts from, the AP's address there (0063) and
+// its gateway there, and whether that answers, the other interfaces holding
+// that address there, and when the prober last put back routes the start
+// lost;
+// whether it is up, or
+// standing by as a fallback, and what the prober found (0059); and the
+// ports the loop guard took off.
+function vxlan_state() {
+	let found = probes();
+	let tunnels = [];
+	// The interfaces not Aeolus's that are up, with their IPv4 addresses: one
+	// holding the address a tunnel starts from, on the same device, shares it,
+	// as two DHCP clients leasing from the same MAC do (2026-10-06, the office
+	// AP). One with an address of its own there shares nothing.
+	let others = null;
+	let sharing = (dev, addr) => {
+		others ??= filter(bus.call('network.interface', 'dump')?.interface ?? [],
+			i => i.up && i.l3_device && !match(i.interface ?? '', /^aeolus_/));
+		let names = [];
+		for (let i in others)
+			if (i.l3_device == dev && length(filter(i['ipv4-address'] ?? [], x => x.address == addr)))
+				push(names, i.interface);
+		return sort(names);
+	};
+	cursor().foreach('network', 'interface', s => {
+		let vni = match(s['.name'], /^aeolus_([0-9]+)$/)?.[1];
+		if (!vni || !(s.proto in { vxlan: 1, vxlan6: 1 }))
+			return;
+		let up = !!bus.call(`network.interface.${s['.name']}`, 'status')?.up;
+		// Up to netifd, but with no device in the kernel (0187): netifd keeps
+		// a tunnel's device it lost as present, so nothing goes over it.
+		let gone = up && !fs.access(`/sys/class/net/${s['.name']}`);
+		let t = {
+			vni: int(vni), peer: s.peeraddr ?? s.peer6addr ?? '', port: int(s.port ?? '4789'),
+			mtu: int(s.mtu ?? '0'), up: up && !gone, standby: !up && s.auto == '0',
+		};
+		if (gone)
+			t.gone = true;
+		// A tunnel that starts from a VLAN (0063): which, and the AP's address
+		// there, which it has only once DHCP answers; and the gateway DHCP
+		// gave there, and whether it answers.
+		let start = match(s.tunlink ?? '', /^aeolus_vlan([0-9]+)_tunnels$/);
+		if (start) {
+			t.from_vlan = int(start[1]);
+			let st = bus.call(`network.interface.${s.tunlink}`, 'status');
+			let a = st?.['ipv4-address']?.[0]?.address;
+			if (a)
+				t.from_address = a;
+			let gw = filter(st?.route ?? [], r => r.target == '0.0.0.0' && r.mask == 0)[0]?.nexthop;
+			if (a && gw) {
+				t.from_gateway = gw;
+				let seen = neighbour(gw, st.l3_device);
+				if (seen != null)
+					t.from_gateway_answers = seen;
+			}
+			// Other interfaces holding the start's address there, and when the
+			// prober last put back routes the start lost.
+			let shared = a && st.l3_device ? sharing(st.l3_device, a) : [];
+			if (length(shared))
+				t.from_shared = slice(shared, 0, 8);
+			let kept = found?.starts?.[s.tunlink];
+			if (type(kept?.put_back) == 'int')
+				t.from_put_back_ago = max(0, time() - kept.put_back);
+		}
+		// When the prober last made its device again (0187).
+		let remade = found?.remade?.[s['.name']];
+		if (type(remade) == 'int')
+			t.remade_ago = max(0, time() - remade);
+		let f = found?.tunnels?.[vni];
+		if (f)
+			t.probe = {
+				verdict: f.verdict, interval: f.interval, asks: slice(f.asks ?? [], 0, 8),
+				underlay: f.underlay, underlay_ms: f.underlay_ms, from: f.from, rtt_ms: f.rtt_ms,
+				answered_ago: f.answered_ago, lease: f.lease,
+			};
+		push(tunnels, t);
+	});
+	let uplink_mtu = int(read(`/sys/class/net/${mgmt_device()}/mtu`) ?? '0');
+	return {
+		installed: has_vxlan(), loaded: vxlan_loaded(), clamp: has_nft_bridge(),
+		prober: has_prober(), uplink_mtu: uplink_mtu, tunnels: slice(tunnels, 0, 64),
+		loops: slice(found?.loops ?? [], 0, 32),
+	};
+}
+
+// transports_state says, for each network with a fallback (0061), which
+// transport carries it now, and how each is doing, by the prober's verdicts;
+// its last switch, and why a switch that is due cannot be made.
+function transports_state() {
+	let out = {};
+	for (let id, s in probes()?.switches ?? {}) {
+		let x = { active: s.active, primary: s.primary, fallback: s.fallback };
+		if (type(s.last?.at) == 'int')
+			x.last_switch = { from: s.last.from, to: s.last.to, why: s.last.why, ago: max(0, time() - s.last.at) };
+		if (s.cannot)
+			x.cannot_switch = s.cannot;
+		out[id] = x;
+	}
+	return length(out) ? out : null;
+}
+
+// vlan_probes says what the prober found on the VLAN transports of networks
+// with a fallback (0061), as vxlan_state does for tunnels.
+function vlan_probes() {
+	let out = [];
+	for (let vlan, f in probes()?.vlans ?? {})
+		push(out, {
+			vlan: int(vlan), tagged: !!f.tagged, probe: {
+				verdict: f.verdict, interval: f.interval, asks: slice(f.asks ?? [], 0, 8),
+				underlay: f.underlay, underlay_ms: null, from: f.from, rtt_ms: f.rtt_ms,
+				answered_ago: f.answered_ago, lease: f.lease,
+			},
+		});
+	return length(out) ? slice(out, 0, 64) : null;
+}
+
+// uplink_state says which of the VLANs watched on the uplink reach the AP
+// from the switch, and all the switch's LLDP says of itself and of the
+// uplink's port (0064), as the prober found and read it.
+function uplink_state() {
+	let u = probes()?.uplink;
+	let vlans = [];
+	for (let v in sort(keys(u?.vlans ?? {}), (a, b) => +a - +b)) {
+		let w = u.vlans[v];
+		push(vlans, { vlan: int(v), tagged: !!w.tagged, verdict: w.verdict, heard_ago: w.heard_ago });
+	}
+	return { vlans: length(vlans) ? slice(vlans, 0, 64) : null, neighbor: u?.neighbor };
+}
+
+// on_vlans is, by VLAN, the device the AP talks through on a VLAN of its
+// uplink (0186): a VLAN device on the uplink or on the bridge it is in, as
+// /proc/net/vlan/config lists them; and for one carried untagged with none,
+// that bridge, or the uplink itself. With its MAC, and each address netifd
+// says an interface holds on it, the AP's own.
+function on_vlans(up, vlans) {
+	let master = match(fs.readlink(`/sys/class/net/${up}/master`) ?? '', /([^\/]+)$/)?.[1];
+	let devs = {};
+	for (let l in split(fs.readfile('/proc/net/vlan/config') ?? '', '\n')) {
+		let f = match(l, /^(\S+)\s*\|\s*([0-9]+)\s*\|\s*(\S+)/);
+		if (f && (f[3] == up || f[3] == master))
+			devs[f[2]] = f[1];
+	}
+	let held = {};
+	for (let i in bus.call('network.interface', 'dump')?.interface ?? []) {
+		let dev = i.l3_device ?? i.device;
+		if (!i.up || !dev)
+			continue;
+		for (let a in [...(i['ipv4-address'] ?? []), ...(i['ipv6-address'] ?? [])])
+			if (a?.address && type(a.mask) == 'int')
+				push(held[dev] ??= [], a.address + '/' + a.mask);
+	}
+	let out = {};
+	for (let v, tagged in vlans) {
+		let dev = devs[v] ?? (tagged ? null : (master ?? up));
+		if (!dev)
+			continue;
+		out[v] = { mac: read(`/sys/class/net/${dev}/address`), addresses: slice(uniq(held[dev] ?? []), 0, 16) };
+	}
+	return out;
+}
+
+// uplink_port is what the AP knows of its uplink itself (0064): its name,
+// MAC and MTU; how often its link has come and gone; the VLANs it carries
+// as the network config has them, Aeolus's and the AP's own, tagged or not,
+// and which is the management VLAN; and its counters since it came up.
+// Where the uplink is two ports, its bond taken apart, it is the one that is
+// the path out (0096). On each VLAN, the MAC the AP talks with there and the
+// addresses it holds there (0186).
+function uplink_port() {
+	let up = uplinks.path_out(uplinks.ports(cursor()));
+	if (!up || read(`/sys/class/net/${up}/address`) == null)
+		return null;
+	let num = (k) => int(read(`/sys/class/net/${up}/${k}`) ?? '0');
+	let vlans = {};
+	cursor().foreach('network', 'bridge-vlan', v => {
+		for (let e in (type(v.ports) == 'array' ? v.ports : v.ports ? [v.ports] : []))
+			if (split(e, ':')[0] == up && match(v.vlan ?? '', /^[0-9]+$/))
+				vlans[v.vlan] = index(split(e, ':')[1] ?? '', 't') >= 0;
+	});
+	let on = on_vlans(up, vlans);
+	let mgmt = match(mgmt_device() ?? '', /\.([0-9]+)$/)?.[1];
+	return {
+		name: up, mac: read(`/sys/class/net/${up}/address`), mtu: num('mtu'), carrier_changes: num('carrier_changes'),
+		vlans: slice(map(sort(keys(vlans), (a, b) => +a - +b), v => ({ vlan: int(v), tagged: vlans[v], mac: on[v]?.mac, addresses: on[v]?.addresses })), 0, 4094),
+		management_vlan: mgmt ? int(mgmt) : null,
+		rx_bytes: num('statistics/rx_bytes'), tx_bytes: num('statistics/tx_bytes'),
+		rx_packets: num('statistics/rx_packets'), tx_packets: num('statistics/tx_packets'),
+		rx_errors: num('statistics/rx_errors'), tx_errors: num('statistics/tx_errors'),
+		rx_dropped: num('statistics/rx_dropped'), tx_dropped: num('statistics/tx_dropped'),
+	};
+}
+
+// on_air_state is each interface the AP holds an IPv4 address on whose
+// network its own Wi-Fi serves too (0209): its name, whether it is the
+// management interface, its VLAN where it is one of a bridge's, and the
+// SSIDs there. What the AP itself broadcasts there goes out over the air,
+// and those networks' clients can reach it. Empty where none is.
+function on_air_state() {
+	let wifi = {};
+	for (let r, d in wireless_status() ?? {})
+		for (let i in d.interfaces ?? [])
+			if (i.ifname)
+				wifi[i.ifname] = i.config?.ssid ?? '';
+	let out = [], managed = mgmt()?.interface;
+	for (let i in bus.call('network.interface', 'dump')?.interface ?? []) {
+		let dev = i.l3_device;
+		if (!i.up || !length(i['ipv4-address'] ?? []) || !dev || !match(dev, /^[A-Za-z0-9._@-]{1,15}$/))
+			continue;
+		// A bridge's VLAN (br-lan.20), or the bridge itself: its members
+		// where it filters no VLANs, else those of its own VLAN.
+		let m = match(dev, /^(.+)\.([0-9]+)$/), bridge = null, vlan = null, entries = null;
+		if (m && fs.access(`/sys/class/net/${m[1]}/bridge`)) {
+			bridge = m[1];
+			vlan = int(m[2]);
+		} else if (fs.access(`/sys/class/net/${dev}/bridge`)) {
+			bridge = dev;
+			if (read(`/sys/class/net/${dev}/bridge/vlan_filtering`) == '1')
+				vlan = int(read(`/sys/class/net/${dev}/bridge/default_pvid`) ?? '1');
+			else
+				entries = fs.lsdir(`/sys/class/net/${dev}/brif`) ?? [];
+		}
+		if (!bridge)
+			continue;
+		if (vlan != null)
+			for (let v in bus.call('network.device', 'status', { name: bridge })?.['bridge-vlans'] ?? [])
+				if (v.id == vlan)
+					entries = v.ports;
+		let ssids = uplinks.on_air(entries ?? [], wifi);
+		if (length(ssids))
+			push(out, { interface: i.interface, management: i.interface == managed, vlan: vlan, ssids: slice(ssids, 0, 32) });
+	}
+	return slice(out, 0, 16);
+}
+
+// probe_news is what, of the prober's results, is worth a state report as
+// soon as it changes: each tunnel's verdict, where each network with a
+// fallback is and whether it cannot switch, whether each VLAN watched on the
+// uplink reaches the AP, the switch and port the uplink is on, each
+// network's DHCP findings, whether each network's RADIUS server went silent
+// or came back, which Wi-Fi clients are on the AP, and the loops it found.
+// And of radio resource management's: power control's latest step, and a
+// radio's latest move of its channel, as it is announced and as it ends.
+function probe_news() {
+	// A step of power control (0206), its latest, by when: what its
+	// clients did is no news an hour on. A move of a radio's channel
+	// (0073), its latest, by band, channel, how far it got and when: the
+	// manager's channel for the radio is the last report's, which a client
+	// test looks on (0239), and a move it heard of five minutes late sent
+	// tests to the channel the radio had left.
+	let apc = '';
+	try {
+		let r = json(read(RRM) ?? 'null');
+		let ev = r?.apc_events, mv = r?.moves;
+		if (type(ev) == 'array' && length(ev))
+			apc = 'apc=' + ev[length(ev) - 1]?.at;
+		if (type(mv) == 'array' && length(mv)) {
+			let m = mv[length(mv) - 1];
+			apc += sprintf(' move=%s:%s:%s@%s', m?.band, m?.to, m?.state, m?.at);
+		}
+	} catch (e) {
+	}
+	let p = probes();
+	if (!p)
+		return apc;
+	let v = map(sort(keys(p.tunnels ?? {})), k => k + '=' + p.tunnels[k].verdict);
+	push(v, ...map(sort(keys(p.vlans ?? {})), k => 'vlan' + k + '=' + p.vlans[k].verdict));
+	push(v, ...map(sort(keys(p.switches ?? {})), k => k + ':' + p.switches[k].active + (p.switches[k].cannot ? '!' : '')));
+	push(v, ...map(sort(keys(p.uplink?.vlans ?? {})), k => 'uplink' + k + '=' + p.uplink.vlans[k].verdict));
+	// A network going off the air, or back on (0201): its clients are moved
+	// off, which should not wait for the next report.
+	push(v, ...map(sort(keys(p.off_air ?? {})), k => 'offair:' + k + '=' + (p.off_air[k].off ? 'off' : 'on')));
+	let n = p.uplink?.neighbor;
+	if (n)
+		push(v, 'switch=' + (n.system ?? n.chassis ?? '') + '/' + (n.port ?? '') + '/' + join(' ', n.vlans ?? []));
+	// Each network's DHCP (0065): whether anything answers, how many servers
+	// answered one request, and which clients don't use DHCP.
+	for (let id in sort(keys(p.dhcp ?? {}))) {
+		let d = p.dhcp[id];
+		push(v, sprintf('dhcp:%s=%s/%d/%s', id, d.unanswered > 0 && !d.answered ? 'silent' : 'ok', length(d.duplicates ?? []) ? 2 : 1,
+			join(' ', sort(map(d.without ?? [], c => c.mac + (c.address ? '' : '!'))))));
+	}
+	// A network's RADIUS server going silent, or coming back (0114): no one
+	// can sign in meanwhile, which should not wait for the next report. Up
+	// and unverified are alike here, as a server that takes no status
+	// requests goes between them with every sign-in.
+	push(v, ...map(p.radius ?? [], r => 'radius:' + r.network + '=' + (r.verdict == 'silent' ? 'silent' : 'ok')));
+	// The Wi-Fi clients on the AP (0066): one joining or leaving.
+	push(v, 'clients=' + join(' ', sort(map(p.clients ?? [], c => c.mac))));
+	let l = map(p.loops ?? [], x => x.port);
+	return join(',', v) + ';' + join(',', l) + ';' + apc;
+}
+
+// time_state is whether the AP's clock is synchronized, as ntpd last said
+// through its hotplug (0069): null until it has said; its stratum and offset;
+// seconds since it said so; and the time servers ntpd was started with.
+function time_state() {
+	let servers = [];
+	for (let pid in split(run('pidof ntpd'), ' ')) {
+		let a = split(fs.readfile(`/proc/${pid}/cmdline`) ?? '', chr(0));
+		for (let i = 0; i + 1 < length(a); i++)
+			if (a[i] == '-p')
+				push(servers, a[i + 1]);
+		if (length(servers))
+			break;
+	}
+	let t = null;
+	try {
+		t = json(fs.readfile(TIME) ?? 'null');
+	}
+	catch (e) {
+		t = null;
+	}
+	let up = int(split(read('/proc/uptime') ?? '0', ' ')[0]);
+	let ago = t?.at != null ? up - int(t.at) : null;
+	// The clock's zone (0262): its name, and the rule in effect, which
+	// OpenWrt keeps in /tmp/TZ; UCI's where that is not there yet.
+	let sys = null;
+	cursor().foreach('system', 'system', s => {
+		if (sys == null)
+			sys = s;
+	});
+	let rule = trim(read('/tmp/TZ') ?? '');
+	return {
+		synced: t == null ? null : t.action != 'unsync' && t.action != 'other' && t.stratum < 16,
+		stratum: t?.stratum, offset: t?.offset, ago: ago != null && ago >= 0 ? ago : null,
+		servers: slice(uniq(servers), 0, 8),
+		zone: sys?.zonename, rule: rule != '' ? rule : sys?.timezone,
+	};
+}
+
+// steer_state reads what the steering daemon asked of clients and what came
+// of it (0138), while it steers a network and its word is recent. Where the
+// config has it steer and it has said nothing of late, that is said: it is
+// not running, and clients there join as on a network that is not steered.
+function steer_state() {
+	let wanted = cursor().get('aeolus', 'aeolus_steer') == 'steer';
+	let r = null;
+	try {
+		r = json(read(STEER) ?? 'null');
+	} catch (e) {
+	}
+	let recent = type(r?.at) == 'int' && time() - r.at <= STEER_STALE && type(r.networks) == 'array';
+	if (!recent)
+		return wanted ? { running: false } : null;
+	if (!length(r.networks) && !wanted)
+		return null;
+	return {
+		running: true, since: r.since ?? 0, networks: slice(r.networks, 0, 32),
+		events: slice(type(r.events) == 'array' ? r.events : [], -50), known: r.known ?? 0,
+	};
+}
+
+// ble_state is how the lending of the AP's Bluetooth radio to Home
+// Assistant does (0156), where the config has it lent: whether the AP has
+// such a radio at all; whether the daemon that lends it runs, and where it
+// does not, whether the tools it needs are there; and, running, whether
+// the radio scans, and whether actively, as Home Assistant can ask of it,
+// the port Home Assistant connects to, who is connected, how many
+// advertisements were heard and handed on since it started, and
+// how many devices were heard in the last five minutes. Null where the
+// config does not have it lent.
+function ble_state() {
+	if (cursor().get('aeolus', 'aeolus_ble', 'enabled') != '1')
+		return null;
+	if (!fs.access('/sys/class/bluetooth/hci0'))
+		return { radio: false };
+	let r = null;
+	try {
+		r = json(read(BLE) ?? 'null');
+	} catch (e) {
+	}
+	if (type(r?.at) != 'int' || time() - r.at > BLE_STALE || r.radio !== true)
+		return { radio: true, running: false, tools: !!(fs.access('/usr/bin/hcitool') && fs.access('/usr/bin/hcidump')) };
+	return {
+		radio: true, running: true, scanning: r.scanning === true, active: r.mode == 'active', port: int(r.port ?? 0), name: substr('' + (r.name ?? ''), 0, 64),
+		heard: int(r.heard ?? 0), sent: int(r.sent ?? 0), devices: int(r.devices ?? 0),
+		clients: map(slice(type(r.clients) == 'array' ? r.clients : [], 0, 8),
+			c => ({ from: substr('' + (c?.from ?? ''), 0, 64), subscribed: c?.subscribed === true })),
+	};
+}
+
+// ble_devices_state is what the AP's Bluetooth radio hears, device by
+// device (0157): from the daemon that lends it to Home Assistant, which
+// hears every advertisement, while it runs; and from the AP's own survey
+// (airscan), every few minutes; taken together where both say. Null where
+// neither says anything, as on an AP with no such radio.
+function ble_devices_state() {
+	let now = time(), table = null;
+	try {
+		let d = json(read(BLE_DEVICES) ?? 'null');
+		if (type(d?.at) == 'int' && now - d.at <= 60 && type(d.devices) == 'array')
+			table = d.devices;
+	} catch (e) {
+	}
+	let s = bus.call('airscan', 'ble');
+	let survey = type(s?.list) == 'array' ? s.list : null;
+	if (!table && !survey)
+		return null;
+	let out = btad.fold(btad.merge(table, survey), now);
+	out.source = table ? (survey ? 'both' : 'proxy') : 'survey';
+	if (type(s?.time) == 'int' && s.time > 0)
+		out.surveyed_ago = max(0, now - s.time);
+	return out;
+}
+
+// rrm_state reads what radio resource management found (0073), while it is
+// on and its results are recent.
+function rrm_state() {
+	let r = null;
+	try {
+		r = json(read(RRM) ?? 'null');
+	} catch (e) {
+	}
+	if (r?.on != true || type(r.at) != 'int' || time() - r.at > PROBES_STALE)
+		return null;
+	let out = {
+		address: r.address ?? '', advertised: r.advertised ?? [], neighbours: r.neighbours ?? [], ratings: r.ratings ?? [],
+		moves: r.moves ?? [], apc: r.apc ?? [],
+	};
+	// Power control's steps, with why (0206).
+	if (type(r.apc_events) == 'array' && length(r.apc_events))
+		out.apc_events = slice(r.apc_events, max(0, length(r.apc_events) - 40));
+	// The networks heard that are not Aeolus's (0105).
+	if (type(r.others) == 'array' && length(r.others))
+		out.others = slice(r.others, 0, 64);
+	// The radios that can't scan, as on a DFS channel.
+	if (type(r.cannot_scan) == 'array' && length(r.cannot_scan))
+		out.cannot_scan = slice(r.cannot_scan, 0, 4);
+	// How it listens, and whether its scan radio is out of service (0173),
+	// which the report never carried till now.
+	if (r.listens in ['scan-radio', 'serving'])
+		out.listens = r.listens;
+	if (r.scan_out === true)
+		out.scan_out = true;
+	// The moves it plans, and how long it has run (0338).
+	if (type(r.plans) == 'array' && length(r.plans))
+		out.plans = slice(r.plans, 0, 12);
+	if (type(r.up) == 'int' && r.up >= 0)
+		out.up = r.up;
+	return out;
+}
+
+// header is a response's header, by its name in any case.
+function header(r, name) {
+	for (let k, v in r.headers ?? {})
+		if (lc(k) == lc(name))
+			return v;
+	return null;
+}
+
+// 802.11r's key holders (0224), as the manager last gave them: by network,
+// the key what they say to each other is sealed with, and every BSS of the
+// network on the AP's site, each by its BSSID and NAS-Identifier; and the
+// version they came with. ft_told is what hostapd was last told to read
+// again, by section.
+let ft_doc = null, ft_seen = null, ft_told = {};
+
+// ft_bss is each BSS of a network with 802.11r the config has (0224): its
+// section and network, the NAS-Identifier it is a key holder by, and, where
+// it runs, its interface and BSSID.
+function ft_bss() {
+	let w = cursor().get_all('wireless') ?? {};
+	let up = {};
+	for (let radio, d in wireless_status() ?? {})
+		for (let i in d.interfaces ?? [])
+			if (i.section && match(i.ifname ?? '', /^[A-Za-z0-9._-]+$/))
+				up[i.section] = i.ifname;
+	let out = [];
+	for (let name in sort(keys(w))) {
+		let s = w[name];
+		if (s['.type'] != 'wifi-iface' || !match(s.aeolus_ft ?? '', /^[a-z][a-z0-9-]*$/) || !match(name, /^[A-Za-z0-9_]+$/))
+			continue;
+		let b = { section: name, network: s.aeolus_ft, nasid: s.nasid };
+		let mac = up[name] ? read(`/sys/class/net/${up[name]}/address`) : null;
+		if (mac && match(mac, /^[0-9a-f]{2}(:[0-9a-f]{2}){5}$/)) {
+			b.ifname = up[name];
+			b.bssid = mac;
+		}
+		push(out, b);
+	}
+	return out;
+}
+
+// ft_reload has hostapd read a BSS's key holders again, over its control
+// socket, without restarting it (0224). hostapd runs as the network user,
+// and answers only a socket it may write to. Without ucode's socket module,
+// hostapd reads them when the BSS next starts.
+function ft_reload(ifname) {
+	let socket = null;
+	try {
+		socket = require('socket');
+	} catch (e) {
+		return false;
+	}
+	let me = '/var/run/aeolus-ft.sock', said = null;
+	fs.unlink(me);
+	let k = socket.create(socket.AF_UNIX, socket.SOCK_DGRAM);
+	if (k && k.bind({ path: me }) && (fs.chown(me, 'network', 'network') || fs.chmod(me, 438)) &&
+	    k.connect({ path: `/var/run/hostapd/${ifname}` }) && k.send('RELOAD_RXKHS')) {
+		socket.poll(1000, [k, socket.POLLIN]);
+		said = k.recv(64, socket.MSG_DONTWAIT);
+	}
+	if (k)
+		k.close();
+	fs.unlink(me);
+	if (trim(said ?? '') == 'OK')
+		return true;
+	fail('ft: hostapd on %s did not read its key holders again: %s', ifname, said ?? 'no answer');
+	return false;
+}
+
+// ft_write writes each BSS's key holders where they are not what the
+// manager gave (0224), and has hostapd read them again: every other BSS of
+// its network, as hostapd reads them, an R0KH by its NAS-Identifier and an
+// R1KH by its BSSID, each sealed with the network's key. hostapd pushes a
+// client's keys to every R1KH as the client signs in, and asks the R0KH it
+// signed in with where none came. The files are root's, and the network
+// group's to read, as hostapd runs as the network user; where there is no
+// such group, hostapd runs as root, and they are root's alone. A BSS of a
+// network the manager named no holders for has none, and the files of
+// BSSes gone are taken away. A BSS
+// not yet running when its file is written is told once it runs; one that
+// starts reads its file itself.
+function ft_write() {
+	if (!ft_doc)
+		return;
+	let keep = {};
+	for (let b in ft_bss()) {
+		keep[b.section] = true;
+		let net = ft_doc.networks?.[b.network], lines = [];
+		if (match(net?.key ?? '', /^[0-9a-f]{64}$/))
+			for (let h in (type(net.holders) == 'array' ? net.holders : [])) {
+				if (h?.bssid == b.bssid || !match(h?.bssid ?? '', /^[0-9a-f]{2}(:[0-9a-f]{2}){5}$/) || !match(h?.nasid ?? '', /^[!-~]{1,48}$/))
+					continue;
+				push(lines, `r0kh=${h.bssid} ${h.nasid} ${net.key}`, `r1kh=${h.bssid} ${h.bssid} ${net.key}`);
+			}
+		let text = join('', map(sort(lines), l => l + '\n'));
+		let path = `${FT_DIR}/${b.section}`;
+		if (fs.readfile(path) != text) {
+			if (!fs.stat(FT_DIR)) {
+				fs.mkdir(FT_DIR, 448);
+				if (fs.chown(FT_DIR, 0, 'network'))
+					fs.chmod(FT_DIR, 488);
+			}
+			if (!store(path, text, 384)) {
+				fail('ft: cannot write %s', path);
+				continue;
+			}
+			if (fs.chown(path, 0, 'network'))
+				fs.chmod(path, 416);
+			log('ft: %s has %d other key holders', b.section, length(lines) / 2);
+		}
+		if (b.ifname && ft_told[b.section] != text) {
+			ft_reload(b.ifname);
+			ft_told[b.section] = text;
+		}
+	}
+	for (let f in fs.lsdir(FT_DIR) ?? [])
+		if (!keep[f]) {
+			fs.unlink(`${FT_DIR}/${f}`);
+			delete ft_told[f];
+		}
+}
+
+// ft_fetch asks the manager for the key holders where the version its
+// poll's answer names is not the one the AP has (0224). A manager that
+// names none has none to give.
+function ft_fetch(r, token) {
+	let want = header(r, 'Aeolus-FT');
+	if (!match(want ?? '', /^[0-9a-f]{1,64}$/) || want == ft_seen)
+		return;
+	let g = http('GET', '/v1/ap/ft', null, token);
+	if (g.status != 200 || type(g.json?.networks) != 'object') {
+		fail('ft: %s', describe(g));
+		return;
+	}
+	ft_doc = g.json;
+	ft_seen = want;
+}
+
+// What airscan is to trust (0304): the fleet's SSIDs and BSSIDs, as the
+// manager has them now, in airscan's trusted lists, beside what a person
+// put there. TRUST_MINE notes what the agent added, so that only that is
+// ever taken away. An AP without airscan has nothing to write to.
+const TRUST_MINE = '/etc/aeolus/airscan-trust.json';
+let trust_doc = null, trust_seen = null, trust_done = null;
+
+// trust_fetch asks the manager what airscan is to trust where the version
+// its poll's answer names is not the one the AP has (0304).
+function trust_fetch(r, token) {
+	let want = header(r, 'Aeolus-Trust');
+	if (!match(want ?? '', /^[0-9a-f]{1,64}$/) || want == trust_seen)
+		return;
+	let g = http('GET', '/v1/ap/trust', null, token);
+	let doc = g.status == 200 ? trust.clean(g.json) : null;
+	if (!doc) {
+		fail('trust: %s', describe(g));
+		return;
+	}
+	trust_doc = doc;
+	trust_seen = want;
+}
+
+// trust_write puts what airscan is to trust in its config, once for each
+// version the manager names (0304). airscan reads its lists before each of
+// its BSS scans, so it is not restarted for them.
+function trust_write() {
+	if (!trust_doc || trust_done == trust_seen || !fs.stat('/etc/config/airscan'))
+		return;
+	let c = cursor();
+	if (c.get('airscan', 'main') == null) {
+		trust_done = trust_seen;
+		return;
+	}
+	let had = null;
+	try {
+		had = json(fs.readfile(TRUST_MINE) ?? 'null');
+	}
+	catch (e) {
+		had = null;
+	}
+	let mine = {}, changed = false;
+	for (let opt in keys(trust.LISTS)) {
+		let now = trust.listOf(c.get('airscan', 'main', opt));
+		let m = trust.merge(now, type(had?.[opt]) == 'array' ? had[opt] : [], trust_doc[opt]);
+		mine[opt] = m.mine;
+		if (trust.same(now, m.next))
+			continue;
+		if (length(m.next))
+			c.set('airscan', 'main', opt, m.next);
+		else
+			c.delete('airscan', 'main', opt);
+		changed = true;
+	}
+	if (changed && !c.commit('airscan')) {
+		fail('trust: cannot write airscan\'s config');
+		return;
+	}
+	store(TRUST_MINE, sprintf('%J', mine), 384);
+	if (changed)
+		log('trust: airscan trusts the fleet\'s %d SSIDs and %d BSSIDs', length(trust_doc.trusted_ssid), length(trust_doc.trusted_bssid));
+	trust_done = trust_seen;
+}
+
+// The live daemon's minutes, watched (0307): where they stopped, procd
+// starts it again, as it would one that ended.
+const LIVE_LOAD = '/var/run/aeolus/load.json';
+let live_empty = null, live_again = null;
+
+function live_watch() {
+	let st = fs.stat(LIVE_LOAD), load = null;
+	if (st) {
+		try {
+			load = json(fs.readfile(LIVE_LOAD) ?? 'null');
+		}
+		catch (e) {
+			load = null;
+		}
+	}
+	let serving = length(filter(bus.list() ?? [], o => match(o, /^hostapd\./))) > 0;
+	let now = time(), j = livewatch.judge(now, st?.mtime, load, serving, live_empty, live_again);
+	live_empty = j.empty;
+	if (!j.why)
+		return;
+	let i = bus.call('service', 'list', { name: 'aeolus' })?.aeolus?.instances?.live;
+	if (!i?.running)
+		return;
+	bus.call('service', 'signal', { name: 'aeolus', instance: 'live', signal: 9 });
+	live_again = now;
+	live_empty = null;
+	note('live: %s: started again', j.why);
+}
+
+// Fleet updates (0079). Each poll's answer names, in its Aeolus-Agent
+// header, the bundle the AP should run. Where that isn't the one it last
+// confirmed, it fetches the manifest, fetches the files it lacks, checks
+// them, backs up what they replace, and installs them on trial, under the
+// old agent's rollback script; the new agent confirms itself once it has run
+// a while, reached the manager, and procd runs every instance.
+
+function agent_json(path) {
+	try {
+		return json(read(path) ?? 'null');
+	}
+	catch (e) {
+		return null;
+	}
+}
+
+// agent_trial is the update on trial, if any: { hash, version }.
+function agent_trial() {
+	let t = read(AGENT_TRIAL) ?? '';
+	let h = match(t, /hash=([0-9a-f]{64})/)?.[1];
+	return h ? { hash: h, version: match(t, /version=([A-Za-z0-9._-]{1,64})/)?.[1] ?? '' } : null;
+}
+
+// agent_failed records an update that couldn't go ahead, and why. That
+// bundle isn't tried again for RETRY_AFTER.
+function agent_failed(hash, version, why) {
+	note('agent update to %s: %s', version || hash, why);
+	store(AGENT_RESULT, sprintf('%J', { hash: hash, version: version ?? '', state: 'failed', why: substr(why, 0, 200), at: time() }));
+	return false;
+}
+
+// agent_confirmed records the bundle the AP runs: its trial is over, and an
+// update that failed before is no longer news.
+function agent_confirmed(version, hash) {
+	store(AGENT_JSON, sprintf('%J', { version: version, hash: hash }));
+	fs.unlink(AGENT_TRIAL);
+	fs.unlink(AGENT_RESULT);
+}
+
+// agent_backoff says whether a bundle failed or was rolled back lately.
+function agent_backoff(hash) {
+	let r = agent_json(AGENT_RESULT);
+	return r?.hash == hash && time() - (r.at ?? 0) < RETRY_AFTER;
+}
+
+// instances_running says whether procd runs every Aeolus instance.
+function instances_running() {
+	let all = bus.call('service', 'list', { name: 'aeolus' })?.aeolus?.instances ?? {};
+	if (!length(keys(all)))
+		return false;
+	for (let name, i in all)
+		if (!i.running)
+			return false;
+	return true;
+}
+
+// The places an agent file may have, as the manager's bundles name them.
+function agent_path_ok(p) {
+	return type(p) == 'string' && index(p, '..') < 0 &&
+		match(p, /^\/(usr\/sbin|usr\/libexec|usr\/share\/ucode\/aeolus|etc\/init\.d|etc\/hotplug\.d\/[a-z0-9-]+|lib\/upgrade\/keep\.d)\/[A-Za-z0-9._-]+$/) != null;
+}
+
+function parent(p) {
+	return substr(p, 0, rindex(p, '/'));
+}
+
+// agent_check checks a staged file as what it is: a ucode program compiles
+// against the staged modules, a staged module imports, a shell script
+// parses.
+function agent_check(f) {
+	let staged = AGENT_STAGE + f.path, mods = AGENT_STAGE + '/usr/share/ucode/*.uc';
+	let first = match(fs.readfile(staged) ?? '', /^[^\n]*/)?.[0] ?? '';
+	let mod = match(f.path, /^\/usr\/share\/ucode\/aeolus\/([a-z0-9_]+)\.uc$/)?.[1];
+	let cmd = null;
+	if (index(first, '#!/usr/bin/ucode') == 0)
+		cmd = `ucode -L '${mods}' -c -o /dev/null '${staged}'`;
+	else if (index(first, '#!/bin/sh') == 0 || index(f.path, '/etc/hotplug.d/') == 0)
+		cmd = `sh -n '${staged}'`;
+	else if (mod)
+		cmd = `ucode -L '${mods}' -e 'import * as m from "aeolus.${mod}";'`;
+	return cmd == null || system(cmd + ' </dev/null >/dev/null 2>&1') == 0;
+}
+
+// restart_self restarts the agent's service, after two seconds, in which
+// the rollback script it has just started leaves the service. On OpenWrt
+// main (cgroups) procd kills every process in a service when it stops it, so
+// a script the agent starts to restart it was killed by its own stop, before
+// the start, and no agent ran after (a W-318, 2026-10-18). rpcd's rc object
+// runs the init script in rpcd's own service; without rpcd, the script
+// leaves the agent's service before it runs the init script. The bus's last
+// error is read once first: an older ucode keeps it past a call that works.
+function restart_self() {
+	sleep(2000);
+	let ok = bus != null;
+	if (ok) {
+		bus.error();
+		bus.call('rc', 'init', { name: 'aeolus', action: 'restart' });
+		ok = bus.error() == null;
+	}
+	if (!ok)
+		system(`setsid sh -c 'grep -q ":/services/" /proc/$$/cgroup && echo $$ >/sys/fs/cgroup/cgroup.procs; exec /etc/init.d/aeolus restart' </dev/null >/dev/null 2>&1 &`);
+}
+
+// agent_update brings the AP's agent to the bundle the manager names. It
+// returns true when the new agent is installed and the service is about to
+// restart into it.
+function agent_update(wanted, token) {
+	let r = http('GET', '/v1/ap/agent', null, token);
+	let m = r.json;
+	if (r.status != 200 || m?.hash != wanted || type(m?.files) != 'array' || !length(m.files))
+		return agent_failed(wanted, null, 'cannot read its manifest: ' + describe(r));
+	let version = match(m.version ?? '', /^[A-Za-z0-9._-]{1,64}$/) ? m.version : '';
+	let need = {};
+	for (let f in m.files) {
+		if (!agent_path_ok(f?.path) || !(f.mode in ['0755', '0644']) || !match(f.sha256 ?? '', /^[0-9a-f]{64}$/))
+			return agent_failed(wanted, version, 'its manifest names a file it may not: ' + (f?.path ?? '?'));
+		if (sha256_file(f.path) != f.sha256)
+			need[f.path] = true;
+	}
+	// Its files are those already, as after an install by hand.
+	if (!length(keys(need))) {
+		agent_confirmed(version, wanted);
+		log('agent: runs %s', version);
+		return false;
+	}
+	log('agent: updating to %s, %d files', version, length(keys(need)));
+	system(`rm -rf '${AGENT_STAGE}'`);
+	for (let f in m.files) {
+		let staged = AGENT_STAGE + f.path, data;
+		system(`mkdir -p '${parent(staged)}'`);
+		if (need[f.path]) {
+			let d = http('GET', '/v1/ap/agent/files/' + f.sha256, null, token);
+			if (d.status != 200)
+				return agent_failed(wanted, version, `cannot fetch ${f.path}: ` + describe(d));
+			data = d.body;
+		}
+		else
+			data = fs.readfile(f.path);
+		if (data == null || sha256(data) != f.sha256)
+			return agent_failed(wanted, version, `${f.path} is not what its manifest says`);
+		if (fs.writefile(staged, data) == null)
+			return agent_failed(wanted, version, `cannot stage ${f.path}`);
+	}
+	for (let f in m.files)
+		if (!agent_check(f))
+			return agent_failed(wanted, version, `${f.path} doesn't check out`);
+	if (!fs.access(ROLLBACK) || system(`cp '${ROLLBACK}' '${ROLLBACK_COPY}'`) != 0)
+		return agent_failed(wanted, version, 'no rollback script to try it under');
+	// What the update replaces, to go back to.
+	system(`rm -rf '${AGENT_PREV}'`);
+	for (let f in m.files)
+		if (need[f.path] && fs.access(f.path) &&
+		    system(`mkdir -p '${parent(AGENT_PREV + f.path)}' && cp -p '${f.path}' '${AGENT_PREV + f.path}'`) != 0)
+			return agent_failed(wanted, version, `cannot back up ${f.path}`);
+	store(AGENT_TRIAL, sprintf('hash=%s\nversion=%s\n', wanted, version));
+	system(`setsid sh '${ROLLBACK_COPY}' ${wanted} ${TRIAL_FOR} </dev/null >/dev/null 2>&1 &`);
+	for (let f in m.files)
+		if (need[f.path] && !store(f.path, fs.readfile(AGENT_STAGE + f.path), f.mode == '0755' ? 0755 : 0644)) {
+			// Half installed: put the old files back now, not in five minutes.
+			note('agent: cannot install %s; putting the old agent back', f.path);
+			system(`setsid sh '${ROLLBACK_COPY}' ${wanted} 0 </dev/null >/dev/null 2>&1 &`);
+			return true;
+		}
+	system(`rm -rf '${AGENT_STAGE}'`);
+	log('agent: installed %s; restarting into it, which must confirm itself within %d s', version, TRIAL_FOR);
+	restart_self();
+	return true;
+}
+
+// agent_report is the agent the AP runs, for its state report: the bundle it
+// last confirmed, and an update under way, or the last that failed or was
+// rolled back.
+function agent_report() {
+	let have = agent_json(AGENT_JSON), t = agent_trial(), res = agent_json(AGENT_RESULT);
+	let out = { version: have?.version ?? '', hash: have?.hash ?? '' };
+	if (t)
+		out.update = { version: t.version, hash: t.hash, state: 'updating', ago: 0 };
+	else if (res?.state in ['failed', 'rolled-back'] && match(res.hash ?? '', /^[0-9a-f]{64}$/))
+		out.update = {
+			version: match(res.version ?? '', /^[A-Za-z0-9._-]{0,64}$/) ? res.version ?? '' : '', hash: res.hash,
+			state: res.state, why: substr(res.why ?? '', 0, 200), ago: max(0, time() - (res.at ?? time())),
+		};
+	return out;
+}
+
+// What the processor had done when health_state last looked, for how busy
+// it has been since; and each process, by pid, for which used it most.
+let cpu_was = null, proc_was = {};
+
+// TOP is how many processes health_state names: those holding the most
+// memory, and those that used the processor most since the last report.
+const TOP = 5;
+
+// processes is what each process holds and has used (0119): by pid, its
+// name, its resident memory in kB and its processor time in ticks, from
+// /proc/<pid>/stat, its name the part in brackets.
+function processes() {
+	let out = {};
+	for (let dir in fs.glob('/proc/[0-9]*') ?? []) {
+		let st = fs.readfile(dir + '/stat');
+		let open = st ? index(st, '(') : -1, close = st ? rindex(st, ')') : -1;
+		if (open < 0 || close < open)
+			continue;
+		let f = split(substr(st, close + 2), ' ');
+		if (length(f) < 22)
+			continue;
+		let name = replace(substr(st, open + 1, close - open - 1), /[^A-Za-z0-9._:\/@+-]/g, '_');
+		out[substr(dir, 6)] = { name: name, rss: int(f[21]) * 4, ticks: int(f[11]) + int(f[12]) };
+	}
+	return out;
+}
+
+// health_state is how the AP itself is doing (0119): how busy its processor
+// was since the last report, in percent of all its cores, and how many it
+// has; its load; its memory, and the space left where its config is kept,
+// in kB; the hottest of its temperature sensors; how many processes it
+// runs; and its connection table. The first report of a run has no figure
+// for the processor: there is nothing yet to measure from.
+function health_state() {
+	let h = {};
+	let cores = 0, total = 0, idle = 0;
+	for (let line in split(fs.readfile('/proc/stat') ?? '', '\n')) {
+		let f = split(trim(line), /[ \t]+/);
+		if (f[0] == 'cpu') {
+			for (let i = 1; i < length(f) && i <= 8; i++)
+				total += int(f[i]);
+			idle = int(f[4]) + int(f[5] ?? '0');   // idle, and waiting on storage
+		} else if (match(f[0] ?? '', /^cpu[0-9]+$/))
+			cores++;
+	}
+	if (cores)
+		h.cores = cores;
+	let span = cpu_was && total > cpu_was.total ? total - cpu_was.total : 0;
+	if (total > 0) {
+		if (span)
+			h.cpu = max(0, min(100, int(100 - 100.0 * (idle - cpu_was.idle) / span + 0.5)));
+		cpu_was = { total: total, idle: idle };
+	}
+	// The processes holding the most memory, and those that used the
+	// processor most since the last report, in percent of all its cores,
+	// as cpu is (0119): what grows, or spins.
+	let ps = processes();
+	let held = sort(values(ps), (a, b) => b.rss - a.rss);
+	h.top_mem = map(slice(held, 0, TOP), p => ({ name: p.name, rss: p.rss }));
+	if (span) {
+		let used = [];
+		for (let pid, p in ps)
+			if (proc_was[pid] && proc_was[pid].name == p.name && p.ticks > proc_was[pid].ticks)
+				push(used, { name: p.name, cpu: int(1000.0 * (p.ticks - proc_was[pid].ticks) / span + 0.5) / 10.0 });
+		sort(used, (a, b) => b.cpu - a.cpu);
+		h.top_cpu = slice(filter(used, u => u.cpu >= 0.1), 0, TOP);
+	}
+	proc_was = {};
+	for (let pid, p in ps)
+		proc_was[pid] = { name: p.name, ticks: p.ticks };
+	let l = split(read('/proc/loadavg') ?? '', ' ');
+	if (length(l) >= 3)
+		h.load = map(slice(l, 0, 3), x => +x);
+	let mem = {};
+	for (let line in split(fs.readfile('/proc/meminfo') ?? '', '\n')) {
+		let m = match(line, /^(MemTotal|MemAvailable|MemFree|Buffers|Cached):[ \t]+([0-9]+) kB/);
+		if (m)
+			mem[m[1]] = int(m[2]);
+	}
+	if (mem.MemTotal) {
+		h.mem_total = mem.MemTotal;
+		h.mem_available = min(mem.MemTotal, mem.MemAvailable ?? (mem.MemFree ?? 0) + (mem.Buffers ?? 0) + (mem.Cached ?? 0));
+	}
+	// /overlay holds its config and what was installed since; an image
+	// without one keeps them on /.
+	let d = match(run('df -k /overlay 2>/dev/null || df -k / 2>/dev/null'), /\n[^\n ]+[ \t]+([0-9]+)[ \t]+[0-9]+[ \t]+([0-9]+)[ \t]/);
+	if (d && int(d[2]) <= int(d[1])) {
+		h.storage_total = int(d[1]);
+		h.storage_free = int(d[2]);
+	}
+	let hot = null;
+	for (let z in fs.glob('/sys/class/thermal/thermal_zone*/temp') ?? []) {
+		let t = int(read(z) ?? '');
+		if (t > 0 && t < 200000 && (hot == null || t > hot))
+			hot = t;
+	}
+	if (hot != null)
+		h.temp = int(hot / 100 + 0.5) / 10.0;
+	h.procs = length(fs.glob('/proc/[0-9]*') ?? []);
+	let c = int(read('/proc/sys/net/netfilter/nf_conntrack_count') ?? ''), cm = int(read('/proc/sys/net/netfilter/nf_conntrack_max') ?? '');
+	if (cm > 0 && c >= 0) {
+		h.conntrack = c;
+		h.conntrack_max = cm;
+	}
+	return h;
+}
+
+// scan_radio_state is how the AP's scan radio is doing, where it has one
+// (0081, 0126): what airscan, whose radio it is, is at; how many networks
+// its latest look heard, and how long ago that was; and how often airscan
+// has bound its driver again to bring it back, how many times running that
+// did not (none once it has), and how long ago the last was. Null on an AP
+// with no scan radio; missing where it has one and airscan does not answer;
+// lent where it does not answer because a client test has stopped it for
+// its own use (0121), as one does with an airscan that lends no radio: the
+// test says so for as long as it has it stopped, not while it only waits.
+const SCAN_STATES = { idle: 'idle', clients: 'clients', bss: 'bss', spectral: 'spectral', lent: 'lent', healing: 'healing' };
+
+function scan_radio_state() {
+	let has = false;
+	cursor().foreach('wireless', 'wifi-device', s => {
+		has = has || s.airscan == '1';
+	});
+	if (!has)
+		return null;
+	let st = bus.call('airscan', 'status');
+	if (type(st) != 'object')
+		return { state: fs.access('/var/run/aeolus/clienttest/stopped') ? 'lent' : 'missing' };
+	let out = { state: SCAN_STATES[st.state] ?? 'waiting' };
+	let b = bus.call('airscan', 'bss');
+	if (type(b?.list) == 'array' && type(b.time) == 'int' && b.time > 0) {
+		out.networks = length(b.list);
+		out.looked_ago = max(0, time() - b.time);
+	}
+	if (type(st.heal) == 'object') {
+		out.heals = int(st.heal.count ?? 0);
+		out.heal_failed = int(st.heal.failed ?? 0);
+		if (st.heal.last > 0)
+			out.healed_ago = max(0, time() - st.heal.last);
+	}
+	return out;
+}
+
+// watching is the BSSIDs the manager last said are rogues or suspects that
+// this AP hears (0160): the clients the scan radio hears with them go in
+// the next state report.
+let watching = [];
+
+// airscan_state is what the scan radio found of other APs (0160): each BSS
+// airscan hears that is not this AP's own, the strongest first, 64 at most,
+// with what its wire check says: whether frames airscan sent on our wire
+// came out of it (null while it does not know yet), on which VLANs, and how
+// many times it looked. And the clients it hears talking through the
+// BSSIDs the manager asked after, those with the most frames first, 64 at
+// most, each heard in 10 frames or more: fewer are as often a client's MAC
+// garbled in the air, dc:da:14 beside dc:da:0c (2026-10-14). Null on an AP
+// with no scan radio, or where airscan has heard nothing.
+function airscan_state() {
+	let has = false;
+	cursor().foreach('wireless', 'wifi-device', s => {
+		has = has || s.airscan == '1';
+	});
+	if (!has)
+		return null;
+	let b = bus.call('airscan', 'bss');
+	if (type(b?.list) != 'array')
+		return null;
+	let bss = [];
+	for (let x in b.list) {
+		let id = lc(x?.bssid ?? ''), sig = x?.signal;
+		if (x?.own || !match(id, /^[0-9a-f]{2}(:[0-9a-f]{2}){5}$/) || !(x.band in { '2g': 1, '5g': 1, '6g': 1 }) ||
+		    type(x.channel) != 'int' || x.channel < 1 || x.channel > 233 || !(type(sig) in { int: 1, double: 1 }) || sig < -127 || sig > 30)
+			continue;
+		push(bss, {
+			bssid: id,
+			// As RRM hears a name: its first 32 bytes, each not printable a ?.
+			ssid: replace(substr(type(x.ssid) == 'string' ? x.ssid : '', 0, 32), /[^ -~]/g, '?'),
+			band: x.band,
+			channel: x.channel,
+			signal: sig,
+			wired: type(x.wired) == 'bool' ? x.wired : null,
+			vlans: slice(filter(x.wired_vlans ?? [], v => type(v) == 'int' && v >= 0 && v <= 4094), 0, 16),
+			looks: type(x.probe_windows) == 'int' && x.probe_windows > 0 ? x.probe_windows : 0,
+			ago: type(x.age_ms) == 'int' && x.age_ms > 0 ? int(x.age_ms / 1000) : 0,
+		});
+	}
+	sort(bss, (p, q) => q.signal > p.signal ? 1 : q.signal < p.signal ? -1 : 0);
+	let out = { bss: slice(bss, 0, 64) };
+	if (length(watching)) {
+		let watched = {};
+		for (let w in watching)
+			watched[w] = true;
+		let c = null;
+		try {
+			c = json(read(AIRSCAN_CLIENTS) ?? 'null');
+		} catch (e) {
+		}
+		let now = time(), clients = [];
+		for (let x in (type(c?.list) == 'array' ? c.list : [])) {
+			let mac = lc(x?.mac ?? ''), id = lc(x?.bssid ?? '');
+			// A group address is no client.
+			if (!watched[id] || !match(mac, /^[0-9a-f]{2}(:[0-9a-f]{2}){5}$/) || (hex(substr(mac, 0, 2)) & 1) ||
+			    type(x.frames) != 'int' || x.frames < 10)
+				continue;
+			push(clients, { mac: mac, bssid: id, frames: x.frames, ago: type(x.last_seen) == 'int' ? max(0, now - x.last_seen) : 0 });
+		}
+		sort(clients, (p, q) => q.frames - p.frames);
+		if (length(clients))
+			out.clients = slice(clients, 0, 64);
+	}
+	return length(out.bss) || out.clients ? out : null;
+}
+
+// short_since keeps, by radio, when it was first seen with fewer of its
+// networks on the air than it has (0216), so the report says for how long.
+let short_since = {};
+
+// The beacons each radio's networks sent and failed to send (0221), as
+// ath11k's beacon_stats counts them, all its networks together: the
+// counts of the last report by radio, to say what came between, and the
+// phys whose file did not read. Before port b4ecbba (B85) the read waits
+// three seconds for an answer that never comes where a radio has more
+// than one network: a phy that fails once is not read again until the
+// agent starts again.
+let beacons_last = {}, beacons_unread = {};
+
+function beacon_counts(phy) {
+	if (!match(phy ?? '', /^phy[0-9]+$/) || beacons_unread[phy])
+		return null;
+	let path = `/sys/kernel/debug/ieee80211/${phy}/ath11k/fw_stats/beacon_stats`;
+	if (!fs.access(path))
+		return null;
+	let text = fs.readfile(path);
+	if (text == null) {
+		beacons_unread[phy] = true;
+		return null;
+	}
+	let out = { sent: 0, failed: 0, networks: 0 };
+	for (let line in split(text, '\n')) {
+		let m = match(line, /^[ \t]*Num of beacon tx (success|failures)[ \t=]+([0-9]+)[ \t]*$/);
+		if (!m)
+			continue;
+		if (m[1] == 'success') {
+			out.sent += int(m[2]);
+			out.networks++;
+		}
+		else
+			out.failed += int(m[2]);
+	}
+	return out.networks ? out : null;
+}
+
+// beacons_since is what a radio's beacons came to since the last report,
+// over how many seconds; null on the first, and where its counts went back,
+// as the driver loaded again.
+function beacons_since(radio, phy) {
+	let b = beacon_counts(phy), last = beacons_last[radio], now = time();
+	if (!b) {
+		delete beacons_last[radio];
+		return null;
+	}
+	beacons_last[radio] = { sent: b.sent, failed: b.failed, phy: phy, at: now };
+	if (!last || last.phy != phy || b.sent < last.sent || b.failed < last.failed || now <= last.at)
+		return null;
+	return { sent: b.sent - last.sent, failed: b.failed - last.failed, over: now - last.at };
+}
+
+// CAC_LONGEST is the longest a radio listens for radar on a DFS channel
+// before it may send, in seconds: ten minutes on weather radar's channels,
+// a minute on the others, and some to spare.
+const CAC_LONGEST = 660;
+
+// in_cac says whether the radio of interface ifname waits on a DFS channel
+// it may not send on yet, listening for radar first (0216): hostapd has no
+// BSS to ask then, and the channel is usable, not yet available. One
+// usable for longer than a listen takes is no listening.
+function in_cac(ifname) {
+	let info = bus.call('iwinfo', 'info', { device: ifname });
+	let phy = info?.phy, mhz = info?.frequency;
+	if (!match(phy ?? '', /^phy[0-9]+$/) || type(mhz) != 'int')
+		return false;
+	let out = run(`iw phy ${phy} channels 2>/dev/null`);
+	let at = index(out, `* ${mhz} MHz`);
+	if (at < 0)
+		return false;
+	let block = substr(out, at + 2);
+	let end = index(block, '* ');
+	if (end >= 0)
+		block = substr(block, 0, end);
+	let m = match(block, /DFS state: usable \(for ([0-9]+) sec\)/);
+	return m != null && int(m[1]) <= CAC_LONGEST;
+}
+
+// on_air_count is how many of a radio's networks are on the air, of those
+// it has: each an AP interface of its config, not one its network took off
+// the air on purpose (0201), nor one turned off. A network is on the air
+// where hostapd has its BSS enabled. cac is whether it is listening for
+// radar before it may send, on a DFS channel: the radio is coming up, and
+// short of nothing yet. missing is the SSIDs not on the air.
+function on_air_count(radio, stopped) {
+	let out = { want: 0, on: 0, cac: false, missing: [] };
+	if (radio.disabled || radio.config?.disabled)
+		return out;
+	for (let i in radio.interfaces ?? []) {
+		if ((i.config?.mode ?? 'ap') != 'ap' || i.config?.disabled || (i.ifname && stopped[i.ifname]))
+			continue;
+		out.want++;
+		let st = i.ifname ? bus.call(`hostapd.${i.ifname}`, 'get_status')?.status : null;
+		if (st == 'ENABLED')
+			out.on++;
+		else {
+			if (st == 'DFS' || (!out.cac && i.ifname && in_cac(i.ifname)))
+				out.cac = true;
+			let ssid = i.config?.ssid;
+			if (type(ssid) == 'string' && length(ssid) <= 32 && index(out.missing, ssid) < 0)
+				push(out.missing, ssid);
+		}
+	}
+	return out;
+}
+
+// state_report is what the AP tells the manager about itself (0039).
+function state_report(running) {
+	let b = bus.call('system', 'board') ?? {};
+	let radios = [];
+	let bssids = [];   // its own, which another AP hearing it should not take for a stranger's (0105)
+	let ws = wireless_status();
+	let status = ws ?? {};
+	// The interfaces networks took off the air on purpose (0201).
+	let stopped = {};
+	for (let id, o in probes()?.off_air ?? {})
+		for (let i in (type(o?.stopped) == 'array' ? o.stopped : []))
+			stopped[i] = true;
+	let seen = {};
+	for (let name in sort(keys(status))) {
+		let band = status[name].config?.band;
+		if (!(band in { '2g': 1, '5g': 1, '6g': 1 }))
+			continue;
+		// Whether the radio is up, and the power it sends at, in dBm, are
+		// what it runs, whether or not Aeolus sets them.
+		let r = { radio: name, band: band, channel: 0, width: 0, clients: 0, up: status[name].up == true };
+		let phy = null;
+		for (let i in status[name].interfaces ?? []) {
+			if (!i.ifname)
+				continue;
+			let mac = match(i.ifname, /^[A-Za-z0-9._-]+$/) ? read(`/sys/class/net/${i.ifname}/address`) : null;
+			if (mac && match(mac, /^[0-9a-f]{2}(:[0-9a-f]{2}){5}$/) && index(bssids, mac) < 0)
+				push(bssids, mac);
+			let info = bus.call('iwinfo', 'info', { device: i.ifname });
+			phy ??= info?.phy;
+			if (info?.channel)
+				r.channel = info.channel;
+			if (type(info?.txpower) == 'int' && info.txpower >= 0 && info.txpower <= 40)
+				r.txpower = info.txpower;
+			let w = match(info?.htmode ?? '', /([0-9]+)/);
+			if (w)
+				r.width = int(w[1]);
+			r.clients += length(keys(bus.call(`hostapd.${i.ifname}`, 'get_clients')?.clients ?? {}));
+		}
+		// How many of its networks are on the air, and for how long fewer
+		// than it has (0216).
+		let c = on_air_count(status[name], stopped);
+		seen[name] = true;
+		if (c.want > 0) {
+			r.bss = c.on;
+			r.bss_want = c.want;
+			if (c.on < c.want && !c.cac) {
+				short_since[name] ??= time();
+				r.short_for = time() - short_since[name];
+				r.missing = slice(c.missing, 0, 16);
+			}
+			else
+				delete short_since[name];
+		}
+		else
+			delete short_since[name];
+		// Its beacons since the last report, where its driver counts them
+		// (0221).
+		let b = beacons_since(name, phy);
+		if (b)
+			r.beacons = b;
+		push(radios, r);
+	}
+	for (let name in keys(short_since))
+		if (!seen[name])
+			delete short_since[name];
+	let report = {
+		version: running ?? 0,
+		uptime: int(split(read('/proc/uptime') ?? '0', ' ')[0]),
+		openwrt: b.release?.version ?? '',
+		radios: slice(radios, 0, 8),
+		bssids: slice(bssids, 0, 64),
+		steering: steering_state(),
+		ports: ports_state(),
+		vxlan: vxlan_state(),
+	};
+	// Only where there are networks with a fallback (0061).
+	let tr = transports_state(), vp = vlan_probes();
+	if (tr)
+		report.transports = tr;
+	if (vp)
+		report.vlan_probes = vp;
+	// The networks that go off the air while they cannot reach their way on,
+	// as the prober has them (0201).
+	let oa = probes()?.off_air;
+	if (type(oa) == 'object' && length(keys(oa)))
+		report.off_air = oa;
+	// The VLANs watched on the uplink, and its switch (0064).
+	let up = uplink_state();
+	if (up.vlans)
+		report.uplink_vlans = up.vlans;
+	if (up.neighbor)
+		report.uplink_neighbor = up.neighbor;
+	let port = uplink_port();
+	if (port)
+		report.uplink_port = port;
+	// Its addresses on networks its own Wi-Fi serves (0209).
+	let shared = on_air_state();
+	if (length(shared))
+		report.on_air = shared;
+	// The clients' DHCP on each Aeolus network, as the prober found (0065).
+	let dhcp = probes()?.dhcp;
+	if (dhcp && length(keys(dhcp)))
+		report.dhcp = dhcp;
+	// Every Wi-Fi client on the AP, as the prober found (0066): each one a
+	// client as the prober writes them. What is not one is left out, as the
+	// manager refuses a report that has one (0289's first file names).
+	let found = probes()?.clients;
+	let clients = filter(type(found) == 'array' ? found : [], c => type(c) == 'object');
+	if (length(clients))
+		report.clients = slice(clients, 0, 256);
+	// Its own networks, that are not Aeolus's (0137): each as its config
+	// has it, with nothing of its key, and how many clients are on it.
+	let ifnames = {};
+	for (let name in keys(status))
+		for (let i in status[name].interfaces ?? [])
+			if (i.section && i.ifname)
+				ifnames[i.section + ' ' + name] = i.ifname;
+	let conf = cursor();
+	let theirs = own_nets.list(conf.get_all('wireless'), conf.get_all('network'), (section, radio) => {
+		let ifname = ifnames[section + ' ' + radio];
+		return ifname ? length(keys(bus.call(`hostapd.${ifname}`, 'get_clients')?.clients ?? {})) : 0;
+	});
+	if (length(theirs))
+		report.others = theirs;
+	// Each BSS of a network with 802.11r, a key holder by its BSSID and
+	// NAS-Identifier (0224).
+	let ft = filter(ft_bss(), b => b.bssid && match(b.nasid ?? '', /^[!-~]{1,48}$/));
+	if (length(ft))
+		report.ft = slice(map(ft, b => ({ network: b.network, bssid: b.bssid, nasid: b.nasid })), 0, 64);
+	// How the AP itself is doing (0119).
+	report.health = health_state();
+	// The RADIUS servers its networks sign clients in against, as the prober
+	// finds them (0114).
+	let radius = probes()?.radius;
+	if (radius && length(radius))
+		report.radius = slice(radius, 0, 64);
+	// Its own way out, as the prober finds it: its gateway, its name
+	// servers and the internet; and how long the manager took to answer its
+	// last poll (0142).
+	let way = probes()?.out;
+	if (way) {
+		if (poll_ms != null)
+			way.manager = { ms: poll_ms };
+		report.path = way;
+	}
+	// Its scan radio, where it has one (0126).
+	// Its agent can make a client test over the wire (0128): it has the
+	// test, and the socket module the test is made with.
+	if (fs.access(WIRE_LIB) && has_prober())
+		report.wire_tests = true;
+	let scan = scan_radio_state();
+	if (scan)
+		report.scan_radio = scan;
+	// What the scan radio found of other APs, and their clients (0160).
+	let air = airscan_state();
+	if (air)
+		report.airscan = air;
+	// Its clock (0069).
+	report.time = time_state();
+	// The per-user keys it has (0070).
+	let have = read(KEYS_VERSION);
+	if (have)
+		report.keys = { version: have, count: length(filter(values(cursor().get_all('wireless') ?? {}),
+			s => s['.type'] == 'wifi-station' && index(s['.name'], 'aeolus_key_') == 0)) };
+	// Its radio neighbours (0073).
+	// What its steering asked of clients, and what came of it (0138).
+	let sr = steer_state();
+	if (sr)
+		report.steer = sr;
+	// Its Bluetooth radio, where it is lent to Home Assistant (0156).
+	let bt = ble_state();
+	if (bt)
+		report.ble = bt;
+	// What it hears there, device by device (0157).
+	let heard = ble_devices_state();
+	if (heard)
+		report.ble_devices = heard;
+	let rr = rrm_state();
+	if (rr)
+		report.rrm = rr;
+	// Radios whose firmware crashed, while the log holds it (0310).
+	let ml = mixed_libs_state();
+	if (ml)
+		report.mixed_libs = ml;
+	let fw = fw_crash_state();
+	if (fw)
+		report.fw_crashes = fw;
+	report.agent = agent_report();
+	// netifd's network.wireless object is gone: the radios run, but nothing
+	// here can see them until the network restarts.
+	if (ws == null)
+		report.wireless_missing = true;
+	return report;
+}
+
+function report_state(running, token) {
+	let res = http('POST', '/v1/ap/state', state_report(running), token);
+	if (res.status != 200) {
+		fail('state report: %s', describe(res));
+		return;
+	}
+	// The rogues and suspects the manager says this AP hears (0160): the
+	// next report lists the clients the scan radio hears with them.
+	let w = res.json?.watch;
+	watching = slice(filter(type(w) == 'array' ? w : [], b => type(b) == 'string' && match(b, /^[0-9a-f]{2}(:[0-9a-f]{2}){5}$/)), 0, 64);
+}
+
+// send_connections sends the manager the records aeolus-journey made of
+// clients coming online (0118), the oldest first, 32 at a time, and notes
+// how far it got beside them, so the daemon lets those go. The manager
+// passes over a record it can't take; one it has no place for at all, an
+// older manager, is passed over here too, as keeping them helps no one.
+// It says whether the manager has them all now.
+function send_connections(token) {
+	let c = null, sent = null;
+	try {
+		c = json(read(CONNECTIONS) ?? 'null');
+		sent = json(read(CONNECTIONS + '.sent') ?? 'null');
+	} catch (e) {
+	}
+	if (type(c?.list) != 'array' || type(c.boot) != 'int')
+		return true;
+	let from = sent?.boot == c.boot && type(sent.seq) == 'int' ? sent.seq : 0;
+	let todo = filter(c.list, r => type(r?.seq) == 'int' && r.seq > from);
+	for (let i = 0; i < length(todo); i += 32) {
+		let batch = slice(todo, i, i + 32);
+		let res = http('POST', '/v1/ap/connections', { connections: map(batch, r => {
+			let x = { ...r };
+			delete x.seq;
+			return x;
+		}) }, token);
+		if (!(res.status in [200, 400, 404])) {
+			fail('clients\' connections: %s', describe(res));
+			return false;
+		}
+		if (res.status != 200)
+			fail('clients\' connections: the manager took none of %d: %s', length(batch), describe(res));
+		else if (res.json?.refused > 0)
+			fail('clients\' connections: the manager refused %d of %d: %s', res.json.refused, length(batch), res.json.why ?? '');
+		store(CONNECTIONS + '.sent', sprintf('%J\n', { boot: c.boot, seq: batch[length(batch) - 1].seq }));
+	}
+	return true;
+}
+
+// send_captures sends the manager the captures aeolus-journey kept of
+// attempts that failed (0135), a file each, the oldest first, and two at a
+// poll at most: they are large beside everything else an AP says. They go
+// after the attempts themselves, as the manager takes a capture only of an
+// attempt it has. One the manager took goes; so does one it cannot take,
+// as keeping it helps no one: not well formed, too large, of an attempt it
+// has not, or the manager an older one with no place for them. Anything
+// else is tried again at the next poll.
+let capture_tries = {};   // a capture that did not go -> how often it was tried
+
+// captures_waiting is the captures there are to send now, the oldest
+// first. Asked before the attempts' records are read: a capture is there
+// once its record is written, so each of these has its record among those
+// read after, and one kept in between is the next poll's.
+function captures_waiting() {
+	let order = (n) => map(split(n, /[-.]/), x => int(x));
+	return sort(filter(fs.lsdir(CAPTURES) ?? [], n => match(n, /^[0-9]+-[0-9]+\.json$/)), (x, y) => {
+		let a = order(x), b = order(y);
+		return a[0] != b[0] ? (a[0] < b[0] ? -1 : 1) : a[1] - b[1];
+	});
+}
+
+function send_captures(token, files) {
+	// What is tried is counted only of the files still there.
+	for (let n in keys(capture_tries))
+		if (index(files, n) < 0)
+			delete capture_tries[n];
+	for (let n in slice(files, 0, 2)) {
+		let c = null;
+		try {
+			c = json(read(`${CAPTURES}/${n}`) ?? 'null');
+		} catch (e) {
+		}
+		if (type(c) == 'object') {
+			// Less than the manager gives a request to arrive in.
+			let res = http('POST', '/v1/ap/captures', c, token, null, 25000);
+			if (!(res.status in [200, 400, 404, 413])) {
+				fail('a capture of a failed attempt: %s', describe(res));
+				// Tried again at the next poll. One that will not go, three
+				// times over, with the manager there, as one too large for
+				// the link in the time it has, is let go, so it does not
+				// hold the rest and the agent's own work back. They are
+				// sent only at a poll the manager answered: with it away
+				// they wait, as the records do.
+				capture_tries[n] = (capture_tries[n] ?? 0) + 1;
+				if (capture_tries[n] >= 3) {
+					fs.unlink(`${CAPTURES}/${n}`);
+					delete capture_tries[n];
+				}
+				return;
+			}
+			if (res.status in [400, 413])
+				fail('a capture of a failed attempt: the manager did not take it: %s', describe(res));
+		}
+		fs.unlink(`${CAPTURES}/${n}`);
+	}
+}
+
+// keys_digest is a digest of the key agent's sections in the wireless config,
+// to tell whether something else, such as a revert, changed them since it
+// wrote them (0070).
+function keys_digest() {
+	let parts = [];
+	for (let k, v in cursor().get_all('wireless') ?? {})
+		if (v['.type'] == 'wifi-station' && index(k, 'aeolus_key_') == 0)
+			push(parts, sprintf('%J', [k, v.iface, v.mac, v.key, v.vid]));
+	return sha256(join('\n', sort(parts)));
+}
+
+// write_keys writes an AP's whole key set as wifi-station sections, named
+// aeolus_key_<id>, through the UCI library in this process (the uci command
+// is far too slow for many keys), and has the wireless config reloaded:
+// hostapd rewrites its PSK files and reloads them without dropping a client
+// (0070). Each key goes on its network's wifi-ifaces here; a key whose form
+// is wrong is skipped. It returns how many keys it wrote.
+function write_keys(set) {
+	let c = cursor();
+	let w = c.get_all('wireless') ?? {};
+	let radios = filter(keys(w), k => w[k]['.type'] == 'wifi-device');
+	let want = {};
+	for (let id, net in set.networks ?? {}) {
+		let ifaces = filter(map(radios, r => iface_name(id, r)), n => w[n]?.['.type'] == 'wifi-iface');
+		if (!length(ifaces))
+			continue;
+		for (let k in net.keys ?? []) {
+			if (!match(k.id ?? '', /^[a-z0-9][a-z0-9-]*$/) || length(k.id) > 32 || !match(k.psk ?? '', /^[0-9a-f]+$/) || length(k.psk) != 64)
+				continue;
+			if (k.vlan != null && (type(k.vlan) != 'int' || k.vlan < 1 || k.vlan > 4094))
+				continue;
+			let macs = filter(k.macs ?? [], m => match(m, /^[0-9a-f][0-9a-f](:[0-9a-f][0-9a-f])+$/) && length(m) == 17);
+			want['aeolus_key_' + replace(k.id, /-/g, '_')] = {
+				iface: ifaces, mac: length(macs) ? macs : ['00:00:00:00:00:00'], key: k.psk, vid: k.vlan,
+			};
+		}
+	}
+	for (let k, v in w)
+		if (v['.type'] == 'wifi-station' && index(k, 'aeolus_key_') == 0 && !want[k])
+			c.delete('wireless', k);
+	for (let name, o in want) {
+		c.set('wireless', name, 'wifi-station');
+		c.set('wireless', name, 'iface', o.iface);
+		c.set('wireless', name, 'mac', o.mac);
+		c.set('wireless', name, 'key', o.key);
+		if (o.vid)
+			c.set('wireless', name, 'vid', '' + o.vid);
+		else
+			c.delete('wireless', name, 'vid');
+	}
+	c.commit('wireless');
+	system('ubus call network reload >/dev/null 2>&1');
+	return length(keys(want));
+}
+
+// stranded keeps the agent up where ucode's uclient module is missing, as
+// after a sysupgrade onto an image without it (0080). The init script starts
+// restore as the agent starts, and tries again until it loads (0234); an
+// agent that died at its import could do nothing meanwhile. So the agent
+// runs aeolus-packages restore itself too, a minute on and then less often,
+// up to an hour apart, until the module is there, and then ends, for procd
+// to start it anew with it. The key agent only waits.
+// loads_uclient says whether uclient loads now, in a ucode of its own: in
+// this process, a module whose load failed loads as nothing ever after,
+// without throwing (2026-10-24: the agent took that for uclient back, and
+// started anew every five seconds, hundreds of times).
+function loads_uclient() {
+	return system(`ucode -e 'exit(require("uclient")?.new ? 0 : 1)' >/dev/null 2>&1`) == 0;
+}
+
+function stranded(restore) {
+	let then = restore ? 'it is installed again through the manager' : 'the agent installs it';
+	if (fs.access('/usr/lib/ucode/uclient.so'))
+		note('ucode-mod-uclient is installed but does not load (%s): it was built for another ucode than this image\'s, and the agent cannot reach its manager without it: %s',
+			uclient_why ?? 'no reason given', then);
+	else
+		note('ucode-mod-uclient is not installed, and the agent cannot reach its manager without it: %s', then);
+	let wait = STRANDED_FIRST;
+	while (true) {
+		sleep(wait * 1000);
+		if (restore && fs.access(PACKAGES_TOOL))
+			system(PACKAGES_TOOL + ' restore </dev/null >/dev/null 2>&1');
+		if (loads_uclient())
+			break;
+		wait = min(wait * 2, RESTORE_EVERY);
+	}
+	log('ucode-mod-uclient loads now: the agent starts anew');
+	exit(0);
+}
+
+// keys_main is the key agent (0070), a procd instance of its own: it asks the
+// manager for the AP's per-user keys with the version it has, and the manager
+// holds the request until they change. A new set is written at once. Where
+// something else changed the key agent's sections, such as a revert of the
+// wireless config, they are written again.
+function keys_main() {
+	uloop.init();
+	signal('SIGTERM', () => exit(0));
+	signal('SIGINT', () => exit(0));
+	if (!uclient)
+		return stranded(false);
+	let have = read(KEYS_VERSION), wrote = null;
+	while (true) {
+		collect();
+		let token = read(TOKEN);
+		if (!token) {
+			sleep(30000);
+			continue;
+		}
+		if (wrote != null && keys_digest() != wrote)
+			have = null;   // changed behind it: ask for the whole set again
+		let r = http('GET', `/v1/ap/keys?wait=${KEYS_WAIT}`, null, token,
+			have ? { 'If-None-Match': `"${have}"` } : null, (KEYS_WAIT + 15) * 1000);
+		if (r.status == 200 && match(r.json?.version ?? '', /^[0-9a-f]+$/)) {
+			let n = write_keys(r.json);
+			have = r.json.version;
+			store(KEYS_VERSION, have + '\n', 0600);
+			wrote = keys_digest();
+			log('per-user keys: version %s, %d %s', have, n, n == 1 ? 'key' : 'keys');
+		}
+		else if (r.status == 304) {
+			wrote ??= keys_digest();
+		}
+		else {
+			if (r.status != 401)
+				fail('keys: %s', describe(r));
+			sleep(30000);
+		}
+	}
+}
+
+// packages points the AP's package feeds at the manager, and after a
+// sysupgrade has the packages Aeolus needs installed again from it, in the
+// background, since that can take a while and may restart the network
+// (0069). Once they are back it keeps the copies aeolus-early puts back
+// after the next sysupgrade, where what is installed changed (0248): an AP
+// set up afresh, or given a package a setting asked for, had none till then,
+// and its first sysupgrade restarted the network for vxlan (ce7f,
+// 2026-10-31). It returns when it next wants to look. Its first run waits
+// for the manager to answer a poll (0276): every feed is the manager's, and
+// at the start of a boot the AP may not reach it yet. Run then, it found no
+// module feed, whose line a sysupgrade takes away, and nothing to keep, and
+// looked again only an hour on (each AP's -95 flash, 2026-11-01).
+function packages(now) {
+	if (!fs.access(PACKAGES_TOOL))
+		return now + RESTORE_EVERY;
+	system(PACKAGES_TOOL + ' feeds >/dev/null 2>&1');
+	let what = fs.access(PACKAGES_DONE) ? 'keep' : 'restore';
+	system('setsid ' + PACKAGES_TOOL + ' ' + what + ' </dev/null >/dev/null 2>&1 &');
+	return now + RESTORE_EVERY;
+}
+
+// The actions a person may ask of the AP, once each (0104). Each returns
+// { ok, result }, said back to the manager before it takes effect where it
+// would cut the AP off.
+const LOCATE = '/tmp/aeolus-locate.sh';
+
+// locate blinks every LED the AP has for a minute, so a person can find it,
+// then puts each back as it was and has OpenWrt set its own LEDs again, in
+// the background.
+function locate() {
+	let leds = fs.lsdir('/sys/class/leds') ?? [];
+	if (!length(leds))
+		return { ok: false, result: 'this AP has no LEDs Linux can drive' };
+	fs.writefile(LOCATE,
+		'cd /sys/class/leds || exit 0\n' +
+		'for l in *; do printf "%s %s %s\\n" "$l" "$(sed -n "s/.*\\[\\(.*\\)\\].*/\\1/p" "$l/trigger")" "$(cat "$l/brightness")"; done > /tmp/aeolus-leds\n' +
+		'for l in *; do echo timer > "$l/trigger"; echo 150 > "$l/delay_on"; echo 150 > "$l/delay_off"; done 2>/dev/null\n' +
+		'sleep 60\n' +
+		'while read l t b; do echo "$t" > "$l/trigger"; [ "$t" = none ] && echo "$b" > "$l/brightness"; done < /tmp/aeolus-leds 2>/dev/null\n' +
+		'[ -x /etc/init.d/led ] && /etc/init.d/led restart >/dev/null 2>&1\n' +
+		'rm -f /tmp/aeolus-leds ' + LOCATE + '\n');
+	system('setsid sh ' + LOCATE + ' </dev/null >/dev/null 2>&1 &');
+	return { ok: true, result: sprintf('blinking its %d LEDs for 60 s', length(leds)) };
+}
+
+// restart_wifi restarts the Wi-Fi, as OpenWrt's wifi does: every client
+// drops, and joins again. Where aeolus-journey says hostapd must start anew
+// to keep the rings a capture's frames are read from (0146), as on an AP
+// that had its Wi-Fi up before what hands them out was installed, hostapd
+// is started anew with it: the Wi-Fi taken down, hostapd restarted, and the
+// Wi-Fi brought up on it.
+function restart_wifi() {
+	if (trim(fs.readfile(RINGS) ?? '') == 'restart') {
+		system("setsid sh -c 'wifi down; sleep 2; /etc/init.d/wpad restart; sleep 2; wifi up' </dev/null >/dev/null 2>&1 &");
+		return { ok: true, result: 'the Wi-Fi restarts, and hostapd with it, so that a failed attempt has a capture of its radio; its clients join again in some seconds' };
+	}
+	system('setsid wifi </dev/null >/dev/null 2>&1 &');
+	return { ok: true, result: 'the Wi-Fi restarts; its clients join again in a few seconds' };
+}
+
+// reboot_ap reboots the AP five seconds on, so the manager hears first;
+// never during an apply, whose revert would then not run.
+function reboot_ap() {
+	if (fs.access(PENDING))
+		return { ok: false, result: 'an apply is in progress; ask again once it is done' };
+	system('setsid sh -c "sleep 5; reboot" </dev/null >/dev/null 2>&1 &');
+	return { ok: true, result: 'rebooting in 5 s' };
+}
+
+// disconnect has one client leave every network it is on here, so that it
+// joins again (0107): hostapd deauthenticates it and lets it straight back.
+// It goes by hostapd's own objects, not netifd's network.wireless, which
+// may be lost (0105).
+function disconnect(a) {
+	let mac = lc(a.target ?? '');
+	if (!match(mac, /^[0-9a-f]{2}(:[0-9a-f]{2}){5}$/))
+		return { ok: false, result: 'no client was named' };
+	let on = [];
+	for (let o in bus.list() ?? []) {
+		if (substr(o, 0, 8) != 'hostapd.' || !bus.call(o, 'get_clients')?.clients?.[mac])
+			continue;
+		sentoff.note('agent', mac, substr(o, 8), 'asked');
+		bus.call(o, 'del_client', { addr: mac, reason: 1, deauth: true, ban_time: 0 });
+		push(on, substr(o, 8));
+	}
+	return length(on)
+		? { ok: true, result: sprintf('disconnected it from %s; it may join again at once', join(', ', on)) }
+		: { ok: false, result: 'it is not connected to this AP' };
+}
+
+// remove_network takes one of the AP's own Wi-Fi networks out of its config
+// (0137): one that is not Aeolus's, which Aeolus otherwise leaves as it is
+// (0040), and takes out only where a person asks it of this AP. It is asked
+// for by its SSID and its sections, one for each radio it is on, and a
+// section is not taken out where it no longer has that SSID. Each is kept
+// first, as it was, key and all, in a file only root reads: Aeolus has no
+// copy of it, and could not put it back. Nothing is taken out that cannot
+// be kept. The Wi-Fi then reloads: the network's clients are off it, and
+// the others on its radios join again in a few seconds. The AP waits for
+// the Wi-Fi to be back, as after an apply (0057), before it says what came
+// of it and reports its state: a report made while the radios reload has
+// none of the AP's own BSSIDs, and the manager would take its networks,
+// heard by another AP, for a stranger's. What it says came of it has
+// nothing of an SSID, which may be more than the manager takes for a
+// result: plain words only.
+function remove_network(a) {
+	let p = type(a.params) == 'object' ? a.params : {};
+	let c = cursor();
+	let w = c.get_all('wireless');
+	// What of the Wi-Fi was down already, to tell it from what does not
+	// come back.
+	let before = wifi_down(), missing = wifi_missing();
+	let on = {};
+	for (let name in (type(p.sections) == 'array' ? slice(p.sections, 0, own_nets.MOST) : [])) {
+		let s = own_nets.find(w, name, p.ssid);
+		if (!s)
+			continue;
+		if (!keep_own(s, 'Taken out of /etc/config/wireless by Aeolus, as asked') || !c.delete('wireless', s['.name'])) {
+			c.revert('wireless');
+			return { ok: false, result: 'it could not be kept in ' + REMOVED + ' and taken out, so it was left as it is' };
+		}
+		for (let r in own_nets.radios(s))
+			on[r] = true;
+	}
+	let n = length(keys(on));
+	if (!n)
+		return { ok: false, result: 'it has no such network of its own now' };
+	if (!c.commit('wireless')) {
+		c.revert('wireless');
+		return { ok: false, result: 'its config could not be written, so it was left as it is' };
+	}
+	system('wifi reload >/dev/null 2>&1');
+	// The reload has begun by then; what was up is waited for.
+	sleep(5000);
+	let down = wifi_back(before, missing);
+	// Said to the manager now, in a state report, and not five minutes on:
+	// what it shows of this AP's own is then as it is.
+	return { ok: true, report: true, result: sprintf('took it out of %s; kept as it was in %s%s', n == 1 ? 'one radio' : n + ' radios', REMOVED,
+		length(down) ? sprintf('; %d of its other networks did not come back within %d s', length(down), WIFI_WAIT) : '') };
+}
+
+// tell_network says all there is of one of the AP's own Wi-Fi networks to
+// the manager (0137): its section as it stands, its key in it, and its
+// VLAN. Asked by a person who is making the network Aeolus's own: Aeolus
+// then offers it as it was, key and all, which only the AP has. It goes as
+// the AP's own config comes, over the connection the AP knows the manager
+// by, and is asked for by section and SSID, as a taking out is. Nothing
+// here is written or changed, and nothing of it is logged.
+function tell_network(a) {
+	let p = type(a.params) == 'object' ? a.params : {};
+	let c = cursor();
+	let w = c.get_all('wireless');
+	// The section asked for by name, where one is: the manager holds what
+	// is said to it.
+	let s = type(p.tell) == 'string' ? own_nets.find(w, p.tell, p.ssid) : null;
+	if (!s && p.tell == null)
+		for (let name in (type(p.sections) == 'array' ? slice(p.sections, 0, own_nets.MOST) : []))
+			s ??= own_nets.find(w, name, p.ssid);
+	if (!s)
+		return { ok: false, result: 'it has no such network of its own now' };
+	return { ok: true, result: 'said its settings', detail: own_nets.told(w, c.get_all('network'), s) };
+}
+
+// The client test (0121): on an AP with a scan radio, that radio joins one
+// of the AP's networks as a client would. It takes a minute or two, so it
+// runs beside the agent, which says what came of it once its result is
+// there (tests_done).
+const CT_TOOL = '/usr/sbin/aeolus-clienttest';
+const CT_DIR = '/var/run/aeolus/clienttest';
+const CT_LONGEST = 480;   // seconds a test is given before it is taken to have died
+
+// trace_set takes from a poll's answer which clients to trace (0144):
+// "mac=seconds,..." in its Aeolus-Trace header, or none. They are written
+// for aeolus-journey with when each ends, and only where they change, by
+// more than a few seconds of drift. An AP that holds its line to the
+// manager (0145) has heard already, from aeolus-live, which writes the same
+// file and keeps it right; this is for one that does not.
+function trace_set(r) {
+	let want = {}, t = time();
+	for (let part in split(header(r, 'Aeolus-Trace') ?? '', ',')) {
+		let m = match(trim(part), /^([0-9a-f][0-9a-f](:[0-9a-f][0-9a-f]){5})=([0-9]+)$/);
+		if (m && int(m[3]) > 0 && int(m[3]) <= 7200 && length(keys(want)) < 16)
+			want[m[1]] = t + int(m[3]);
+	}
+	let have = null;
+	try {
+		have = json(read(TRACE) ?? 'null')?.macs;
+	} catch (e) {
+	}
+	have ??= {};
+	let same = length(keys(want)) == length(keys(have));
+	for (let mac, until in want)
+		if (type(have[mac]) != 'int' || have[mac] - until > 5 || until - have[mac] > 5)
+			same = false;
+	if (same)
+		return;
+	if (!length(keys(want)))
+		fs.unlink(TRACE);
+	else
+		store(TRACE, sprintf('%J\n', { at: t, macs: want }));
+}
+
+// test_running is the client test under way: { id, at, pid }, or null.
+function test_running() {
+	let r = null;
+	try {
+		r = json(read(CT_DIR + '/running') ?? 'null');
+	} catch (e) {
+	}
+	return type(r?.id) == 'int' && type(r.at) == 'int' ? r : null;
+}
+
+function client_test(a) {
+	if (!fs.access(CT_TOOL))
+		return { ok: false, result: 'this agent has no client test' };
+	if (type(a.params) != 'object')
+		return { ok: false, result: 'nothing was said of what to test' };
+	if (test_running())
+		return { ok: false, result: 'a client test is running here already' };
+	fs.mkdir('/var/run/aeolus');
+	fs.mkdir(CT_DIR);
+	fs.unlink(CT_DIR + '/result.json');
+	fs.unlink(CT_DIR + '/pid');
+	// For root alone: it holds a password, where the test signs in as a
+	// user (0124).
+	store(CT_DIR + '/ask.json', sprintf('%J', a.params), 0o600);
+	fs.writefile(CT_DIR + '/running', sprintf('%J', { id: a.id, at: time() }));
+	system(`setsid sh -c 'echo $$ > ${CT_DIR}/pid; exec ${CT_TOOL} ${CT_DIR}/ask.json ${CT_DIR}/result.json' </dev/null >/dev/null 2>&1 &`);
+	return { pending: true, result: 'started; its result follows' };
+}
+
+// tests_done says what came of the client test under way, once its result
+// is there. One that died without a result is said to have, and what it
+// may have left is put right: its interface taken down, and airscan, whose
+// radio it borrowed, started again.
+function tests_done(token) {
+	let r = test_running();
+	if (!r)
+		return;
+	let res = null;
+	try {
+		res = json(read(CT_DIR + '/result.json') ?? 'null');
+	} catch (e) {
+	}
+	let out = null;
+	if (type(res) == 'object')
+		out = { ok: res.outcome == 'passed', result: type(res.summary) == 'string' ? res.summary : '' + res.outcome, detail: res };
+	else {
+		// Its PID is written a moment after it is started.
+		let pid = read(CT_DIR + '/pid');
+		let alive = pid == null ? time() - r.at < 10 : match(pid, /^[0-9]+$/) && fs.access('/proc/' + pid);
+		if (alive && time() - r.at <= CT_LONGEST)
+			return;
+		for (let f in ['pid', 'wpa.pid']) {
+			let p = read(CT_DIR + '/' + f);
+			if (match(p ?? '', /^[0-9]+$/) && fs.access('/proc/' + p))
+				system(['kill', p]);
+		}
+		// One over the wire (0128) had no radio, and leaves nothing behind
+		// but its socket, which went with it.
+		let wire = false;
+		try {
+			wire = json(read(CT_DIR + '/ask.json') ?? 'null')?.band == 'wire';
+		} catch (e) {
+		}
+		if (fs.access('/sys/class/net/aet-sta0'))
+			system(['iw', 'dev', 'aet-sta0', 'del']);
+		// Its passphrase file among what it left.
+		for (let f in ['wpa.conf', 'wpa.pid', 'lease', 'udhcpc.sh', 'ctl', 'stopped'])
+			fs.unlink(CT_DIR + '/' + f);
+		if (!wire && fs.access('/etc/init.d/airscan'))
+			system('/etc/init.d/airscan start >/dev/null 2>&1');
+		out = { ok: false, result: wire ? 'the test did not finish' : 'the test did not finish; the scan radio was given back to airscan' };
+		note('the client test did not finish');
+	}
+	let d = http('POST', `/v1/ap/actions/${r.id}`, out, token);
+	// Said, or no longer wanted: either way it is done with.
+	if (d.status == 200 || d.status == 404) {
+		for (let f in ['running', 'ask.json', 'result.json', 'pid'])
+			fs.unlink(CT_DIR + '/' + f);
+		log('action client-test: %s', out.result);
+	}
+	else
+		fail('action client-test: %s', describe(d));
+}
+
+// Captures people start (0148): what crosses the AP, taken by tcpdump on
+// the interfaces aeolus.pcap picks, into files in memory, and sent to the
+// manager in pieces as they are written. One runs at a time. It runs beside
+// the agent, which only sends: an agent that restarts takes it up again.
+// aeolus-capture begins one, at once where the AP hears of it on its line.
+const CAP_DIR = pcap.DIR;                // a capture's files while it is taken and sent: in memory, gone at a restart of the AP
+const CAP_TOOL = '/usr/sbin/aeolus-capture';   // what begins one
+const CAP_PIECE = 262144;                // bytes of a file sent at a time
+const CAP_PIECES = 16;                   // pieces sent a turn
+const CAP_TURN = 2;                      // seconds between turns while one runs
+const CAP_AFTER = 240;                   // seconds one has to send what is left, once it has ended
+
+// capture_running is the capture under way: { id, at, seconds, files, each
+// { n, name, side, note, sent }; took, how long after the AP heard of it on
+// its line it was begun, in ms, where it heard so }, or null.
+function capture_running() {
+	let r = null;
+	try {
+		r = json(read(CAP_DIR + '/running') ?? 'null');
+	} catch (e) {
+	}
+	return type(r?.id) == 'int' && type(r.files) == 'array' ? r : null;
+}
+
+// capture_start begins a capture: the action, { id, params }, params what
+// to take. It is aeolus-capture that begins it, which aeolus-live has run
+// already where the AP heard of it on its line (0145): this then finds it
+// begun, and says so.
+function capture_start(a) {
+	if (type(a.params) != 'object')
+		return { ok: false, result: 'nothing was said of what to take' };
+	if (!fs.access(CAP_TOOL))
+		return { ok: false, result: 'this agent cannot take a capture' };
+	fs.mkdir('/var/run/aeolus');
+	let ask = sprintf('/var/run/aeolus/capture-%d.ask', a.id);
+	store(ask, sprintf('%J', a.params), 0o600);
+	let out = null;
+	try {
+		out = json(run(sprintf('%s %d %s 2>/dev/null', CAP_TOOL, a.id, ask)));
+	} catch (e) {
+	}
+	fs.unlink(ask);
+	if (type(out) != 'object' || type(out.result) != 'string')
+		return { ok: false, result: 'the capture could not be begun' };
+	return out.pending ? { pending: true, result: out.result } : { ok: false, result: out.result };
+}
+
+// capture_end stops what a capture runs, where it still does: its timer,
+// so that its script stops the rest and says it has ended; and, with all,
+// every tcpdump of it as well, as where no one waits for it any more.
+function capture_end(all) {
+	for (let n in fs.lsdir(CAP_DIR) ?? []) {
+		if (!match(n, /\.pid$/) || (!all && n != 'timer.pid'))
+			continue;
+		let p = read(CAP_DIR + '/' + n);
+		if (match(p ?? '', /^[0-9]+$/) && fs.access('/proc/' + p))
+			system(['kill', p]);
+	}
+}
+
+// capture_pump sends the manager what the capture under way has written
+// since the last turn, a piece at a time, and hears whether someone asked
+// for it to stop. Once it has ended and all of it is sent, or it has had
+// long enough to send, it says what came of it and lets its files go.
+function capture_pump(token) {
+	let r = capture_running();
+	if (!r)
+		return;
+	let ended = fs.access(CAP_DIR + '/ended'), stop = false, gone = false, said = false, left = 0, pieces = 0;
+	for (let f in r.files) {
+		let path = `${CAP_DIR}/${f.n}.pcap`, size = fs.stat(path)?.size ?? 0;
+		while (!gone && f.sent < size && pieces < CAP_PIECES) {
+			let h = fs.open(path, 'r');
+			if (!h)
+				break;
+			h.seek(f.sent);
+			let chunk = h.read(CAP_PIECE) ?? '';
+			h.close();
+			if (!length(chunk))
+				break;
+			let d = http('POST', `/v1/ap/pcaps/${r.id}`, { n: f.n, name: f.name, side: f.side, note: f.note, offset: f.sent, data: b64enc(chunk), took: r.took }, token, null, 30000);
+			pieces++;
+			if (d.status == 404)
+				gone = true;
+			else if (d.status == 413) {
+				// The manager holds as much as it will: the rest is let go.
+				f.sent = size;
+				stop = true;
+			}
+			else if ((d.status == 200 || d.status == 409) && type(d.json?.bytes) == 'int') {
+				// Where the manager is, which is where the next begins.
+				f.sent = min(d.json.bytes, size);
+				stop = stop || d.json.stop == true;
+				said = true;
+				if (d.status == 409)
+					break;
+			}
+			else
+				break;
+		}
+		left += max(0, size - f.sent);
+	}
+	// A turn with nothing to send still asks whether to go on.
+	if (!said && !gone && !ended) {
+		let d = http('POST', `/v1/ap/pcaps/${r.id}`, { took: r.took }, token, null, 10000);
+		gone = d.status == 404;
+		stop = stop || d.json?.stop == true;
+	}
+	if (gone) {
+		// No one waits for it: stopped, and let go.
+		capture_end(true);
+		system(['rm', '-rf', CAP_DIR]);
+		log('action capture: no longer wanted');
+		return;
+	}
+	if (stop && !ended && !r.stopped) {
+		capture_end(false);
+		r.stopped = time();
+	}
+	if (ended && r.ended == null)
+		r.ended = time();
+	// Its script gone without a word, as where it was killed: ended all the same.
+	let late = time() - r.at > r.seconds + 60;
+	if (!ended && late && r.ended == null) {
+		capture_end(true);
+		r.ended = time();
+		ended = true;
+	}
+	if (!ended || (left > 0 && time() - r.ended < CAP_AFTER)) {
+		store(CAP_DIR + '/running', sprintf('%J', r), 0o600);
+		return;
+	}
+	let packets = 0, dropped = 0, missed = [];
+	for (let f in r.files) {
+		let err = fs.readfile(`${CAP_DIR}/${f.n}.err`), c = pcap.counted(err);
+		if (c) {
+			packets += c.packets;
+			dropped += c.dropped;
+		}
+		else
+			push(missed, substr(f.name + ': ' + (pcap.failed(err) ?? 'it took nothing'), 0, 120));
+	}
+	let why = r.stopped ? 'stopped' : left > 0 ? 'its sending was not finished' : 'its time was up';
+	let out = { ok: packets > 0 || !length(missed),
+		result: substr(sprintf('%d packet%s from %d interface%s in %d s; %s%s%s', packets, packets == 1 ? '' : 's', length(r.files) - length(missed), length(r.files) - length(missed) == 1 ? '' : 's',
+			max(0, r.ended - r.at), why, dropped ? sprintf('; %d more than the AP could keep up with', dropped) : '', length(missed) ? '; not ' + join(', not ', missed) : ''), 0, 300),
+		detail: { packets: packets, why: why, missed: missed } };
+	let d = http('POST', `/v1/ap/actions/${r.id}`, out, token);
+	// Said, or no longer wanted: either way it is done with.
+	if (d.status == 200 || d.status == 404) {
+		system(['rm', '-rf', CAP_DIR]);
+		log('action capture: %s', out.result);
+	}
+	else {
+		store(CAP_DIR + '/running', sprintf('%J', r), 0o600);
+		fail('action capture: %s', describe(d));
+	}
+}
+
+// do_actions fetches the actions that wait for this AP, does each, and says
+// what came of it (0104). It says whether one changed what the AP reports
+// of itself, so that its state is reported at once.
+function do_actions(token) {
+	let r = http('GET', '/v1/ap/actions', null, token);
+	if (r.status != 200) {
+		fail('actions: %s', describe(r));
+		return false;
+	}
+	let report = false;
+	let kinds = { locate: locate, 'restart-wifi': restart_wifi, reboot: reboot_ap, disconnect: disconnect, 'client-test': client_test, 'remove-network': remove_network, 'import-network': tell_network, capture: capture_start };
+	for (let a in r.json?.actions ?? []) {
+		let out = kinds[a.kind] ? kinds[a.kind](a) : { ok: false, result: 'this agent cannot ' + a.kind };
+		log('action %s%s: %s', a.kind, a.target ? ' ' + a.target : '', out.result);
+		// One that runs on beside the agent is said of when it is done.
+		if (out.pending)
+			continue;
+		if (out.report)
+			report = true;
+		delete out.report;
+		let d = http('POST', `/v1/ap/actions/${a.id}`, out, token);
+		if (d.status != 200)
+			fail('action %s: %s', a.kind, describe(d));
+	}
+	return report;
+}
+
+function main() {
+	uloop.init();
+	// uloop's own handlers only act inside uloop.run(), and the agent spends
+	// its time asleep, so stop on these ourselves. Stopping during an apply
+	// is safe: the pending marker makes the next start finish or revert it.
+	signal('SIGTERM', () => exit(0));
+	signal('SIGINT', () => exit(0));
+	if (!uclient)
+		return stranded(true);
+	recover(read(TOKEN));
+	// The clamp's file is not kept over a sysupgrade, so make it again.
+	if (write_clamp(cursor().get_all('network'), cursor().get_all('aeolus')))
+		system('/etc/init.d/firewall reload >/dev/null 2>&1');
+	hold_radios();
+	let next_packages = null;   // once the manager answers a poll (0276)
+	let running = running_version();
+	// An update on trial (0079): this agent is the new one, until it
+	// confirms itself.
+	let trial = agent_trial();
+	let started = mono();
+	let assigned = false;
+	let held = null;
+	let last_state = 0;
+	let news = probe_news();
+	// The first poll after a start asks for the config whole, not only
+	// whether it changed, so an updated agent renders what it already runs
+	// with its own renderer, and applies what that adds.
+	let whole = true;
+	let woken = false;
+	while (true) {
+		collect();
+		tests_due();
+		let token = read(TOKEN);
+		if (!token) {
+			let wait = enroll();
+			if (wait > 0) {
+				sleep(wait * 1000);
+				continue;
+			}
+			token = read(TOKEN);
+		}
+		// Woken by what the AP heard on its line (0145): what waits for it
+		// is fetched before anything else, and done.
+		if (woken) {
+			if (do_actions(token))
+				last_state = 0;
+			capture_pump(token);
+		}
+		// The management interface moved under the config (0210), as when
+		// the AP is managed on another VLAN by hand: what renders from it,
+		// a tunnel's start, is rendered again, from the config asked for
+		// whole. It renders only for a config that comes.
+		let m = mgmt_interface();
+		if (uplinks.moved(rendered_mgmt, mgmt_seen, m)) {
+			log('the management interface is now %s, not %s: rendering the config again', m, rendered_mgmt);
+			rendered_mgmt = m;
+			whole = true;
+		}
+		mgmt_seen = m;
+		let extra = running != null && !whole ? { 'If-None-Match': `"${running}"` } : null;
+		let asked = clock(true);
+		let r = http('GET', '/v1/ap/config', null, token, extra);
+		if (r.status == 200 || r.status == 304) {
+			let got = clock(true);
+			poll_ms = int(((got[0] - asked[0]) * 1000 + (got[1] - asked[1]) / 1000000.0) * 10 + 0.5) / 10.0;
+		}
+		if (r.status == 401) {
+			log('the manager no longer knows this AP; enrolling again');
+			fs.unlink(TOKEN);
+			assigned = false;
+			continue;
+		}
+		if (r.status == 304) {
+			assigned = true;
+		}
+		else if (r.status == 200) {
+			whole = false;
+			let state = r.json?.state;
+			assigned = state != 'unassigned';
+			if (state == 'ready') {
+				keep_rrm_key(r.json);
+				converge(r.json, token);
+				keep_rrm_key(r.json);
+				keep_ssh_keys(r.json);
+				let now = running_version();
+				if (now != running) {
+					running = now;
+					last_state = 0;
+				}
+			}
+			else if (state == 'held') {
+				// Asked whole until it is ready: the manager holds a config
+				// by what the AP last reported, as netifd not yet having
+				// loaded vxlan, and lets it go once the AP reports otherwise.
+				// Asked by the version it runs, it would only answer 304,
+				// and the version would not be rendered again (0235).
+				whole = true;
+				if (held != r.json.version) {
+					held = r.json.version;
+					note('version %d is held by the manager; keeping what runs:', held);
+					for (let p in r.json.problems ?? [])
+						note('  %s', p);
+				}
+			}
+		}
+		else {
+			fail('poll: %s', describe(r));
+		}
+		let reached = r.status == 200 || r.status == 304;
+		// A new agent on trial confirms itself once it has run a while,
+		// reached the manager, and procd runs every instance (0079).
+		if (trial && reached && mono() - started >= CONFIRM_AFTER && instances_running()) {
+			agent_confirmed(trial.version, trial.hash);
+			log('agent: confirmed %s', trial.version);
+			trial = null;
+			last_state = 0;
+		}
+		// The clients the manager says to trace (0144).
+		if (reached)
+			trace_set(r);
+		// 802.11r's key holders, as the manager has them now, kept for each
+		// BSS the config has (0224).
+		if (reached && assigned) {
+			ft_fetch(r, token);
+			ft_write();
+		}
+		// What airscan is to trust, as the manager has it now (0304).
+		if (reached && assigned) {
+			trust_fetch(r, token);
+			trust_write();
+		}
+		// Actions a person asked of this AP, once each (0104).
+		if (reached && int(header(r, 'Aeolus-Actions') ?? '0') > 0 && do_actions(token))
+			last_state = 0;
+		if (reached)
+			tests_done(token);
+		// The live daemon's minutes, where they stopped (0307).
+		live_watch();
+		// What a capture has written since the last turn (0148).
+		if (reached)
+			capture_pump(token);
+		// What the AP is, where it has changed (0122).
+		if (reached)
+			facts_again(token);
+		// The bundle the manager names, where it isn't the one this AP runs.
+		// Not while a client test runs: the restart stops the service, and
+		// with it the test, which runs in its cgroup (C360-AP, 2026-11-06:
+		// v0.281.0 came at 08:40:19, the test was finishing, and its result
+		// was lost). It waits for the test's result, CT_LONGEST at most.
+		let wanted = header(r, 'Aeolus-Agent');
+		if (reached && !trial && match(wanted ?? '', /^[0-9a-f]{64}$/) &&
+		    wanted != agent_json(AGENT_JSON)?.hash && !agent_backoff(wanted) && !test_running()) {
+			if (agent_update(wanted, token)) {
+				// The restart stops this process.
+				while (true)
+					sleep(1000);
+			}
+			last_state = 0;
+		}
+		// A tunnel that went down or came back, or a loop, is reported at
+		// once rather than with the next state report (0059).
+		let now_news = probe_news();
+		if (now_news != news) {
+			news = now_news;
+			last_state = 0;
+		}
+		if (assigned && time() - last_state >= STATE_EVERY) {
+			report_state(running, token);
+			last_state = time();
+			hold_radios();
+		}
+		if (assigned) {
+			let waiting = captures_waiting();
+			if (send_connections(token) && reached)
+				send_captures(token, waiting);
+		}
+		if (next_packages == null ? reached : time() >= next_packages)
+			next_packages = packages(time());
+		want();
+		// On trial, often, to confirm in good time; and while a client
+		// test runs, to say what came of it soon after it is done.
+		let poll = trial ? 10 : capture_running() ? CAP_TURN : test_running() ? 5 : settings().poll;
+		woken = nap(poll * 1000 * (90 + math.rand() % 21) / 100);
+	}
+}
+
+switch (ARGV[0]) {
+case 'facts':
+	print(sprintf('%.J\n', facts()));
+	break;
+// state prints the state report and the facts the agent renders with, and
+// sends nothing: it runs the agent's own code where it can be seen.
+case 'state':
+	print(sprintf('%.J\n', { report: state_report(running_version()), render: render_facts({}, null) }));
+	break;
+case 'keys':
+	keys_main();
+	break;
+case 'ping': {
+	let r = http('GET', '/healthz');
+	print(r.status == 200 ? sprintf('manager reachable: %s\n', r.body) : sprintf('cannot reach the manager: %s\n', describe(r)));
+	exit(r.status == 200 ? 0 : 1);
+}
+default:
+	main();
+}

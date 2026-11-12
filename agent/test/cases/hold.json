@@ -1,0 +1,64 @@
+{
+	"about": "A test window (0344): the manager sends hold, with its end in Unix seconds and why, from maintenance with hold and until; the agent writes aeolus_hold, which aeolus-rrm and aeolus-steer hold still by. maintenance itself renders nothing.",
+	"current": "shed-current.json",
+	"facts": {
+		"uplink": "wan",
+		"radios": {
+			"radio0": {
+				"htmodes": [
+					"HT20",
+					"HT40",
+					"VHT20",
+					"VHT40",
+					"VHT80",
+					"VHT80+80",
+					"VHT160"
+				]
+			},
+			"radio1": {
+				"htmodes": [
+					"HT20",
+					"HT40"
+				]
+			}
+		}
+	},
+	"intent": {
+		"system": {
+			"country": "US",
+			"poll": 60
+		},
+		"radio": {
+			"2g": {
+				"channel": "auto"
+			},
+			"5g": {
+				"channel": "auto",
+				"width": 160
+			}
+		},
+		"network": {
+			"lab": {
+				"ssid": "Aeolus Lab",
+				"security": "wpa2-psk",
+				"passphrase": "fixture-passphrase-1",
+				"transport": {
+					"primary": {
+						"type": "vlan",
+						"vlan": 20
+					}
+				}
+			}
+		},
+		"maintenance": {
+			"on": true,
+			"until": "2026-11-09T03:00Z",
+			"why": "porting's -136 soak",
+			"hold": true
+		},
+		"hold": {
+			"until": 1794193200,
+			"why": "porting's -136 soak"
+		}
+	}
+}

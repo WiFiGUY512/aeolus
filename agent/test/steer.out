@@ -1,0 +1,428 @@
+
+== Suggest: a client near enough, that says it can use 5 GHz, is asked up once it has been on ten seconds, and moves
+  10  btm 02:00:00:00:00:0a on phy1-ap2 these only to 36862def2fc0..0301ff
+      { "at": 1791770010, "mac": "02:00:00:00:00:0a", "network": "test", "method": "suggest", "from": "2g", "asked": "btm", "outcome": "moved", "took": 2.0, "to": [ "5g" ], "answer": "accepted", "code": 0, "signal": -50 }
+  On 5 GHz it is not asked on to 6 GHz, which it never said it can use:
+
+== Suggest: one that says no is asked twice more, further apart, and then left alone
+  10  btm 02:00:00:00:00:0b on phy1-ap2 these only to 36862def2fc0..0301ff
+ 130  btm 02:00:00:00:00:0b on phy1-ap2 these only to 36862def2fc0..0301ff
+ 730  btm 02:00:00:00:00:0b on phy1-ap2 these only to 36862def2fc0..0301ff
+  and no more, in the half hour after
+      { "at": 1791770010, "mac": "02:00:00:00:00:0b", "network": "test", "method": "suggest", "from": "2g", "asked": "btm", "outcome": "refused", "took": 0.0, "to": [ "5g" ], "answer": "refused", "code": 6, "signal": -48 }
+      { "at": 1791770130, "mac": "02:00:00:00:00:0b", "network": "test", "method": "suggest", "from": "2g", "asked": "btm", "outcome": "refused", "took": 0.0, "to": [ "5g" ], "answer": "refused", "code": 6, "signal": -48 }
+      { "at": 1791770730, "mac": "02:00:00:00:00:0b", "network": "test", "method": "suggest", "from": "2g", "asked": "btm", "outcome": "refused", "took": 0.0, "to": [ "5g" ], "answer": "refused", "code": 6, "signal": -48 }
+
+== Suggest: one that says nothing and stays is counted as having stayed; one that is far, one that takes no request, and one never seen higher are not asked
+  10  btm 02:00:00:00:00:0a on phy1-ap2 these only to 36862def2fc0..0301ff
+      { "at": 1791770010, "mac": "02:00:00:00:00:0a", "network": "test", "method": "suggest", "from": "2g", "asked": "btm", "outcome": "stayed", "took": 20.0, "to": [ "5g" ], "signal": -52 }
+
+== Suggest: on 5 GHz, near, and able to use 6 GHz, a client is asked to 6 GHz; on 2.4 GHz and very near, to 6 GHz before 5
+  10  btm 02:00:00:00:00:0a on phy0-ap2 these only to 30862def2fe0..0301ff
+  10  btm 02:00:00:00:00:0b on phy1-ap2 these only to 30862def2fe0..0301ff 36862def2fc0..0301fe
+      { "at": 1791770010, "mac": "02:00:00:00:00:0a", "network": "test", "method": "suggest", "from": "5g", "asked": "btm", "outcome": "moved", "took": 1.0, "to": [ "6g" ], "signal": -55 }
+      { "at": 1791770010, "mac": "02:00:00:00:00:0b", "network": "test", "method": "suggest", "from": "2g", "asked": "btm", "outcome": "stayed", "took": 21.0, "to": [ "6g", "5g" ], "signal": -40 }
+
+== Hold: a client that has been on 5 GHz here is kept off 2.4 GHz for a moment when it comes to join, and joins 5 GHz
+  60  ban 02:00:00:00:00:0a on phy1-ap2 for 2500 ms
+      { "at": 1791770060, "mac": "02:00:00:00:00:0a", "network": "test", "method": "hold", "from": "2g", "asked": "held", "outcome": "moved", "took": 1.0, "to": [ "5g" ], "signal": -52 }
+  It leaves; later it joins 2.4 GHz all the same, once the moment is over, and its next try is not held:
+ 461  ban 02:00:00:00:00:0a on phy1-ap2 for 2500 ms
+      { "at": 1791770461, "mac": "02:00:00:00:00:0a", "network": "test", "method": "hold", "from": "2g", "asked": "held", "outcome": "joined", "took": 4.0, "to": [ "5g" ], "signal": -52 }
+
+== Hold: not one that is far, one never seen higher, or one that is on this AP already and comes down; not while the higher band is not up; and a probe that is only a look around leaves no record
+  60  ban 02:00:00:00:00:0a on phy1-ap2 for 2500 ms
+  records: 0
+  A probe, and then it joins 5 GHz: that is a record:
+ 120  ban 02:00:00:00:00:0a on phy1-ap2 for 2500 ms
+      { "at": 1791770120, "mac": "02:00:00:00:00:0a", "network": "test", "method": "hold", "from": "2g", "asked": "held", "outcome": "moved", "took": 2.0, "to": [ "5g" ], "signal": -50 }
+
+== Hold: one the daemon got to late, the client let on before hostapd was asked to keep it off, is no hold and no record; a network with only Hold back on needs no neighbour report of the higher band
+  decided: ban; then let on before it was asked: records 0, counted { }
+ 120  ban 02:00:00:00:00:0a on phy1-ap2 for 2500 ms
+      { "at": 1791770120, "mac": "02:00:00:00:00:0a", "network": "test", "method": "hold", "from": "2g", "asked": "held", "outcome": "moved", "took": 1.0, "to": [ "5g" ], "signal": -50 }
+
+== A client moved up that is back down within five minutes did not stay moved: said, and it is left alone for half an hour
+  10  btm 02:00:00:00:00:0a on phy1-ap2 these only to 36862def2fc0..0301ff
+      { "at": 1791770010, "mac": "02:00:00:00:00:0a", "network": "test", "method": "suggest", "from": "2g", "asked": "btm", "outcome": "moved", "took": 2.0, "to": [ "5g" ], "signal": -50 }
+      { "at": 1791770042, "mac": "02:00:00:00:00:0a", "network": "test", "method": "suggest", "from": "2g", "asked": "none", "outcome": "back", "took": 30.0 }
+
+== Sticky: a client weak on 5 GHz for three looks is told to go, to 2.4 GHz here first, and goes; there, though near enough, it is not asked back up
+  10  btm 02:00:00:00:00:0a on phy0-ap2 it is to go, these or others to 36862def2fd0..0301ff
+      { "at": 1791770010, "mac": "02:00:00:00:00:0a", "network": "test", "method": "sticky", "from": "5g", "asked": "btm", "outcome": "moved", "took": 8.0, "signal": -80, "why": "weak" }
+
+== Sticky: one that takes no request is put off at once where another AP has the network, and kept off its other band here for the hold down, ten seconds unset (0289); back within the minute, it is left alone, and twice as long each time it comes back again
+  10  kick 02:00:00:00:00:0b on phy1-ap1 for 10000 ms
+  10  ban 02:00:00:00:00:0b on phy0-ap1 for 10000 ms
+1815  kick 02:00:00:00:00:0b on phy1-ap1 for 10000 ms
+1815  ban 02:00:00:00:00:0b on phy0-ap1 for 10000 ms
+5420  kick 02:00:00:00:00:0b on phy1-ap1 for 10000 ms
+5420  ban 02:00:00:00:00:0b on phy0-ap1 for 10000 ms
+12625  kick 02:00:00:00:00:0b on phy1-ap1 for 10000 ms
+12625  ban 02:00:00:00:00:0b on phy0-ap1 for 10000 ms
+27030  kick 02:00:00:00:00:0b on phy1-ap1 for 10000 ms
+27030  ban 02:00:00:00:00:0b on phy0-ap1 for 10000 ms
+55835  kick 02:00:00:00:00:0b on phy1-ap1 for 10000 ms
+55835  ban 02:00:00:00:00:0b on phy0-ap1 for 10000 ms
+113440  kick 02:00:00:00:00:0b on phy1-ap1 for 10000 ms
+113440  ban 02:00:00:00:00:0b on phy0-ap1 for 10000 ms
+  put off 7 times in a day and a half, at: 0h00 0h30 1h30 3h30 7h30 15h30 31h30
+      { "at": 1791770010, "mac": "02:00:00:00:00:0b", "network": "lab", "method": "sticky", "from": "2g", "asked": "kick", "outcome": "back", "took": 5.0, "signal": -82, "why": "weak" }
+
+== Sticky: one told to go that stays is put off after eight seconds, and is gone; one whose signal comes back is left; one with nowhere better to go is never asked
+  10  btm 02:00:00:00:00:0a on phy0-ap1 it is to go, these or others to 36862def2fd0..0301ff 2005b6df64e9..0301fe
+  10  btm 02:00:00:00:00:0c on phy0-ap1 it is to go, these or others to 36862def2fd0..0301ff 2005b6df64e9..0301fe
+  20  kick 02:00:00:00:00:0a on phy0-ap1 for 10000 ms
+      { "at": 1791770010, "mac": "02:00:00:00:00:0c", "network": "lab", "method": "sticky", "from": "5g", "asked": "btm", "outcome": "recovered", "took": 10.0, "signal": -80, "why": "weak" }
+      { "at": 1791770010, "mac": "02:00:00:00:00:0a", "network": "lab", "method": "sticky", "from": "5g", "asked": "kick", "outcome": "left", "took": 70.0, "answer": "refused", "code": 1, "signal": -80, "why": "weak" }
+
+== Sticky: one whose signal is not known when its time is up is not put off; one that has gone to another of the AP's networks has left this one
+  10  btm 02:00:00:00:00:0a on phy0-ap1 it is to go, these or others to 36862def2fd0..0301ff 2005b6df64e9..0301fe
+  10  btm 02:00:00:00:00:0b on phy0-ap1 it is to go, these or others to 36862def2fd0..0301ff 2005b6df64e9..0301fe
+      { "at": 1791770010, "mac": "02:00:00:00:00:0b", "network": "lab", "method": "sticky", "from": "5g", "asked": "btm", "outcome": "left", "took": 0.0, "signal": -80, "why": "weak" }
+      { "at": 1791770010, "mac": "02:00:00:00:00:0a", "network": "lab", "method": "sticky", "from": "5g", "asked": "btm", "outcome": "stayed", "took": 10.0, "signal": -80, "why": "weak" }
+
+== Suggest and Sticky together: near enough on 2.4 GHz to be asked up, and weak on 5 GHz once there, a client is not sent up and down every half hour
+  in two days it is asked: up 0h00, down 0h00, up 0h30, down 0h30, up 1h30, down 1h31, up 3h31, down 3h31, up 7h31, down 7h31, up 15h31, down 15h32, up 31h32, down 31h32
+
+== An AP's own test client, which says so as it joins, is not asked up, held or put off: here, and when it comes again
+  one on for a moment, known at once: asked or held 0
+ 105  btm 02:00:00:00:00:0c on phy1-ap2 these only to 36862def2fc0..0301ff
+  records: 0, of the test client 0
+
+== A network with nothing on is not looked at; one with only Sticky on is not asked up
+  records: 0, on: [ "02:00:00:00:00:0a", "02:00:00:00:00:0b" ]
+
+== What the agent reports
+  10  btm 02:00:00:00:00:0a on phy1-ap2 these only to 36862def2fc0..0301ff
+{
+	"at": 1791770012,
+	"since": 1791770000,
+	"networks": [
+		{
+			"network": "lab",
+			"suggest": false,
+			"hold": false,
+			"sticky": true,
+			"bands": [
+				"2g",
+				"5g"
+			],
+			"counts": {
+			},
+			"weak": -75,
+			"margin": 5,
+			"floor": -65,
+			"hold_down": 10
+		},
+		{
+			"network": "test",
+			"suggest": true,
+			"hold": true,
+			"sticky": true,
+			"bands": [
+				"2g",
+				"5g",
+				"6g"
+			],
+			"counts": {
+				"suggest": {
+					"asked": 1,
+					"moved": 1
+				}
+			},
+			"weak": -75,
+			"margin": 5,
+			"floor": -65,
+			"hold_down": 10
+		}
+	],
+	"events": [
+		{
+			"at": 1791770010,
+			"mac": "02:00:00:00:00:0a",
+			"network": "test",
+			"method": "suggest",
+			"from": "2g",
+			"asked": "btm",
+			"outcome": "moved",
+			"took": 2.0,
+			"to": [
+				"5g"
+			],
+			"signal": -50
+		}
+	],
+	"known": 1
+}
+
+== What a client says of itself
+2.4 and 5 GHz: [ "2g", "5g" ]
+all three: [ "2g", "5g", "6g" ]
+says nothing: [ ]
+cut short: [ ]
+takes a transition request: true false false
+an AP's own test client: true; as the mark is written for wpa_supplicant: dd0502ae010201
+not one: false false false false
+
+== Suggest: not on to a band whose channel is nearly full; on to the next one up that is not (0207)
+  10  btm 02:00:00:00:00:0a on phy1-ap2 these only to 30862def2fe0..0301ff
+middle "86:2d:ef:2f" null; radio "86:2d:ef:2f 2g" null null
+loads near, a radio at a time: { "86:2d:ef:2f 2g": 12, "86:2d:ef:2f 5g": 60.5, "86:2d:ef:2f 6g": 3, "05:b6:df:64 5g": 30 }
+by load [ "C-360 6 GHz", "C-360 2.4 GHz", "Office 5 GHz", "C-360 5 GHz", "nonsense" ]
+by load, none known [ "C-360 5 GHz", "Office 5 GHz", "C-360 2.4 GHz", "C-360 6 GHz", "nonsense" ]
+loads near, none said: { } { }
+
+== Sticky, heard better (0289): a client on 5 GHz at -72 that another AP hears at -64 by its probes is told to go there at the second look, and goes
+  first look: asked 0
+   5  btm 02:00:00:00:00:0a on phy0-ap1 it is to go, these or others to 2005b6df64e9..0301ff
+      { "at": 1791770005, "mac": "02:00:00:00:00:0a", "network": "lab", "method": "sticky", "from": "5g", "asked": "btm", "outcome": "left", "took": 7.0, "signal": -72, "why": "better", "elsewhere": { "ap": "ap-2005b6df64e0", "signal": -64 } }
+
+== Sticky, heard better: not one heard well here, nor for a reading too old, on another band, short of the margin, or of an AP hostapd does not list
+  asked 0, records 0
+
+== Sticky, heard better: one that takes no request is put off at once, and kept off every band of the network here for its hold down; one told to go that stays is put off five seconds on, there too
+   5  kick 02:00:00:00:00:0a on phy0-ap1 for 15000 ms
+   5  ban 02:00:00:00:00:0a on phy1-ap1 for 15000 ms
+   5  btm 02:00:00:00:00:0b on phy0-ap1 it is to go, these or others to 2005b6df64e9..0301ff
+  10  kick 02:00:00:00:00:0b on phy0-ap1 for 15000 ms
+  10  ban 02:00:00:00:00:0b on phy1-ap1 for 15000 ms
+      { "at": 1791770005, "mac": "02:00:00:00:00:0a", "network": "lab", "method": "sticky", "from": "5g", "asked": "kick", "outcome": "left", "took": 60.0, "signal": -74, "why": "better", "elsewhere": { "ap": "ap-2005b6df64e0", "signal": -66 } }
+      { "at": 1791770005, "mac": "02:00:00:00:00:0b", "network": "lab", "method": "sticky", "from": "5g", "asked": "kick", "outcome": "left", "took": 65.0, "signal": -73, "why": "better", "elsewhere": { "ap": "ap-2005b6df64e0", "signal": -62 } }
+
+== Sticky, heard better: one put off that comes straight back is left alone for half an hour
+   5  kick 02:00:00:00:00:0a on phy0-ap1 for 15000 ms
+   5  ban 02:00:00:00:00:0a on phy1-ap1 for 15000 ms
+  records in the half hour: 1
+      { "at": 1791770005, "mac": "02:00:00:00:00:0a", "network": "lab", "method": "sticky", "from": "5g", "asked": "kick", "outcome": "back", "took": 20.0, "signal": -74, "why": "better", "elsewhere": { "ap": "ap-2005b6df64e0", "signal": -60 } }
+
+== The clients this AP hears by probe and does not serve, for its neighbours: the latest first, a band at a time, none it serves, none older than thirty seconds
+  [ [ "02:00:00:00:00:0a", "2g", "86:2d:ef:2f", -48, 0 ], [ "02:00:00:00:00:0b", "5g", "86:2d:ef:2f", -70, 0 ], [ "02:00:00:00:00:0a", "5g", "86:2d:ef:2f", -61, 5 ] ]
+  thirty seconds on: [ [ "02:00:00:00:00:0a", "2g", "86:2d:ef:2f", -48, 30 ], [ "02:00:00:00:00:0b", "5g", "86:2d:ef:2f", -70, 30 ] ]
+
+== Sticky's settings, as the renderer writes them (0289)
+[ "lab", { "margin": 8, "floor": -60, "hold_down": 15 } ]
+unset, out of bounds, not known, and weak, which is sticky's own: [ "lab", { "margin": 5, "floor": -65, "hold_down": 10 } ]
+none: null null
+
+== Sticky, as a client says (802.11k): one weak here, under -75, that no other AP hears and gives beacon reports, is asked once it has been on five seconds, of its own channel and its places elsewhere; one at -68, good where it is, is not; asked every five minutes at first, and twice as long each time after, up to two hours
+  in eight hours: A 0h00:05, A 0h05:05, A 0h15:05, A 0h35:05, A 1h15:05, A 2h35:05, A 4h35:05, A 6h35:05
+  which RRM knows by radio: { "05:b6:df:64 5g": "ap-2005b6df64e0", "05:b6:df:64 2g": "ap-2005b6df64e0" }
+
+== Sticky, as a client says: asked to go, it is asked every five minutes again
+  asked at 0h00:05 0h05:05 0h15:05
+2010  btm 02:00:00:00:00:0a on phy0-ap1 it is to go, these or others to 2005b6df64e9..0301ff
+  after it was asked to go: asked at 1h03:35 1h08:35
+
+== Sticky, as a client says: not one heard well here, one that gives no reports, one another AP hears by its probes, one on a network with no place elsewhere on its band, or an AP's own test client
+  asked: 0
+
+== Sticky, as a client says: it hears the network elsewhere 9 dB better than this AP, as it says it hears this AP; at the second look it is told to go there, the AP RRM knows by that radio named
+  15  btm 02:00:00:00:00:0a on phy0-ap1 it is to go, these or others to 2005b6df64e9..0301ff
+      { "at": 1791770015, "mac": "02:00:00:00:00:0a", "network": "lab", "method": "sticky", "from": "5g", "asked": "btm", "outcome": "left", "took": 5.0, "signal": -72, "why": "better", "elsewhere": { "ap": "ap-2005b6df64e0", "signal": -66 } }
+
+== Sticky, as a client says: set against what it says of this AP, not how this AP hears it; nor a report too old, one it would not make, of a BSS that is no place, or of a client not on the network there
+  3 dB better than it hears this AP: asked to go 0
+  a report 31 seconds old: asked to go 0
+  refused, of another BSS, of a client not here, or said on another of its bands here: asked to go 0, said of [ "02:00:00:00:00:0b" ]
+
+== Sticky, as a client says: one whose report names a place 9 dB over how this AP hears it, and says nothing of this AP, is not moved: a client hears an AP's louder sending, and only what it says of this AP is set against it
+  asked to go: 0, records: 0
+  and once it says how it hears this AP, 9 dB under the place, it is:
+  35  btm 02:00:00:00:00:0a on phy0-ap1 it is to go, these or others to 2005b6df64e9..0301ff
+  asked to go: 1
+
+== Sticky, as a client says: a place of an AP RRM does not know is a place all the same, and the record names no AP
+  15  kick 02:00:00:00:00:0a on phy0-ap1 for 15000 ms
+  15  ban 02:00:00:00:00:0a on phy1-ap1 for 15000 ms
+      { "at": 1791770015, "mac": "02:00:00:00:00:0a", "network": "lab", "method": "sticky", "from": "5g", "asked": "kick", "outcome": "left", "took": 60.0, "signal": -74, "why": "better" }
+  ask_channels, no own report: [ { "op_class": 125, "channel": 149 } ]
+
+== Sticky, weak and heard by no other AP: put off once, back five and a half minutes later, weak again twelve seconds on, and not put off again, then or after its rest
+  twelve seconds after it is back: put off 1 time(s), at 0h00:10
+  four hours on: put off 1 time(s)
+      { "at": 1791770010, "mac": "02:00:00:00:00:e5", "network": "lab", "method": "sticky", "from": "2g", "asked": "kick", "outcome": "left", "took": 60.0, "signal": -93, "why": "weak" }
+      { "at": 1791770340, "mac": "02:00:00:00:00:e5", "network": "lab", "method": "sticky", "from": "2g", "asked": "none", "outcome": "back", "took": 330.0, "why": "weak" }
+
+== Sticky, weak, heard by another AP two hours before: put off, back, and put off again after its rest
+  put off at 1h30:15 2h04:15
+
+== Sticky, weak and heard by no other AP: one whose place is a lower band here is not held back by its coming back before
+  put off 1 time(s)
+      { "at": 1791770010, "mac": "02:00:00:00:00:e5", "network": "lab", "method": "sticky", "from": "5g", "asked": "kick", "outcome": "moved", "took": 3.0, "signal": -80, "why": "weak" }
+
+== Sticky, like the TV: weak, heard by no other AP, come back once before, it still goes by what it says (802.11k), which the weak rule waits for
+   5  beacon 02:00:00:00:00:0a on phy0-ap1, mode 0, of Lab, for 120 TU: 115/44 125/149
+  15  btm 02:00:00:00:00:0a on phy0-ap1 it is to go, these or others to 2005b6df64e9..0301ff
+      { "at": 1791770015, "mac": "02:00:00:00:00:0a", "network": "lab", "method": "sticky", "from": "5g", "asked": "btm", "outcome": "left", "took": 5.0, "signal": -80, "why": "better", "elsewhere": { "ap": "ap-2005b6df64e0", "signal": -68 } }
+  one that says nothing is put off for its weak signal, the moment after:
+  30  beacon 02:00:00:00:00:0b on phy0-ap1, mode 0, of Lab, for 120 TU: 115/44 125/149
+  40  btm 02:00:00:00:00:0b on phy0-ap1 it is to go, these or others to 36862def2fd0..0301ff 2005b6df64e9..0301fe
+
+== Sticky, across a restart: a lone client that came back before it is not put off after it, its rest kept too
+  kept: came back [ 340 ], heard elsewhere [ [ "02:00:00:00:00:f0", 337 ] ], left alone until [ 2140 ]
+  after the restart, four hours: put off 0 time(s)
+  without what it kept, the first look after the restart would put it off again:
+  put off 1 time(s)
+
+== Sticky, across restarts: one that keeps coming back is left alone twice as long each time, though the daemon starts again after each time
+  put off 7 times in a day and a half, started again 7 times, at: 0h00 0h30 1h30 3h30 7h30 15h30 31h30
+
+== What a run before kept, read back: a file from before 0289, and what is past its time or not well said
+  from before: { "02:00:00:00:00:0a": { "bands": { "2g": -10, "5g": -5 }, "at": -5, "btm": true } }
+  came back { "02:00:00:00:00:0a": -3600 }, heard elsewhere { "02:00:00:00:00:0a": -7200 }, left alone until { "02:00:00:00:00:0a": 900 }
+  nothing, or not a file: as it was, 1
+  came back how often { "02:00:00:00:00:0a": { "n": 3, "at": -3600 } }, sent down how often { "02:00:00:00:00:0b": { "n": 1, "at": -60 } }, left down until { "02:00:00:00:00:0a": 600 }
+
+== Sticky, weak and heard by no other AP, back ten and a half minutes after its try: not put off again, then, five minutes or an hour on, or after a restart; put off once another AP hears it
+  back ten and a half minutes on, fifteen seconds after: put off 1 time(s), at 0h00:10
+  five minutes on: 1
+  an hour on: 1
+      { "at": 1791770010, "mac": "02:00:00:00:00:e5", "network": "lab", "method": "sticky", "from": "2g", "asked": "kick", "outcome": "left", "took": 60.0, "signal": -93, "why": "weak" }
+  kept: tried [ 10 ]
+  after a restart from what was kept, an hour: put off 0 time(s)
+  another AP hears it: put off 1 time(s)
+
+== Community sharing: what the other APs said their clients can use is known here from when it was said, a band known later kept, a bad reading passed over
+  A, said 30 s ago at another AP: { "bands": { "2g": 70, "5g": 70, "6g": 70 }, "at": 70 }
+  B, on 5 GHz here 5 s ago, told of 5 GHz 10 s ago: { "bands": { "5g": 95 }, "at": 95 }
+
+== Community sharing: told on are this AP's clients that said, as they joined here, they can use a band above 2.4 GHz, the latest joined first; not one that said 2.4 GHz alone, nor one gone
+  [ [ "02:00:00:00:00:0a", [ "2g", "5g", "6g" ], 0 ] ]
+  B said 2.4 and 5 GHz, A gone: [ [ "02:00:00:00:00:0b", [ "2g", "5g" ], 0 ] ]
+  on a network without it: [ ]
+
+== Community sharing, across: a client on 5 GHz that can use 6 GHz, here where the network has no 6 GHz, is asked what it hears of the network's 6 GHz at other APs; it says -48, and is sent there
+  10  beacon 02:00:00:00:00:0a on phy0-ap1, mode 0, of Lab, for 120 TU: 131/37
+  15  btm 02:00:00:00:00:0a on phy0-ap1 these only to 2005b6df64ea..0301ff
+      { "at": 1791770015, "mac": "02:00:00:00:00:0a", "network": "lab", "method": "suggest", "from": "5g", "asked": "btm", "outcome": "left", "took": 22.0, "to": [ "6g" ], "answer": "accepted", "code": 0, "signal": -67, "elsewhere": { "ap": "ap-2005b6df64e0", "signal": -48 } }
+
+== Community sharing, across: one that says it hears the other AP's 6 GHz at -70 stays, and is asked again two and then ten minutes on, and no more
+  10  beacon 02:00:00:00:00:0a on phy0-ap1, mode 0, of Lab, for 120 TU: 131/37
+ 130  beacon 02:00:00:00:00:0a on phy0-ap1, mode 0, of Lab, for 120 TU: 131/37
+ 730  beacon 02:00:00:00:00:0a on phy0-ap1, mode 0, of Lab, for 120 TU: 131/37
+
+== Community sharing, across: not with community sharing off; not for a client that never said it can use 6 GHz; not one that gives no beacon reports
+  (nothing asked)
+
+== Keep on 6 GHz: a client on 6 GHz here at -60 is kept off 5 GHz and 2.4 GHz here beforehand, for 15 s, renewed while it is so; heard under -72 once it stays kept, twice running it is let go there; kept again, the switch turned off lets it go
+   0  bar 02:00:00:00:00:0a on phy0-ap2 for 15000 ms
+   0  bar 02:00:00:00:00:0a on phy1-ap2 for 15000 ms
+  10  bar 02:00:00:00:00:0a on phy0-ap2 for 15000 ms
+  10  bar 02:00:00:00:00:0a on phy1-ap2 for 15000 ms
+  20  bar 02:00:00:00:00:0a on phy0-ap2 for 15000 ms
+  20  bar 02:00:00:00:00:0a on phy1-ap2 for 15000 ms
+  (heard at -74 once: still kept)
+  30  bar 02:00:00:00:00:0a on phy0-ap2 for 15000 ms
+  30  bar 02:00:00:00:00:0a on phy1-ap2 for 15000 ms
+  40  bar 02:00:00:00:00:0a on phy0-ap2 for 0 ms
+  40  bar 02:00:00:00:00:0a on phy1-ap2 for 0 ms
+  (heard at -75 twice running: let go)
+      { "at": 1791770000, "mac": "02:00:00:00:00:0a", "network": "test", "method": "keep", "from": "6g", "to": [ "6g" ], "asked": "held", "outcome": "stayed", "took": 40, "signal": -75 }
+  (still weak: not kept again)
+  55  bar 02:00:00:00:00:0a on phy0-ap2 for 15000 ms
+  55  bar 02:00:00:00:00:0a on phy1-ap2 for 15000 ms
+  60  bar 02:00:00:00:00:0a on phy0-ap2 for 0 ms
+  60  bar 02:00:00:00:00:0a on phy1-ap2 for 0 ms
+  (the switch off: let go)
+      { "at": 1791770055, "mac": "02:00:00:00:00:0a", "network": "test", "method": "keep", "from": "6g", "to": [ "6g" ], "asked": "held", "outcome": "stayed", "took": 5, "signal": -58 }
+  counted { "asked": 2, "stayed": 2 }
+
+== Keep on 6 GHz: a kept client gone from 6 GHz here is let go at once, the lower bands open to it again; one found on a lower band, as where a ban ran out with the daemon held up, is asked nothing there
+   0  bar 02:00:00:00:00:0a on phy0-ap2 for 15000 ms
+   0  bar 02:00:00:00:00:0a on phy1-ap2 for 15000 ms
+  30  bar 02:00:00:00:00:0a on phy0-ap2 for 0 ms
+  30  bar 02:00:00:00:00:0a on phy1-ap2 for 0 ms
+  (gone: nothing more)
+      { "at": 1791770000, "mac": "02:00:00:00:00:0a", "network": "test", "method": "keep", "from": "6g", "to": [ "6g" ], "asked": "held", "outcome": "left", "took": 30, "signal": -55 }
+  45  bar 02:00:00:00:00:0a on phy0-ap2 for 15000 ms
+  45  bar 02:00:00:00:00:0a on phy1-ap2 for 15000 ms
+  45  bar 02:00:00:00:00:0a on phy1-ap2 for 0 ms
+  (on 5 GHz now: only 2.4 GHz is let go, 5 GHz asked nothing)
+      { "at": 1791770045, "mac": "02:00:00:00:00:0a", "network": "test", "method": "keep", "from": "6g", "to": [ "6g" ], "asked": "held", "outcome": "left", "took": 0, "signal": -55 }
+
+== Keep on 6 GHz: radios restarted under new names, as after a driver swap, took hostapd's bans with them: the kept client is kept off the new ones, and let go, nothing is asked of the ones gone
+   0  bar 02:00:00:00:00:0a on phy0-ap2 for 15000 ms
+   0  bar 02:00:00:00:00:0a on phy1-ap2 for 15000 ms
+  (2.4 and 5 GHz back as phy9-ap2 and phy8-ap2)
+   5  bar 02:00:00:00:00:0a on phy8-ap2 for 15000 ms
+   5  bar 02:00:00:00:00:0a on phy9-ap2 for 15000 ms
+  35  bar 02:00:00:00:00:0a on phy8-ap2 for 0 ms
+  35  bar 02:00:00:00:00:0a on phy9-ap2 for 0 ms
+  (gone: only phy8-ap2 and phy9-ap2 let go)
+      { "at": 1791770000, "mac": "02:00:00:00:00:0a", "network": "test", "method": "keep", "from": "6g", "to": [ "6g" ], "asked": "held", "outcome": "left", "took": 35, "signal": -55 }
+
+== Keep on 6 GHz never strands a client that is not on 6 GHz: one on 2.4 GHz alone, one on 5 GHz, one on 6 GHz heard at -75, an AP's own test client on 6 GHz, and one on a network without it are none of them kept
+  (nothing kept)
+
+== Where a client belongs, as the renderer writes it (0319)
+[ "02:00:00:00:00:0a", { "here": false, "nearest": false, "aps": [ "ap-2005b6df64e0" ], "bands": [ ], "hold": 20 } ]
+[ "02:00:00:00:00:0b", { "here": true, "nearest": false, "aps": [ "ap-30862def2fff", "ap-2005b6df64e0" ], "bands": [ "5g", "6g" ], "hold": 30 } ]
+not well said, each none: [ null, null, null, null, null, null, null, null, null, null ]
+
+== Home (0319): a client on lab 5 GHz whose rule names the other AP is told to go there once it has been on ten seconds, however well it is heard here; it stays, and is put off five seconds on, kept off both of the network's bands here for its rule's hold
+  asked at five seconds: 0
+  10  btm 02:00:00:00:00:0a on phy0-ap1 it is to go, these or others to 2005b6df64e9..0301ff
+  15  kick 02:00:00:00:00:0a on phy0-ap1 for 20000 ms
+  15  ban 02:00:00:00:00:0a on phy1-ap1 for 20000 ms
+      { "at": 1791770010, "mac": "02:00:00:00:00:0a", "network": "lab", "method": "sticky", "from": "5g", "asked": "kick", "outcome": "left", "took": 65.0, "signal": -45, "why": "home", "elsewhere": { "ap": "ap-2005b6df64e0" } }
+
+== Home: one that takes no request is put off at once; one that comes straight back is left alone for half an hour, then is sent again
+  10  kick 02:00:00:00:00:0a on phy0-ap1 for 20000 ms
+  10  ban 02:00:00:00:00:0a on phy1-ap1 for 20000 ms
+  records in the half hour: 1
+1830  kick 02:00:00:00:00:0a on phy0-ap1 for 20000 ms
+1830  ban 02:00:00:00:00:0a on phy1-ap1 for 20000 ms
+      { "at": 1791770010, "mac": "02:00:00:00:00:0a", "network": "lab", "method": "sticky", "from": "5g", "asked": "kick", "outcome": "back", "took": 20.0, "signal": -45, "why": "home", "elsewhere": { "ap": "ap-2005b6df64e0" } }
+      { "at": 1791771830, "mac": "02:00:00:00:00:0a", "network": "lab", "method": "sticky", "from": "5g", "asked": "kick", "outcome": "back", "took": 5.0, "signal": -45, "why": "home", "elsewhere": { "ap": "ap-2005b6df64e0" } }
+
+== Home: one on the AP it belongs on but a band it does not is sent to the band it belongs on here, kept off only the band it was on; one already there is asked nothing
+  10  btm 02:00:00:00:00:0a on phy1-ap2 it is to go, these or others to 36862def2fc0..0301ff
+  15  kick 02:00:00:00:00:0a on phy1-ap2 for 30000 ms
+      { "at": 1791770010, "mac": "02:00:00:00:00:0a", "network": "test", "method": "sticky", "from": "2g", "asked": "kick", "outcome": "moved", "took": 7.0, "signal": -50, "why": "home" }
+
+== Home never strands a client: one only ever seen on 2.4 GHz, whose home has 5 GHz alone, or whose rule names bands it was never seen to use here, is left where it is; so is one whose home AP RRM does not know, and an AP's own test client
+  asked 0, records 0
+
+== Home keeps the other ways within a rule: suggest asks no client up off the 2.4 GHz it belongs on, hold back holds it nowhere, sticky sends none away from the AP it belongs on, and keep on 6 GHz keeps none that belongs on 5 GHz
+  asked 0, kept 0
+
+== Rules of the nearest, as the renderer writes them (0321)
+[ "02:00:00:00:00:3f", { "here": false, "nearest": true, "aps": [ ], "bands": [ ], "hold": 30 } ]
+[ "02:00:00:00:00:3f", { "here": false, "nearest": true, "aps": [ "ap-30862def2fff", "ap-2005b6df64e0" ], "bands": [ "5g" ], "hold": 20 } ]
+
+== Nearest (0321): the scan radio is set against this AP's radio by three clients it serves, at the middle of what each says; then what it hears of a client with a rule of the nearest, on the AP it is on's own channel, is a reading as this AP's radio would hear it
+  two clients set: offset null, readings [ ]
+  three, one heard 20 s before, as airscan writes every 12 s or so (one on another channel, and one 31 s old, left out): offset 10
+  readings: [ [ "02:00:00:00:00:3f", "5g", "86:2d:ef:2f", -62, 1, "s" ] ]
+  thirty-one seconds on: [ ]
+
+== Nearest: a client on lab 5 GHz at -70, with a rule of the nearest, that the other AP hears at -62 is told to go there at the second look, once settled; it stays, and is put off five seconds on, kept off both bands here for its rule's hold
+  10  btm 02:00:00:00:00:3f on phy0-ap1 it is to go, these or others to 2005b6df64e9..0301ff
+  15  kick 02:00:00:00:00:3f on phy0-ap1 for 30000 ms
+  15  ban 02:00:00:00:00:3f on phy1-ap1 for 30000 ms
+      { "at": 1791770010, "mac": "02:00:00:00:00:3f", "network": "lab", "method": "sticky", "from": "5g", "asked": "kick", "outcome": "left", "took": 65.0, "signal": -70, "why": "nearest", "elsewhere": { "ap": "ap-2005b6df64e0", "signal": -62 } }
+
+== Nearest: not for one the other AP hears 4 dB better, nor for a reading 31 seconds old, nor to an AP its rule leaves out, nor for one with no rule of the nearest
+  asked 0, records 0
+
+== Nearest, where no other AP hears it (0321): on lab 2.4 GHz at -76, no AP's reading of it on its band for two minutes, it is put off to choose again, every band here kept off for its rule's hold; at -70 it is left; a fresh reading on its band keeps it to the comparison
+  at 115 s: asked 0
+ 120  kick 02:00:00:00:00:3f on phy1-ap1 for 30000 ms
+ 120  ban 02:00:00:00:00:3f on phy0-ap1 for 30000 ms
+      { "at": 1791770120, "mac": "02:00:00:00:00:3f", "network": "lab", "method": "sticky", "from": "2g", "asked": "kick", "outcome": "back", "took": 5.0, "signal": -76, "why": "nearest" }
+
+== Nearest, stopped after two: one that takes no request, heard 8 dB better by the other AP, comes back after each putting off; after the second its rule stops here, kept across a restart, until the rule changes; a rule naming an AP does not stop
+  put off in six hours at: 0h00:15 0h30:50; stopped here: true
+      { "at": 1791771850, "mac": "02:00:00:00:00:3f", "network": "lab", "method": "sticky", "from": "5g", "asked": "kick", "outcome": "back", "took": 35.0, "signal": -70, "why": "nearest", "elsewhere": { "ap": "ap-2005b6df64e0", "signal": -62 }, "stopped": true }
+  kept across a restart: true
+  its rule changed (hold=20): put off again at 6h00:05
+  a rule naming an AP, six hours: put off 4 times
+
+== Sticky on the scan radios (0324): where a network here weighs them, the scan radio's readings are of every client it hears on its AP's own channel, a rule of the nearest's first, then the most strongly heard; where none does, of the rule's clients alone
+  no network weighs them: [ [ "02:00:00:00:00:3f", -70 ] ]
+  one does: [ [ "02:00:00:00:00:3f", -70 ], [ "02:00:00:00:00:3e", -50 ], [ "02:00:00:00:00:3d", -65 ] ]
+
+== Sticky on the scan radios: a client on lab 5 GHz at -72 that only a scan radio hears 9 dB better elsewhere is moved, where lab weighs the scan radios, at the second look; not where it does not; nor does a scan reading count as heard elsewhere for the weak rule
+  lab not weighing them: asked 0, heard elsewhere false
+  25  btm 02:00:00:00:00:0a on phy0-ap1 it is to go, these or others to 2005b6df64e9..0301ff

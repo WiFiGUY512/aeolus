@@ -1,0 +1,24 @@
+{
+	"about": "DFS allowed (0328) at 160 MHz, with radio resource management moving radios (0329): every 160 MHz block on 5 GHz holds DFS channels, so the radio starts at 80 MHz outside them, serving at once, and the daemon's section lets it move to a DFS channel and says the width it widens the radio to, 160 MHz, once it has looked, in the window for moves. The AP's hostapd can switch it to 160 and advertises 160 MHz only once there (facts.csa160): the radio asks for no 160 MHz capability (no vht160).",
+	"current": "shed-current.json",
+	"facts": {
+		"ap": "ap-a0046082275e",
+		"csa160": true,
+		"uplink": "wan",
+		"radios": {
+			"radio0": { "htmodes": ["HT20", "HT40", "VHT20", "VHT40", "VHT80", "VHT80+80", "VHT160"] },
+			"radio1": { "htmodes": ["HT20", "HT40"] }
+		}
+	},
+	"intent": {
+		"rrm": { "enabled": true },
+		"system": { "country": "US", "poll": 60 },
+		"radio": {
+			"2g": { "channel": "auto" },
+			"5g": { "channel": "auto", "width": 160, "dfs": "allow" }
+		},
+		"network": {
+			"lab": { "ssid": "Aeolus Lab", "security": "wpa2-psk", "passphrase": "fixture-passphrase-1", "transport": { "primary": { "type": "vlan", "vlan": 20 } } }
+		}
+	}
+}

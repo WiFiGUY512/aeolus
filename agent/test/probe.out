@@ -1,0 +1,132 @@
+arp probe ffffffffffffaa046082276008060001080006040001aa046082276000000000000000000000c0a83201000000000000000000000000000000000000
+arp answer { "from": "192.168.50.1", "key": "arp:192.168.50.1" }
+arp answer to another AP 
+arp request is no answer 
+echo6 333300000001aa046082276086dd6000000000103afffe80000000000000ac0460fffe822761ff0200000000000000000000000000018000c1941234000161656f6c75733539
+echo6 answer { "from": "fe80::2ae7:1dff:fed2:d013", "key": "echo:1" }
+echo6 answer to another id 
+echo4 08006a461234000761656f6c75733539
+echo4 answer { "from": "1.1.1.2", "seq": 7 }
+echo4 request is no answer 
+echo6 plain 800000001234000761656f6c75733539
+echo6 plain answer { "seq": 7 }
+checksum 220d
+ip6 2001:db8::2 -> 2001:db8::2
+ip6 fe80::ac04:60ff:fe82:2761 -> fe80::ac04:60ff:fe82:2761
+ip6 ff02::1 -> ff02::1
+ip6 :: -> ::
+ip6 1:0:0:2:0:0:0:3 -> 1:0:0:2::3
+ip6 2001:db8:0:1:1:1:1:1 -> 2001:db8:0:1:1:1:1:1
+guard 03ae01000059aa046082276388b561656f6c75732d6c6f6f701030303131323233336161626263636464046c616e33076c616e332e33300000000000
+guard seen { "port": "lan3", "device": "lan3.30" }
+guard of another run 
+not a guard frame 
+verdict answered 10 s ago: up
+verdict answered 100 s ago: down
+verdict just started: unknown
+verdict never answered, concentrator does: unverified
+verdict never answered, nor the concentrator: down
+verdict answered at 90, now 180: up
+verdict answered at 90, now 181: down
+switch report mode, primary down: { "want": "primary", "start": false, "stop": false, "why": null, "cannot": null }
+switch primary up: { "want": "primary", "start": false, "stop": false, "why": null, "cannot": null }
+switch primary down, fallback up: { "want": "fallback", "start": false, "stop": false, "why": "the primary is down", "cannot": null }
+switch primary down, fallback unverified: { "want": "primary", "start": false, "stop": false, "why": null, "cannot": "the primary is down, and the fallback is unverified" }
+switch primary down, fallback down: { "want": "primary", "start": false, "stop": false, "why": null, "cannot": "the primary is down, and the fallback is down" }
+switch primary unverified: { "want": "primary", "start": false, "stop": false, "why": null, "cannot": null }
+switch primary down, tunnel fallback stopped: { "want": "primary", "start": true, "stop": false, "why": null, "cannot": "the primary is down, and the fallback is starting" }
+switch primary down, tunnel fallback started and up: { "want": "fallback", "start": false, "stop": false, "why": "the primary is down", "cannot": null }
+switch on the fallback, primary still down: { "want": "fallback", "start": false, "stop": false, "why": null, "cannot": null }
+switch on the fallback, primary up 100 s: { "want": "fallback", "start": false, "stop": false, "why": null, "cannot": null }
+switch on the fallback, primary up 300 s: { "want": "primary", "start": false, "stop": false, "why": "the primary has been up for 300 s", "cannot": null }
+switch on the fallback, primary up 300 s, failback equal: { "want": "fallback", "start": false, "stop": false, "why": null, "cannot": null }
+switch on the fallback, fallback down, primary up: { "want": "primary", "start": false, "stop": false, "why": "the fallback is down", "cannot": null }
+switch on the fallback, both down: { "want": "fallback", "start": false, "stop": false, "why": null, "cannot": "the fallback is down, and the primary is down" }
+switch on the tunnel fallback, back to the primary: { "want": "primary", "start": false, "stop": true, "why": "the primary has been up for 300 s", "cannot": null }
+switch on the tunnel fallback, back to the primary, HA: { "want": "primary", "start": false, "stop": false, "why": "the primary has been up for 300 s", "cannot": null }
+switch on the tunnel fallback, it stopped: { "want": "fallback", "start": true, "stop": false, "why": null, "cannot": "the fallback is starting, and the primary is down" }
+switch on the tunnel fallback, it stopped, primary up: { "want": "primary", "start": false, "stop": false, "why": "the fallback is off", "cannot": null }
+switch on the tunnel fallback, it is unknown, primary up: { "want": "fallback", "start": false, "stop": false, "why": null, "cannot": null }
+switch primary up, tunnel fallback still running: { "want": "primary", "start": false, "stop": true, "why": null, "cannot": null }
+switch primary unknown, tunnel fallback stopped: { "want": "primary", "start": false, "stop": false, "why": null, "cannot": null }
+switch HA, tunnel fallback stopped: { "want": "primary", "start": true, "stop": false, "why": null, "cannot": null }
+switch primary down, VLAN fallback off: { "want": "primary", "start": false, "stop": false, "why": null, "cannot": "the primary is down, and the fallback is off" }
+switch report mode, on the fallback: { "want": "primary", "start": false, "stop": false, "why": null, "cannot": null }
+switch report mode, tunnel fallback running: { "want": "primary", "start": false, "stop": false, "why": null, "cannot": null }
+lldp { "chassis": "28:e7:1d:d2:d0:13", "chassis_kind": "mac", "system": "homelab.example.com", "system_description": null, "port": "Ethernet6", "port_kind": "interface name", "port_description": "Shed OpenWrt", "ttl": 120, "capabilities": null, "enabled_capabilities": null, "management": [ ], "native_vlan": 1, "vlans": [ ], "vlan_names": { }, "protocol_vlans": [ ], "protocols": [ ], "aggregation": null, "max_frame": null, "mac_phy": null, "power": null, "med": null, "other": [ ] }
+lldp with vlans { "chassis": "28:e7:1d:d2:d0:13", "chassis_kind": "mac", "system": "homelab.example.com", "system_description": null, "port": "Ethernet6", "port_kind": "interface name", "port_description": "Shed OpenWrt", "ttl": 120, "capabilities": null, "enabled_capabilities": null, "management": [ ], "native_vlan": 1, "vlans": [ 10, 20 ], "vlan_names": { "20": "Core", "10": "IoT" }, "protocol_vlans": [ ], "protocols": [ ], "aggregation": null, "max_frame": null, "mac_phy": null, "power": null, "med": null, "other": [ ] }
+lldp of an ARP 
+lldp of everything { "chassis": "28:e7:1d:d2:d0:13", "chassis_kind": "mac", "system": "homelab.example.com", "system_description": "Arista Networks EOS version 4.30.1F running on an Arista CCS-720DP-24ZS-2", "port": "Ethernet6", "port_kind": "interface name", "port_description": "Shed OpenWrt", "ttl": 120, "capabilities": [ "bridge", "router" ], "enabled_capabilities": [ "bridge", "router" ], "management": [ { "address": "172.16.0.4", "interface": 5000000, "interface_kind": "ifindex" } ], "native_vlan": 1, "vlans": [ 20, 1010 ], "vlan_names": { "20": "Core", "1010": "PTP_Tower_Link" }, "protocol_vlans": [ 30 ], "protocols": [ "88cc" ], "aggregation": { "capable": true, "enabled": false, "port": 0 }, "max_frame": 9416, "mac_phy": { "autoneg_supported": true, "autoneg_enabled": true, "advertised": "6c01", "mau": 30, "mau_name": "1000BASE-T, full duplex" }, "power": { "pse": true, "supported": true, "enabled": true, "pair": "signal", "class": 4, "requested_w": 25.5, "allocated_w": 25.5 }, "med": { "capabilities": "0033", "class": 4, "policies": [ { "application": "voice", "unknown": false, "tagged": true, "vlan": 30, "priority": 5, "dscp": 46 } ], "inventory": { "software": "EOS-4.30.1F", "model": "CCS-720DP-24ZS-2" }, "location": null, "power_w": null }, "other": [ { "type": 127, "oui": "001c73", "subtype": 1, "data": "dead" }, { "type": 9, "data": "78797a" } ] }
+link-local of 06:82:27:5e:00:50: fe80::482:27ff:fe5e:50
+link-local of aa:04:60:82:27:60: fe80::a804:60ff:fe82:2760
+watch heard 50 s ago: present
+watch heard 180 s ago: present
+watch heard 200 s ago: silent
+watch never heard, watched 100 s: unknown
+watch never heard, watched 200 s: silent
+segment mac vni 50: 02:82:27:5e:00:50
+segment mac vni 1234: 02:82:27:5e:12:34
+segment mac vni 10000: 0a:82:27:5e:27:10
+segment mac vni 70000: 0a:82:27:5e:11:70
+segment mac vlan 20: 06:82:27:5e:00:20
+segment mac of no AP: 
+arp probe from a lease ffffffffffff0282275e0050080600010800060400010282275e0050c0a83206000000000000c0a83201000000000000000000000000000000000000
+dhcp discover ffffffffffff0282275e005008004500014800000000401179a600000000ffffffff0044004301340000010106001234567800008000000000000000000000000000000000000282275e005000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000638253633501013d07010282275e00503704010333360c124f70656e5772746e696768742d766e693530ff000000000000000000000000000000000000000000
+dhcp request ffffffffffff0282275e005008004500014800000000401179a600000000ffffffff0044004301340000010106001234567800008000000000000000000000000000000000000282275e005000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000638253633501033d07010282275e00503204c0a832063604c0a832fe3704010333360c124f70656e5772746e696768742d766e693530ff000000000000000000
+dhcp renew ffffffffffff0282275e005008004500014800000000401186f7c0a83206ffffffff0044004301340000010106000abcdef000000000c0a832060000000000000000000000000282275e005000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000638253633501033d07010282275e00503704010333360c124f70656e5772746e696768742d766e693530ff000000000000000000000000000000000000000000
+dhcp release ffffffffffff0282275e00500800450001480000000040119350c0a83206c0a832fe0044004301340000010106000abcdef000000000c0a832060000000000000000000000000282275e005000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000638253633501073d07010282275e00503604c0a832feff0000000000000000000000000000000000000000000000000000000000000000000000000000000000
+dhcp offer { "type": "offer", "address": "192.168.50.6", "server": "192.168.50.254", "router": "192.168.50.1", "mask": "255.255.255.0", "lease": 86400 }
+dhcp offer to another xid 
+an arp reply is no dhcp 
+dhcp seen: a discover { "op": 1, "type": "discover", "xid": 305419896, "client": "02:82:27:5e:00:50", "ciaddr": "0.0.0.0", "yiaddr": "0.0.0.0", "server": null, "requested": null, "host": "phone", "vendor_class": null, "params": "1,3,51,54", "src_mac": "02:82:27:5e:00:50", "src_ip": "0.0.0.0" }
+dhcp seen: a renewal { "op": 1, "type": "request", "xid": 180150000, "client": "02:82:27:5e:00:50", "ciaddr": "192.168.50.6", "yiaddr": "0.0.0.0", "server": null, "requested": null, "host": null, "vendor_class": null, "params": "1,3,51,54", "src_mac": "02:82:27:5e:00:50", "src_ip": "192.168.50.6" }
+dhcp seen: an offer { "op": 2, "type": "offer", "xid": 305419896, "client": "02:82:27:5e:00:50", "ciaddr": "0.0.0.0", "yiaddr": "192.168.50.6", "server": "192.168.50.254", "requested": null, "host": null, "vendor_class": null, "params": null, "src_mac": "28:e7:1d:d2:d0:13", "src_ip": "192.168.50.254" }
+dhcp seen: a host name as an FQDN phone.home
+dhcp seen: a vendor class and parameter list android-dhcp-14 1,3,51,54
+dhcp seen: an arp reply 
+arp seen: a reply { "mac": "28:e7:1d:d2:d0:13", "address": "192.168.50.1" }
+arp seen: a probe from 0.0.0.0 
+arp seen: an offer 
+request no answer, at 995: waiting
+request no answer, at 1000: unanswered
+request an offer: answered
+client asked after joining: ok
+client asked in the second nl80211 rounds the join into: ok
+client asked before joining again: static
+client joined 30 s ago, nothing yet: unknown
+client joined 100 s ago, uses an address: static
+client joined 100 s ago, no address: none
+client joined before the watch: unknown
+filter overlay: 18 instructions, jumps land inside, ends returning
+filter guard: 6 instructions, jumps land inside, ends returning
+filter watch: 7 instructions, jumps land inside, ends returning
+filter lldp: 6 instructions, jumps land inside, ends returning
+filter dhcp: 18 instructions, jumps land inside, ends returning
+start routes: [ { "dst": "192.168.20.0/24", "via": null, "src": null }, { "dst": "0.0.0.0/0", "via": "192.168.20.1", "src": "192.168.20.88" } ]
+missing from an empty table: [ { "dst": "192.168.20.0/24", "via": null, "src": null }, { "dst": "0.0.0.0/0", "via": "192.168.20.1", "src": "192.168.20.88" } ]
+missing from a whole table: [ ]
+missing beside another gateway: [ { "dst": "0.0.0.0/0", "via": "192.168.20.1", "src": "192.168.20.88" } ]
+ip route replace 192.168.20.0/24 dev br-lan.20 scope link table 1020
+ip route replace default via 192.168.20.1 dev br-lan.20 src 192.168.20.88 table 1020
+a device that is no device: 
+a gateway that is no address: 
+no status: [ ]
+prefix 192.168.20.88/24: 192.168.20.0/24
+prefix 10.1.2.3/8: 10.0.0.0/8
+prefix 10.1.2.3/32: 10.1.2.3/32
+prefix 10.1.2.3/0: 0.0.0.0/0
+prefix 172.16.200.9/13: 172.16.0.0/13
+prefix 300.1.1.1/24: 
+prefix 10.1.1.1/33: 
+dns query 123401000001000000000000036f6e65036f6e65036f6e65036f6e650000010001
+dns query of no name:   
+dns answer { "rcode": 0, "address": "1.1.1.1" }
+dns answer to another question: 
+dns answer by an alias { "rcode": 0, "address": "192.0.2.7" }
+dns answer, no such name { "rcode": 3, "address": null }
+dns question read as an answer: 
+dns answer cut short { "rcode": 0, "address": "1.1.1.1" } { "rcode": 0, "address": null } 
+out state up silent unknown silent
+ath11k retries 17  
+counts retries false true true false false
+off the air: down true, up false, unknown while on false, unknown while off true, unverified while on true, off while on false

@@ -1,0 +1,46 @@
+{
+	"about": "The Sandbox AP with its Bluetooth radio lent to Home Assistant (0156): the agent's ble section says so to aeolus-ble, which is idle without it. The section is there whether or not the AP has such a radio: the daemon says where it has none. The rest is as the sandbox case.",
+	"current": "shed-current.json",
+	"facts": {
+		"uplink": "wan",
+		"radios": {
+			"radio0": {
+				"htmodes": [
+					"HT20",
+					"HT40",
+					"VHT20",
+					"VHT40",
+					"VHT80",
+					"VHT80+80",
+					"VHT160"
+				]
+			},
+			"radio1": {
+				"htmodes": [
+					"HT20",
+					"HT40"
+				]
+			}
+		}
+	},
+	"intent": {
+		"system": {
+			"country": "US",
+			"poll": 60,
+			"ble_proxy": true
+		},
+		"network": {
+			"lab": {
+				"ssid": "Aeolus Lab",
+				"security": "wpa2-psk",
+				"passphrase": "fixture-passphrase-1",
+				"transport": {
+					"primary": {
+						"type": "vlan",
+						"vlan": 20
+					}
+				}
+			}
+		}
+	}
+}

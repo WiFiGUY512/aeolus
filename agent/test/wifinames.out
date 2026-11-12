@@ -1,0 +1,20 @@
+settled: radio0 phy0-ap0,phy0-ap1,phy0-ap2,phy0-ap3; radio1 phy1-ap0,phy1-ap1,phy1-ap2,phy1-ap3; radio3 phy2-ap0
+pending, as netifd has it: radio0 phy0-ap0,phy0-ap1,phy0-ap2,phy0-ap3
+pending, kept: radio0 phy0-ap0,phy0-ap1,phy0-ap2,phy0-ap3; radio1 (held) phy1-ap0,phy1-ap1,phy1-ap2,phy1-ap3; radio3 (held) phy2-ap0
+pending radios: [ "radio1", "radio3" ]
+held radio1: up true pending true band 2g; netifd's own still has null
+one gone: radio0 phy0-ap0,phy0-ap1,phy0-ap2,phy0-ap3; radio1 (held) phy1-ap0,phy1-ap1,phy1-ap2; radio3 (held) phy2-ap0
+added: radio0 phy0-ap0,phy0-ap1,phy0-ap2,phy0-ap3; radio1 (held) phy1-ap0,phy1-ap1,phy1-ap2,phy1-ap3; radio3 phy2-ap0; the new one named null
+settled again: radio0 phy0-ap0,phy0-ap1,phy0-ap2,phy0-ap3; radio1 phy1-ap0,phy1-ap1,phy1-ap2,phy1-ap3,phy1-ap4; radio3 phy2-ap0
+netifd keeps the names: radio0 phy0-ap0,phy0-ap1,phy0-ap2,phy0-ap3; radio1 (held) phy1-ap0,phy1-ap1,phy1-ap2,phy1-ap3; radio3 phy2-ap0
+taken down: radio0 phy0-ap0,phy0-ap1,phy0-ap2,phy0-ap3; radio1 phy1-ap0,phy1-ap1,phy1-ap2,phy1-ap3
+first look: none
+gone: null; then pending: radio0 (held) phy0-ap0,phy0-ap1,phy0-ap2,phy0-ap3; radio1 phy1-ap0,phy1-ap1,phy1-ap2,phy1-ap3; radio3 phy2-ap0
+hold: pending since 1010; at 120 s radio0 (held) phy0-ap0,phy0-ap1,phy0-ap2,phy0-ap3; radio1 phy1-ap0,phy1-ap1,phy1-ap2,phy1-ap3; radio3 phy2-ap0; at 121 s radio1 phy1-ap0,phy1-ap1,phy1-ap2,phy1-ap3; radio3 phy2-ap0
+hold again: since 2001, radio0 (held) phy0-ap0,phy0-ap1,phy0-ap2,phy0-ap3; radio1 phy1-ap0,phy1-ap1,phy1-ap2,phy1-ap3; radio3 phy2-ap0
+odd: [ null, 5, { "config": { } }, { "section": "x", "ifname": "phy0-ap0" } ] "radio" null [ "radio0", "radio2" ]
+none: { } [ ] "x"
+bad name: [ { "section": "s" } ]
+settle: asked 3 times, pending [ ]
+settle never: asked 6 times, pending [ "radio1", "radio3" ]
+settle null: asked 1 time, null

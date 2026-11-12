@@ -1,0 +1,24 @@
+== A client on 6 GHz kept off 5 and 2.4 GHz here for 15 s
+  { "02:00:00:00:00:0a phy0-ap2": { "since": 1791770000, "until": 1791770015 }, "02:00:00:00:00:0a phy1-ap2": { "since": 1791770000, "until": 1791770015 } }
+  5 GHz, from 6 s before to 21 s after:
+    - kept kept kept kept kept kept kept kept kept kept kept kept kept kept kept kept kept kept kept kept kept kept kept kept kept kept -
+  half a second in, as journey reads a frame by its own clock: true
+  not on its 6 GHz, where it is: false; nor of another client: false
+
+== Renewed 8 s on, before it ran out: it keeps when it began
+  { "since": 1791770000, "until": 1791770023 }
+  a frame of the first asking, read after the renewal: true
+
+== Lifted at 16 s: the frame of the lifting is still covered, then nothing
+  { "since": 1791770000, "until": 1791770016 }
+  from 15 s to 23 s:
+    kept kept kept kept kept kept kept - -
+
+== Kept again a minute on: what ran out is left out, and the keeping begins anew
+  { "02:00:00:00:00:0a phy0-ap2": { "since": 1791770060, "until": 1791770075 } }
+
+== Never more than the latest 256
+  256 kept, from 02:00:00:00:00:2c phy0-ap2 to 02:00:00:00:01:2b phy0-ap2
+
+== What is not a list says nothing; a file that is not one starts anew
+  false false { "02:00:00:00:00:0a phy0-ap2": { "since": 1791770000, "until": 1791770015 } }

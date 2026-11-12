@@ -1,0 +1,82 @@
+{
+	"about": "An Arista C-360 with beamforming set a radio at a time (0195): at 2.4 GHz the beamformer off, which takes MU-MIMO with it, and the beamformee on; at 5 GHz MU-MIMO off alone, in 802.11ac as well as ax and be; at 6 GHz the beamformee off.",
+	"current": "c360-current.json",
+	"facts": {
+		"uplink": "eth0",
+		"radios": {
+			"radio0": {
+				"htmodes": [
+					"HE20",
+					"HE40",
+					"HE80",
+					"HE160"
+				]
+			},
+			"radio1": {
+				"htmodes": [
+					"HE20",
+					"HE40"
+				]
+			},
+			"radio3": {
+				"htmodes": [
+					"HE20",
+					"HE40",
+					"HE80",
+					"HE160"
+				]
+			}
+		}
+	},
+	"intent": {
+		"system": {
+			"country": "US",
+			"poll": 60
+		},
+		"rrm": {
+			"enabled": true
+		},
+		"radio": {
+			"2g": {
+				"enabled": true,
+				"channel": 6,
+				"width": 20,
+				"beamformer": false,
+				"beamformee": true
+			},
+			"5g": {
+				"enabled": true,
+				"channel": 36,
+				"width": 80,
+				"mu_mimo": false
+			},
+			"6g": {
+				"enabled": true,
+				"channel": 37,
+				"width": 80,
+				"beamformee": false
+			}
+		},
+		"network": {
+			"lab": {
+				"ssid": "Aeolus Lab",
+				"security": "wpa3-sae",
+				"passphrase": "fixture-passphrase-1",
+				"transport": {
+					"primary": {
+						"type": "vlan",
+						"vlan": 20
+					}
+				}
+			}
+		}
+	},
+	"kept": [
+		"wireless.radio2",
+		"wireless.default_radio2",
+		"aeolus.aeolus_rrm"
+	],
+	"gone": [
+		"wireless.aeolus_lab_radio2"
+	]
+}

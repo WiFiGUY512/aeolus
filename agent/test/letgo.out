@@ -1,0 +1,8 @@
+here { "v": 1, "t": "here", "ap": "ap-30862d46348f", "at": 1793170000, "seq": 7, "macs": [ "30:86:2d:ef:2f:f0" ] }
+here many 16
+here macs [ "30:86:2d:ef:2f:f0", "fe:8f:ee:d3:60:e3" ]
+a hello [ ], no list [ ], not an object [ ]
+at most 16
+held a while true, just back false, at the limit true
+not there false, another client false, no answer false, no time said true
+due true false true true

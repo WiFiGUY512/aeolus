@@ -1,0 +1,117 @@
+{
+	"about": "An Arista C-360 whose radios still carry switches set before, now unset (0196): target wake time and BSS color off and a beamformer off at 2.4 GHz, MU-MIMO off at 5 GHz. Unset, each is OpenWrt's default again, its option taken away; 6 GHz keeps BSS color set to a color.",
+	"current": "c360-current.json",
+	"facts": {
+		"uplink": "eth0",
+		"radios": {
+			"radio0": {
+				"htmodes": [
+					"HE20",
+					"HE40",
+					"HE80",
+					"HE160"
+				]
+			},
+			"radio1": {
+				"htmodes": [
+					"HE20",
+					"HE40"
+				]
+			},
+			"radio3": {
+				"htmodes": [
+					"HE20",
+					"HE40",
+					"HE80",
+					"HE160"
+				]
+			}
+		}
+	},
+	"intent": {
+		"system": {
+			"country": "US",
+			"poll": 60
+		},
+		"rrm": {
+			"enabled": true
+		},
+		"radio": {
+			"2g": {
+				"enabled": true,
+				"channel": 6,
+				"width": 20
+			},
+			"5g": {
+				"enabled": true,
+				"channel": 36,
+				"width": 80
+			},
+			"6g": {
+				"enabled": true,
+				"channel": 37,
+				"width": 80,
+				"bss_color": 12
+			}
+		},
+		"network": {
+			"lab": {
+				"ssid": "Aeolus Lab",
+				"security": "wpa3-sae",
+				"passphrase": "fixture-passphrase-1",
+				"transport": {
+					"primary": {
+						"type": "vlan",
+						"vlan": 20
+					}
+				}
+			}
+		}
+	},
+	"kept": [
+		"wireless.radio2",
+		"wireless.default_radio2",
+		"aeolus.aeolus_rrm"
+	],
+	"gone": [
+		"wireless.aeolus_lab_radio2"
+	],
+	"extra": {
+		"wireless": {
+			"radio1": {
+				".anonymous": false,
+				".type": "wifi-device",
+				".name": "radio1",
+				".index": 2,
+				"type": "mac80211",
+				"path": "platform/soc@0/c000000.wifi+1",
+				"band": "2g",
+				"channel": "1",
+				"htmode": "HE20",
+				"he_twt_responder": "0",
+				"he_bss_color_enabled": "0",
+				"he_su_beamformer": "0",
+				"he_mu_beamformer": "0",
+				"eht_su_beamformer": "0",
+				"eht_mu_beamformer": "0"
+			},
+			"radio0": {
+				".anonymous": false,
+				".type": "wifi-device",
+				".name": "radio0",
+				".index": 0,
+				"type": "mac80211",
+				"path": "platform/soc@0/c000000.wifi",
+				"band": "5g",
+				"channel": "36",
+				"htmode": "HE80",
+				"he_twt_responder": "0",
+				"he_bss_color_enabled": "1",
+				"he_bss_color": "7",
+				"mu_beamformer": "0",
+				"he_mu_beamformer": "0",
+				"eht_mu_beamformer": "0"
+			}
+		}
+	}
+}

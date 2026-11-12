@@ -1,0 +1,83 @@
+{
+	"about": "The same fresh C-360, but someone has put an interface on an 802.1Q device of the bridge (br-lan.30). The renderer does not make such a bridge filter VLANs, as that device would then carry nothing (0152); it says what it cannot render, and the network's Wi-Fi is not made.",
+	"current": "c360-8021q-current.json",
+	"facts": {
+		"uplink": "eth0",
+		"radios": {
+			"radio0": {
+				"htmodes": [
+					"HE20",
+					"HE40",
+					"HE80",
+					"HE160"
+				]
+			},
+			"radio1": {
+				"htmodes": [
+					"HE20",
+					"HE40"
+				]
+			},
+			"radio3": {
+				"htmodes": [
+					"HE20",
+					"HE40",
+					"HE80",
+					"HE160"
+				]
+			}
+		},
+		"management": "lan"
+	},
+	"intent": {
+		"system": {
+			"country": "US",
+			"poll": 60
+		},
+		"rrm": {
+			"enabled": true
+		},
+		"radio": {
+			"2g": {
+				"enabled": true,
+				"channel": 6,
+				"width": 20
+			},
+			"5g": {
+				"enabled": true,
+				"channel": 36,
+				"width": 80
+			},
+			"6g": {
+				"enabled": true,
+				"channel": 37,
+				"width": 80
+			}
+		},
+		"network": {
+			"lab": {
+				"ssid": "Aeolus Lab",
+				"security": "wpa3-sae",
+				"passphrase": "fixture-passphrase-1",
+				"transport": {
+					"primary": {
+						"type": "vlan",
+						"vlan": 20
+					}
+				}
+			}
+		}
+	},
+	"errors": [
+		"bridge br-lan does not filter VLANs; 802.1Q devices on the uplink are not rendered yet"
+	],
+	"kept": [
+		"wireless.radio2",
+		"wireless.default_radio2",
+		"aeolus.aeolus_rrm"
+	],
+	"gone": [
+		"wireless.aeolus_lab_radio2"
+	],
+	"refused": true
+}

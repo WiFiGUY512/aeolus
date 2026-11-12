@@ -1,0 +1,79 @@
+{
+	"about": "An Arista C-360 as a fresh install leaves it, adopted into a folder with one network on VLAN 20: its bridge, br-lan holding Ethernet 1 with the AP's address by DHCP, does not filter VLANs. The renderer has it filter them (0152): Ethernet 1 untagged in VLAN 1, the AP's own interface moved to that VLAN of the bridge, and then the network's VLAN tagged on the uplink as on any AP.",
+	"current": "c360-fresh-current.json",
+	"facts": {
+		"uplink": "eth0",
+		"radios": {
+			"radio0": {
+				"htmodes": [
+					"HE20",
+					"HE40",
+					"HE80",
+					"HE160"
+				]
+			},
+			"radio1": {
+				"htmodes": [
+					"HE20",
+					"HE40"
+				]
+			},
+			"radio3": {
+				"htmodes": [
+					"HE20",
+					"HE40",
+					"HE80",
+					"HE160"
+				]
+			}
+		},
+		"management": "lan"
+	},
+	"intent": {
+		"system": {
+			"country": "US",
+			"poll": 60
+		},
+		"rrm": {
+			"enabled": true
+		},
+		"radio": {
+			"2g": {
+				"enabled": true,
+				"channel": 6,
+				"width": 20
+			},
+			"5g": {
+				"enabled": true,
+				"channel": 36,
+				"width": 80
+			},
+			"6g": {
+				"enabled": true,
+				"channel": 37,
+				"width": 80
+			}
+		},
+		"network": {
+			"lab": {
+				"ssid": "Aeolus Lab",
+				"security": "wpa3-sae",
+				"passphrase": "fixture-passphrase-1",
+				"transport": {
+					"primary": {
+						"type": "vlan",
+						"vlan": 20
+					}
+				}
+			}
+		}
+	},
+	"kept": [
+		"wireless.radio2",
+		"wireless.default_radio2",
+		"aeolus.aeolus_rrm"
+	],
+	"gone": [
+		"wireless.aeolus_lab_radio2"
+	]
+}

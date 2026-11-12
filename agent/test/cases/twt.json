@@ -1,0 +1,80 @@
+{
+	"about": "An Arista C-360 with target wake time set a radio at a time (0191): off on 2.4 GHz, so the radio answers no client's request to agree when it wakes, and on at 5 GHz; 6 GHz left as OpenWrt has it.",
+	"current": "c360-current.json",
+	"facts": {
+		"uplink": "eth0",
+		"radios": {
+			"radio0": {
+				"htmodes": [
+					"HE20",
+					"HE40",
+					"HE80",
+					"HE160"
+				]
+			},
+			"radio1": {
+				"htmodes": [
+					"HE20",
+					"HE40"
+				]
+			},
+			"radio3": {
+				"htmodes": [
+					"HE20",
+					"HE40",
+					"HE80",
+					"HE160"
+				]
+			}
+		}
+	},
+	"intent": {
+		"system": {
+			"country": "US",
+			"poll": 60
+		},
+		"rrm": {
+			"enabled": true
+		},
+		"radio": {
+			"2g": {
+				"enabled": true,
+				"channel": 6,
+				"width": 20,
+				"twt": false
+			},
+			"5g": {
+				"enabled": true,
+				"channel": 36,
+				"width": 80,
+				"twt": true
+			},
+			"6g": {
+				"enabled": true,
+				"channel": 37,
+				"width": 80
+			}
+		},
+		"network": {
+			"lab": {
+				"ssid": "Aeolus Lab",
+				"security": "wpa3-sae",
+				"passphrase": "fixture-passphrase-1",
+				"transport": {
+					"primary": {
+						"type": "vlan",
+						"vlan": 20
+					}
+				}
+			}
+		}
+	},
+	"kept": [
+		"wireless.radio2",
+		"wireless.default_radio2",
+		"aeolus.aeolus_rrm"
+	],
+	"gone": [
+		"wireless.aeolus_lab_radio2"
+	]
+}

@@ -1,0 +1,599 @@
+package schema
+
+import (
+	"encoding/json"
+	"errors"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/WiFiGUY512/aeolus/internal/change"
+	"github.com/WiFiGUY512/aeolus/internal/changelog"
+	"github.com/WiFiGUY512/aeolus/internal/hierarchy"
+	"github.com/WiFiGUY512/aeolus/internal/secret"
+)
+
+const passphrase = "home-wi-fi-passphrase-42"
+
+// scenario is the UI mockup with v1 fields. Secret values are prepared
+// (sealed) the way the API will prepare them.
+func scenario(t *testing.T, s *Schema, box *secret.Box) []change.Op {
+	t.Helper()
+	L, S := change.Locations, change.Services
+	folder := func(tree change.TreeName, id, name, parent string) change.Op {
+		return change.Op{Kind: change.AddFolder, Tree: tree, Node: hierarchy.NodeID(id), Name: name, Parent: hierarchy.NodeID(parent)}
+	}
+	ap := func(id, name, parent string) change.Op {
+		return change.Op{Kind: change.AddAP, Tree: L, Node: hierarchy.NodeID(id), Name: name, Parent: hierarchy.NodeID(parent)}
+	}
+	set := func(tree change.TreeName, node, path string, v any) change.Op {
+		raw, err := json.Marshal(v)
+		must(t, err)
+		prepared, err := s.Prepare(hierarchy.Path(path), raw, box)
+		must(t, err)
+		return change.Op{Kind: change.Set, Tree: tree, Node: hierarchy.NodeID(node), Path: hierarchy.Path(path), Value: prepared}
+	}
+	return []change.Op{
+		{Kind: change.CreateOrg, Node: "example", Name: "Example", Account: "griff"},
+		folder(L, "house", "House", "example"),
+		folder(L, "office", "Office", "house"),
+		ap("office-ap", "OfficeOpenWrt", "office"),
+		folder(L, "gate", "Main Gate", "example"),
+		ap("gate-ap", "GateOpenWrt", "gate"),
+		folder(S, "household", "Household", "example"),
+		folder(S, "household-gate", "Gate", "household"),
+
+		set(L, "example", "system.country", "US"),
+		set(L, "example", "system.tz", "America/Chicago"),
+		set(L, "example", "system.poll", 60),
+		{Kind: change.Lock, Tree: L, Node: "example", Path: "system.poll"},
+		set(L, "example", "radio.2g.width", 20),
+		set(L, "example", "radio.5g.channel", "auto"),
+		set(L, "example", "radio.5g.width", 80),
+		set(L, "example", "ports.eth0.uplink", true),
+		set(L, "example", "ports.eth0.mode", "trunk"),
+		set(L, "example", "ports.eth0.untagged", 1),
+		set(L, "example", "ports.eth0.tagged", []int{10, 20, 50}),
+		set(L, "house", "radio.5g.width", 40),
+		set(L, "office-ap", "radio.5g.channel", 48),
+		set(L, "gate", "ports.eth0.mode", "access"),
+
+		set(S, "household", "network.sweet.ssid", "Home Wi-Fi"),
+		set(S, "household", "network.sweet.security", "wpa2-wpa3"),
+		set(S, "household", "network.sweet.passphrase", passphrase),
+		set(S, "household", "network.sweet.bands", []string{"2g", "5g"}),
+		set(S, "household", "network.sweet.transport.primary.type", "vlan"),
+		set(S, "household", "network.sweet.transport.primary.vlan", 20),
+		set(S, "household", "network.sweet.transport.fallback.type", "vxlan"),
+		set(S, "household", "network.sweet.transport.fallback.concentrator", "homelab"),
+		set(S, "household", "network.sweet.transport.fallback.vni", 20),
+		set(S, "household", "network.sweet.transport.ha", true),
+		set(S, "household", "network.sweet.transport.failback", "revertive"),
+		set(S, "household", "network.sweet.transport.holddown", 120),
+		set(S, "household-gate", "network.sweet.transport.primary.type", "vxlan"),
+		set(S, "household-gate", "network.sweet.transport.primary.concentrator", "homelab"),
+		set(S, "household-gate", "network.sweet.transport.primary.vni", 20),
+
+		{Kind: change.AssignServices, Node: "example", Services: []hierarchy.NodeID{"household"}},
+		{Kind: change.AssignServices, Node: "gate", Services: []hierarchy.NodeID{"household-gate"}},
+	}
+}
+
+func TestScenarioPassesTheGuardAndBuildsValidConfigs(t *testing.T) {
+	s, box := v1(t), newBox(t)
+	var state *change.State
+	for _, op := range scenario(t, s, box) {
+		if err := s.CheckOp(op); err != nil {
+			t.Fatalf("%+v refused: %v", op, err)
+		}
+		var err error
+		if state, _, err = change.Apply(state, op); err != nil {
+			t.Fatalf("%+v: %v", op, err)
+		}
+	}
+	org := state.Org
+	for _, ap := range org.Locations.APs() {
+		cfg, err := org.ResolveAP(ap)
+		must(t, err)
+		doc, err := document(cfg, box.Open)
+		must(t, err)
+		if err := s.CheckDocument(doc); err != nil {
+			t.Fatalf("%s config invalid: %v\n%v", ap, err, doc)
+		}
+	}
+
+	cfg, err := org.ResolveAP("office-ap")
+	must(t, err)
+	doc, err := document(cfg, box.Open)
+	must(t, err)
+	radio5 := doc["radio"].(map[string]any)["5g"].(map[string]any)
+	if radio5["width"] != float64(40) || radio5["channel"] != float64(48) {
+		t.Fatalf("office 5 GHz = %v", radio5)
+	}
+	sweet := doc["network"].(map[string]any)["sweet"].(map[string]any)
+	if sweet["passphrase"] != passphrase {
+		t.Fatalf("revealed passphrase = %v", sweet["passphrase"])
+	}
+
+	gate, err := org.ResolveAP("gate-ap")
+	must(t, err)
+	gdoc, err := document(gate, nil)
+	must(t, err)
+	primary := gdoc["network"].(map[string]any)["sweet"].(map[string]any)["transport"].(map[string]any)["primary"].(map[string]any)
+	if primary["type"] != "vxlan" || primary["vni"] != float64(20) {
+		t.Fatalf("gate primary transport = %v", primary)
+	}
+	if !secret.IsSealed(gdoc["network"].(map[string]any)["sweet"].(map[string]any)["passphrase"]) {
+		t.Fatal("Document without reveal exposed the passphrase")
+	}
+}
+
+func TestDescribe(t *testing.T) {
+	sch, err := V1()
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := sch.Describe()
+	ssid := d.Fields["network.*.ssid"]
+	if ssid["type"] != "string" || ssid["maxLength"] != json.Number("32") && ssid["maxLength"] != float64(32) || ssid["x-aeolus-tree"] != "services" {
+		t.Fatalf("network.*.ssid = %v", ssid)
+	}
+	if vlan := d.Fields["network.*.transport.primary.vlan"]; vlan["type"] != "integer" || vlan["x-aeolus-tree"] != "services" {
+		t.Fatalf("vlan = %v", vlan) // through two $refs
+	}
+	if pass := d.Fields["network.*.passphrase"]; pass["writeOnly"] != true {
+		t.Fatalf("passphrase = %v", pass)
+	}
+	if w := d.Fields["radio.5g.width"]; w["x-aeolus-tree"] != "locations" {
+		t.Fatalf("radio.5g.width = %v", w)
+	}
+	if d.Names["network"] != "^[a-z][a-z0-9-]{0,31}$" || d.Names["ports"] == "" {
+		t.Fatalf("names = %v", d.Names)
+	}
+	// Every leaf, tunnels too (0055).
+	for _, l := range sch.Leaves() {
+		if _, described := d.Fields[l]; !described {
+			t.Errorf("%s is not described", l)
+		}
+	}
+	if a := d.Fields["concentrators.*.address"]; a["x-aeolus-tree"] != "locations" || a["pattern"] == nil {
+		t.Errorf("concentrators.*.address = %v", a)
+	}
+}
+
+func TestLeaves(t *testing.T) {
+	sch := v1(t)
+	leaves := sch.Leaves()
+	has := map[string]bool{}
+	for _, l := range leaves {
+		has[l] = true
+	}
+	for _, want := range []string{"radio.5g.channel", "system.management.vlan", "system.ntp", "ports.*.tagged", "network.*.transport.primary.vni", "network.*.roaming.ft", "concentrators.*.mtu"} {
+		if !has[want] {
+			t.Errorf("missing %s", want)
+		}
+	}
+	for _, l := range leaves {
+		if strings.Contains(l, "libraryConcentrator") || strings.HasSuffix(l, ".transport") || strings.HasPrefix(l, ".") {
+			t.Errorf("unexpected leaf %s", l)
+		}
+		// A name that fits each place: a VLAN for a tunnel port's VNI (0058),
+		// a client's MAC for where it belongs (0319).
+		name := strings.ReplaceAll(strings.ReplaceAll(strings.ReplaceAll(l, "vxlan.*", "vxlan.50"), "homes.*", "homes.02:00:00:00:00:0a"), "*", "x")
+		if f, err := sch.Field(hierarchy.Path(name)); err != nil && !strings.HasPrefix(l, "concentrators.") {
+			t.Errorf("%s is not a field: %v", l, err)
+		} else if err == nil && f.Path == "" {
+			t.Errorf("%s resolved to nothing", l)
+		}
+	}
+}
+
+func TestFieldPaths(t *testing.T) {
+	s := v1(t)
+	ok := map[hierarchy.Path]change.TreeName{
+		"radio.2g.channel":                      change.Locations,
+		"radio.6g.width":                        change.Locations,
+		"system.management.vlan":                change.Locations,
+		"ports.eth0.tagged":                     change.Locations,
+		"ports.lan1.bond":                       change.Locations,
+		"network.sweet.ssid":                    change.Services,
+		"network.sweet.transport.primary.vni":   change.Services,
+		"network.sweet.roaming.ft":              change.Services,
+		"network.guest-2.rate_limit.down_kbps":  change.Services,
+		"concentrators.homelab.address":         change.Locations,
+		"network.vlan-guests.ssid":              change.Services,
+		"ports.lan3.vxlan.50.vni":               change.Locations,
+		"ports.lan3.vxlan.untagged.tunnel":      change.Locations,
+		"network.vlan2go.ssid":                  change.Services,
+		"concentrators.arista.probe_interval":   change.Locations,
+		"concentrators.arista.underlay_vlan":    change.Locations,
+		"network.n626092f.ssid":                 change.Services,
+		"network.night-shift.ssid":              change.Services,
+		"network.sweet.transport.primary.probe": change.Services,
+		"ports.lan3.vxlan.30.probe":             change.Locations,
+	}
+	for p, tree := range ok {
+		f, err := s.Field(p)
+		if err != nil || f.Tree != tree {
+			t.Errorf("Field(%s) = %+v, %v; want tree %s", p, f, err, tree)
+		}
+	}
+	bad := map[hierarchy.Path]error{
+		"radio.2g":                         ErrNotAField,
+		"network.sweet.transport.primary":  ErrNotAField,
+		"radio.9g.channel":                 ErrUnknownField,
+		"network.Bad_Name.ssid":            ErrUnknownField,
+		"network.sweet.ssid.extra":         ErrUnknownField,
+		"system.nope":                      ErrUnknownField,
+		"":                                 ErrUnknownField,
+		"network..ssid":                    ErrUnknownField,
+		"ports.Eth0.mode":                  ErrUnknownField,
+		"network.sweet.transport.tertiary": ErrUnknownField,
+		// Names Aeolus keeps for its own sections on an AP (0054).
+		"network.20.ssid":             ErrUnknownField,
+		"network.5g-guest.ssid":       ErrUnknownField,
+		"network.vlan20.ssid":         ErrUnknownField,
+		"network.port-lan3.ssid":      ErrUnknownField,
+		"ports.lan3.vxlan.tagged.vni": ErrUnknownField,
+		// And for the interface a tunnel starts from on a VLAN (0063).
+		"network.vlan20-tunnels.ssid": ErrUnknownField,
+		// And for a network's own bridge and veth pairs (0061).
+		"network.n626092f4.ssid":   ErrUnknownField,
+		"network.n626092f4-p.ssid": ErrUnknownField,
+	}
+	for p, want := range bad {
+		if _, err := s.Field(p); !errors.Is(err, want) {
+			t.Errorf("Field(%q): got %v, want %v", p, err, want)
+		}
+	}
+	if f, _ := s.Field("network.sweet.passphrase"); !f.Secret {
+		t.Error("passphrase is not marked secret")
+	}
+	if f, _ := s.Field("network.sweet.ssid"); f.Secret {
+		t.Error("ssid is marked secret")
+	}
+}
+
+func TestFieldValues(t *testing.T) {
+	s := v1(t)
+	cases := []struct {
+		path hierarchy.Path
+		v    any
+		ok   bool
+	}{
+		{"radio.2g.channel", 6, true},
+		// SNMP's values go into snmpd's config lines (0052).
+		{"system.snmp.community", "aeolus-ro", true},
+		{"system.snmp.community", "two words", false},
+		{"system.snmp.v3.user", "monitor", true},
+		{"system.snmp.v3.auth", "long enough passphrase", true},
+		{"system.snmp.v3.auth", "short", false},
+		{"system.snmp.v3.auth", `has a "quote"`, false},
+		{"system.snmp.location", "Shed, north wall", true},
+		{"system.snmp.location", "two\nlines", false},
+		{"radio.2g.channel", "auto", true},
+		{"radio.2g.channel", 36, false},
+		{"radio.5g.channel", 48, true},
+		{"radio.5g.channel", 50, false},
+		{"radio.6g.channel", 37, true},
+		{"radio.6g.channel", 38, false},
+		{"radio.5g.width", 80, true},
+		{"radio.5g.width", 320, false},
+		{"radio.6g.width", 320, true},
+		{"radio.2g.power", 20, true},
+		{"radio.2g.power", 40, false},
+		{"system.country", "US", true},
+		{"system.country", "us", false},
+		// A country from tzdata's list, and no other (0074).
+		{"system.country", "GB", true},
+		{"system.country", "ZZ", false},
+		// A time zone from Aeolus's table, and no other (0074).
+		{"system.tz", "America/Chicago", true},
+		{"system.tz", "UTC", true},
+		{"system.tz", "America/Argentina/Buenos_Aires", true},
+		{"system.tz", "Mars/Olympus_Mons", false},
+		{"system.tz", "america/chicago", false},
+		{"system.poll", 5, false},
+		{"system.poll", 60.5, false},
+		{"system.ssh_keys", []string{"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJFp griff@laptop"}, true},
+		{"system.ssh_keys", []string{"not a key"}, false},
+		{"network.sweet.ssid", strings.Repeat("x", 32), true},
+		{"network.sweet.ssid", strings.Repeat("x", 33), false},
+		{"network.sweet.security", "wep", false},
+		{"network.sweet.bands", []string{"5g", "5g"}, false},
+		{"network.sweet.transport.primary.vlan", 4094, true},
+		{"network.sweet.transport.primary.vlan", 4095, false},
+		{"network.sweet.transport.primary.vni", 16777216, false},
+		{"network.sweet.transport.failback", "sticky", false},
+		{"ports.eth0.tagged", []int{10, 20}, true},
+		{"ports.eth0.tagged", []int{0}, false},
+	}
+	for _, c := range cases {
+		v := roundTrip(t, c.v)
+		err := s.Check(c.path, v)
+		if (err == nil) != c.ok {
+			t.Errorf("Check(%s, %v) = %v, want ok=%v", c.path, c.v, err, c.ok)
+		}
+	}
+}
+
+// The manager's table of time zones and the agent's are one file (0074):
+// what the manager accepts, every AP has a rule for.
+func TestZonesMatchTheAgents(t *testing.T) {
+	agent, err := os.ReadFile(filepath.Join("..", "..", "agent", "files", "usr", "share", "ucode", "aeolus", "zones.uc"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.ReplaceAll(string(agent), "\r\n", "\n") != strings.ReplaceAll(string(zonesUC), "\r\n", "\n") {
+		t.Error("internal/schema/zones.uc and the agent's aeolus/zones.uc differ")
+	}
+	zones := Zones()
+	if len(zones) != 446 || zones[0] != "UTC" {
+		t.Errorf("%d zones, the first %q: want 446, UTC first", len(zones), zones[0])
+	}
+	for name, want := range map[string]string{
+		"UTC":               "UTC0",
+		"America/Chicago":   "CST6CDT,M3.2.0,M11.1.0",
+		"America/Vancouver": "MST7",
+		"Asia/Kolkata":      "IST-5:30",
+	} {
+		if got, ok := ZoneRule(name); !ok || got != want {
+			t.Errorf("ZoneRule(%s) = %q, %v; want %q", name, got, ok, want)
+		}
+	}
+	if _, ok := ZoneRule("Mars/Olympus_Mons"); ok {
+		t.Error("a zone outside the table has a rule")
+	}
+	// The description gives the UI the list, for its dropdown.
+	tz := v1(t).Describe().Fields["system.tz"]
+	if list, _ := tz["enum"].([]string); len(list) != 446 || tz["x-aeolus-enum"] != "zones" {
+		t.Errorf("system.tz is described with %d zones (%v)", len(list), tz["x-aeolus-enum"])
+	}
+	// Each zone tzdata gives a country is one Aeolus has a rule for, and the
+	// US's come east to west, as tzselect lists them.
+	var us []ZoneInfo
+	for _, z := range Places() {
+		if _, ok := ZoneRule(z.Zone); !ok {
+			t.Errorf("zone.tab's %s (%s) is not in the table", z.Zone, z.Country)
+		}
+		if z.Country == "US" {
+			us = append(us, z)
+		}
+	}
+	if len(Places()) != 418 || len(us) != 29 || us[0] != (ZoneInfo{"America/New_York", "US", "Eastern (most areas)"}) || us[28].Zone != "Pacific/Honolulu" {
+		t.Errorf("%d places, %d in the US, the first %+v", len(Places()), len(us), us[0])
+	}
+	if got, _ := tz["x-aeolus-zones"].([]ZoneInfo); len(got) != 418 {
+		t.Errorf("system.tz is described with %d places", len(got))
+	}
+	// The countries, by name, every one zone.tab names among them.
+	codes := map[string]string{}
+	for _, c := range Countries() {
+		codes[c.Code] = c.Name
+	}
+	for _, z := range Places() {
+		if codes[z.Country] == "" {
+			t.Errorf("zone.tab's country %s is not in iso3166.tab", z.Country)
+		}
+	}
+	if len(Countries()) != 249 || codes["US"] != "United States" || Countries()[0].Name > Countries()[1].Name {
+		t.Errorf("%d countries, the US %q, the first two %v", len(Countries()), codes["US"], Countries()[:2])
+	}
+	country := v1(t).Describe().Fields["system.country"]
+	if got, _ := country["x-aeolus-countries"].([]Country); len(got) != 249 {
+		t.Errorf("system.country is described with %d countries", len(got))
+	}
+	// A zone set before the list was, such as an alias, isn't refused in a
+	// document, so the AP's config isn't held for it; a new one is.
+	s := v1(t)
+	if err := s.CheckDocument(map[string]any{"system": map[string]any{"tz": "US/Eastern"}}); err != nil {
+		t.Errorf("a document with an old alias: %v", err)
+	}
+	if err := s.Check("system.tz", "US/Eastern"); !errors.Is(err, ErrNotListed) {
+		t.Errorf("setting the alias now: %v, want ErrNotListed", err)
+	}
+}
+
+func TestPrepareSealsSecretsAndGuardRefusesPlainOnes(t *testing.T) {
+	s, box := v1(t), newBox(t)
+	raw, _ := json.Marshal(passphrase)
+
+	sealed, err := s.Prepare("network.sweet.passphrase", raw, box)
+	must(t, err)
+	if strings.Contains(string(sealed), passphrase) {
+		t.Fatalf("prepared secret shows the plain text: %s", sealed)
+	}
+	good := change.Op{Kind: change.Set, Tree: change.Services, Node: "household", Path: "network.sweet.passphrase", Value: sealed}
+	must(t, s.CheckOp(good))
+
+	plain := good
+	plain.Value = raw
+	if err := s.CheckOp(plain); !errors.Is(err, ErrPlainSecret) {
+		t.Fatalf("plain secret: got %v, want ErrPlainSecret", err)
+	}
+	if _, err := s.Prepare("network.sweet.passphrase", raw, nil); !errors.Is(err, ErrNoKey) {
+		t.Fatalf("no key: got %v, want ErrNoKey", err)
+	}
+	short, _ := json.Marshal("short")
+	if _, err := s.Prepare("network.sweet.passphrase", short, box); err == nil {
+		t.Fatal("a too-short passphrase was prepared")
+	}
+}
+
+func TestGuardKeepsFieldsInTheirTree(t *testing.T) {
+	s := v1(t)
+	cases := []change.Op{
+		{Kind: change.Set, Tree: change.Services, Node: "household", Path: "radio.2g.channel", Value: json.RawMessage(`6`)},
+		{Kind: change.Set, Tree: change.Locations, Node: "house", Path: "network.sweet.ssid", Value: json.RawMessage(`"x"`)},
+		{Kind: change.Lock, Tree: change.Services, Node: "household", Path: "system.poll"},
+	}
+	for _, op := range cases {
+		if err := s.CheckOp(op); !errors.Is(err, ErrWrongTree) {
+			t.Errorf("%+v: got %v, want ErrWrongTree", op, err)
+		}
+	}
+	for _, op := range []change.Op{
+		{Kind: change.Lock, Tree: change.Locations, Node: "example", Path: hierarchy.ServicesPath},
+		{Kind: change.AddFolder, Tree: change.Locations, Node: "x", Name: "X", Parent: "example"},
+	} {
+		must(t, s.CheckOp(op))
+	}
+}
+
+func TestDocumentRulesTieFieldsTogether(t *testing.T) {
+	s := v1(t)
+	complete := func() map[string]any {
+		return roundTrip(t, map[string]any{
+			"network": map[string]any{"sweet": map[string]any{
+				"ssid": "Home Wi-Fi", "security": "wpa2-psk", "passphrase": passphrase,
+				"transport": map[string]any{"primary": map[string]any{"type": "vxlan", "concentrator": "homelab", "vni": 20}},
+			}},
+		}).(map[string]any)
+	}
+	must(t, s.CheckDocument(complete()))
+
+	noPass := complete()
+	delete(noPass["network"].(map[string]any)["sweet"].(map[string]any), "passphrase")
+	if err := s.CheckDocument(noPass); err == nil {
+		t.Error("WPA2 network without a passphrase passed")
+	}
+	// With each device's passphrase from the RADIUS server, the network
+	// needs none of its own (0115); with that off, it does again.
+	sweet := noPass["network"].(map[string]any)["sweet"].(map[string]any)
+	sweet["radius"] = map[string]any{"mac_auth": true, "passphrases": true}
+	must(t, s.CheckDocument(noPass))
+	sweet["radius"] = map[string]any{"mac_auth": true, "passphrases": false}
+	if err := s.CheckDocument(noPass); err == nil {
+		t.Error("WPA2 network without a passphrase, and none from RADIUS, passed")
+	}
+	noVNI := complete()
+	delete(noVNI["network"].(map[string]any)["sweet"].(map[string]any)["transport"].(map[string]any)["primary"].(map[string]any), "vni")
+	if err := s.CheckDocument(noVNI); err == nil {
+		t.Error("VXLAN transport without a VNI passed")
+	}
+	noTransport := complete()
+	delete(noTransport["network"].(map[string]any)["sweet"].(map[string]any), "transport")
+	if err := s.CheckDocument(noTransport); err == nil {
+		t.Error("network without a transport passed")
+	}
+}
+
+func TestErrorMessagesAreReadable(t *testing.T) {
+	s := v1(t)
+	check := func(p hierarchy.Path, v any) string {
+		err := s.Check(p, roundTrip(t, v))
+		if err == nil {
+			t.Fatalf("Check(%s, %v) passed", p, v)
+		}
+		return err.Error()
+	}
+	for _, c := range []struct{ got, want string }{
+		{check("network.sweet.ssid", strings.Repeat("x", 33)), "network.sweet.ssid: maxLength: got 33, want 32"},
+		{check("system.poll", 5), "system.poll: minimum: got 5, want 10"},
+		{check("radio.2g.channel", 36), "radio.2g.channel: value must be 'auto' or maximum: got 36, want 14"},
+	} {
+		if c.got != c.want {
+			t.Errorf("got  %q\nwant %q", c.got, c.want)
+		}
+	}
+	doc := roundTrip(t, map[string]any{"network": map[string]any{"sweet": map[string]any{
+		"ssid": "S", "security": "wpa2-psk",
+		"transport": map[string]any{"primary": map[string]any{"type": "vxlan", "concentrator": "homelab"}},
+	}}}).(map[string]any)
+	err := s.CheckDocument(doc)
+	want := "network.sweet.transport.primary: missing property 'vni'; network.sweet: missing property 'passphrase'"
+	if err == nil || err.Error() != want {
+		t.Errorf("document error:\ngot  %v\nwant %s", err, want)
+	}
+}
+
+func TestSecretsNeverReachTheLogInPlainText(t *testing.T) {
+	s, box := v1(t), newBox(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aeolus.db")
+	log, err := changelog.Open(path, changelog.Options{Check: schemaOnly(s)})
+	must(t, err)
+	for _, op := range scenario(t, s, box) {
+		if _, err := log.Commit("claude", "scenario", op); err != nil {
+			t.Fatalf("%+v: %v", op, err)
+		}
+	}
+	plain := change.Op{Kind: change.Set, Tree: change.Services, Node: "household", Path: "network.sweet.passphrase", Value: json.RawMessage(`"` + passphrase + `"`)}
+	if _, err := log.Commit("claude", "", plain); !errors.Is(err, ErrPlainSecret) {
+		t.Fatalf("plain passphrase commit: got %v, want ErrPlainSecret", err)
+	}
+	must(t, log.Close())
+
+	files, err := filepath.Glob(filepath.Join(dir, "aeolus.db*"))
+	must(t, err)
+	for _, f := range files {
+		data, err := os.ReadFile(f)
+		must(t, err)
+		if strings.Contains(string(data), passphrase) {
+			t.Fatalf("%s contains the passphrase in plain text", filepath.Base(f))
+		}
+	}
+
+	log, err = changelog.Open(path, changelog.Options{Check: schemaOnly(s)})
+	must(t, err)
+	defer log.Close()
+	cfg, err := log.Snapshot().Org.ResolveAP("office-ap")
+	must(t, err)
+	doc, err := document(cfg, box.Open)
+	must(t, err)
+	if got := doc["network"].(map[string]any)["sweet"].(map[string]any)["passphrase"]; got != passphrase {
+		t.Fatalf("passphrase after replay = %v", got)
+	}
+}
+
+// document assembles an AP's resolved fields; the manager does this, with the
+// library, in package compose.
+func document(cfg hierarchy.APConfig, reveal func(string, any) (any, error)) (map[string]any, error) {
+	fields := map[string]any{}
+	for p, r := range cfg.Location {
+		fields[string(p)] = r.Value
+	}
+	for id, n := range cfg.Networks {
+		for f, r := range n.Fields {
+			fields["network."+id+"."+f] = r.Value
+		}
+	}
+	return Assemble(fields, reveal)
+}
+
+// schemaOnly adapts CheckOp to the change log's commit check.
+func schemaOnly(s *Schema) func(*change.State, string, change.Op) error {
+	return func(_ *change.State, _ string, op change.Op) error { return s.CheckOp(op) }
+}
+
+func v1(t *testing.T) *Schema {
+	t.Helper()
+	s, err := V1()
+	must(t, err)
+	return s
+}
+
+func newBox(t *testing.T) *secret.Box {
+	t.Helper()
+	b, err := secret.LoadOrCreate(filepath.Join(t.TempDir(), "secret.key"))
+	must(t, err)
+	return b
+}
+
+// roundTrip passes a value through JSON, as every committed value does.
+func roundTrip(t *testing.T, v any) any {
+	t.Helper()
+	raw, err := json.Marshal(v)
+	must(t, err)
+	var out any
+	must(t, json.Unmarshal(raw, &out))
+	return out
+}
+
+func must(t *testing.T, err error) {
+	t.Helper()
+	if err != nil {
+		t.Fatal(err)
+	}
+}

@@ -1,0 +1,134 @@
+#!/usr/bin/ucode
+// Asks the network for a name under .local by multicast DNS, once, and
+// prints each IPv4 address that answers to it, one a line (0151).
+//
+//	aeolus-find-mdns [name]        aeolus.local, where none is given
+//
+// The question goes to 224.0.0.251, port 5353, from a port of this AP's own
+// choosing and with the bit that asks for an answer straight back, so the
+// answers come to this socket alone and nothing here has to hold port 5353
+// (RFC 6762, 5.4 and 6.7). It goes out by the default route's interface,
+// which is the uplink's network; multicast DNS reaches no further than that
+// one network. It is asked twice, a moment apart, and what comes within a
+// second and a half is all that is waited for.
+
+'use strict';
+
+import * as socket from 'socket';
+
+const GROUP = '224.0.0.251', PORT = 5353;
+const WAIT = 1500;      // ms answers are waited for
+const AGAIN = 400;      // ms after the first asking, the second
+const TYPE_A = 1;
+
+// question is the DNS message that asks for name's IPv4 address.
+function question(name) {
+	let m = chr(0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0);
+	for (let label in split(name, '.')) {
+		if (!length(label))
+			continue;
+		if (length(label) > 63)
+			return null;
+		m += chr(length(label)) + label;
+	}
+	// the root; type A; class IN, with the bit that asks for the answer
+	// straight back
+	return m + chr(0, 0, TYPE_A, 0x80, 1);
+}
+
+function u16(m, at) {
+	return ord(m, at) * 256 + ord(m, at + 1);
+}
+
+// name_at reads the name at a place in a message: [the name, lower case,
+// and where what follows it begins]. A name may end in a pointer back into
+// the message; one that points in circles is given up on.
+function name_at(m, at) {
+	let labels = [], next = null, hops = 0;
+	while (at < length(m)) {
+		let n = ord(m, at);
+		if (n == 0) {
+			next ??= at + 1;
+			return [lc(join('.', labels)), next];
+		}
+		if ((n & 0xc0) == 0xc0) {
+			if (at + 1 >= length(m) || ++hops > 16)
+				return null;
+			next ??= at + 2;
+			at = (n & 0x3f) * 256 + ord(m, at + 1);
+			continue;
+		}
+		if (n > 63 || at + 1 + n > length(m))
+			return null;
+		push(labels, substr(m, at + 1, n));
+		at += 1 + n;
+	}
+	return null;
+}
+
+// addresses is the IPv4 addresses a message gives for name, where it is an
+// answer.
+function addresses(m, name) {
+	let out = [];
+	if (length(m) < 12 || !(ord(m, 2) & 0x80))
+		return out;
+	let questions = u16(m, 4), records = u16(m, 6) + u16(m, 8) + u16(m, 10), at = 12;
+	for (let i = 0; i < questions; i++) {
+		let n = name_at(m, at);
+		if (!n)
+			return out;
+		at = n[1] + 4;
+	}
+	for (let i = 0; i < records; i++) {
+		let n = name_at(m, at);
+		if (!n || n[1] + 10 > length(m))
+			return out;
+		let kind = u16(m, n[1]), size = u16(m, n[1] + 8), data = n[1] + 10;
+		if (data + size > length(m))
+			return out;
+		if (kind == TYPE_A && size == 4 && n[0] == name)
+			push(out, sprintf('%d.%d.%d.%d', ord(m, data), ord(m, data + 1), ord(m, data + 2), ord(m, data + 3)));
+		at = data + size;
+	}
+	return out;
+}
+
+let name = lc(rtrim(ARGV[0] ?? 'aeolus.local', '.'));
+let q = question(name);
+if (!q || !match(name, /^[a-z0-9-]+(\.[a-z0-9-]+)*\.local$/)) {
+	warn('aeolus-find-mdns: not a name under .local: ', name, '\n');
+	exit(2);
+}
+
+let s = socket.create(socket.AF_INET, socket.SOCK_DGRAM);
+if (!s) {
+	warn('aeolus-find-mdns: no socket: ', socket.error(), '\n');
+	exit(1);
+}
+let to = { family: socket.AF_INET, address: GROUP, port: PORT };
+let seen = {}, began = clock(true), asked = 0;
+
+function since() {
+	let now = clock(true);
+	return (now[0] - began[0]) * 1000 + (now[1] - began[1]) / 1000000;
+}
+
+while (since() < WAIT) {
+	if (asked == 0 || (asked == 1 && since() >= AGAIN)) {
+		if (s.send(q, 0, to) == null && asked == 0) {
+			warn('aeolus-find-mdns: cannot ask: ', socket.error(), '\n');
+			exit(1);
+		}
+		asked++;
+	}
+	socket.poll(100, [s, socket.POLLIN]);
+	let m;
+	while ((m = s.recv(1500, socket.MSG_DONTWAIT)) != null && length(m)) {
+		for (let a in addresses(m, name)) {
+			if (seen[a])
+				continue;
+			seen[a] = true;
+			print(a, '\n');
+		}
+	}
+}

@@ -1,0 +1,222 @@
+#!/usr/bin/ucode -S
+// aeolus-shell: one terminal on this AP, for someone in Aeolus (0198).
+//
+// aeolus-live starts it when the manager says on its line (0145) that a
+// terminal waits, with the terminal's ID. It joins this AP's dropbear to
+// the manager by connections of its own, as every connection goes (0007):
+// a GET of /v1/ap/terminal/<id>, whose answer is what goes to dropbear, and
+// POSTs of what dropbear says, one at a time and in order. The manager
+// speaks SSH over them with its own key (0197), and checks dropbear's host
+// key by the one this names on its GET. It ends when either side does.
+//
+//	aeolus-shell <id> [-u <manager URL>] [-t <token file>] [-c <certificate, or none>]
+
+'use strict';
+
+import * as fs from 'fs';
+import * as uloop from 'uloop';
+import * as uclient from 'uclient';
+import * as socket from 'socket';
+import { cursor } from 'uci';
+import { openlog, syslog, LOG_PID, LOG_DAEMON, LOG_INFO, LOG_WARNING } from 'log';
+
+const HOST_KEYS = ['/etc/dropbear/dropbear_ed25519_host_key', '/etc/dropbear/dropbear_ecdsa_host_key', '/etc/dropbear/dropbear_rsa_host_key'];
+const UP_MOST = 32768;   // the most of what dropbear says that goes in one POST
+
+let id = ARGV[0], url = null, token_file = '/etc/aeolus/token', cert = '/etc/aeolus/manager.crt';
+for (let i = 1; i < length(ARGV); i++) {
+	if (ARGV[i] == '-u')
+		url = rtrim(ARGV[++i], '/');
+	else if (ARGV[i] == '-t')
+		token_file = ARGV[++i];
+	else if (ARGV[i] == '-c')
+		cert = ARGV[++i] == 'none' ? null : ARGV[i];
+}
+
+openlog('aeolus-shell', LOG_PID, LOG_DAEMON);
+
+function log(fmt, ...args) {
+	syslog(LOG_INFO, sprintf(fmt, ...args));
+}
+
+function note(fmt, ...args) {
+	syslog(LOG_WARNING, sprintf(fmt, ...args));
+}
+
+function read(path) {
+	let v = fs.readfile(path);
+	return v == null ? null : trim(v);
+}
+
+// host_key is dropbear's host key as an authorized_keys line: the one the
+// manager checks this AP by.
+function host_key() {
+	for (let f in HOST_KEYS) {
+		if (!fs.access(f))
+			continue;
+		let p = fs.popen(sprintf("dropbearkey -y -f '%s' 2>/dev/null", f), 'r');
+		if (!p)
+			continue;
+		let text = p.read('all');
+		p.close();
+		for (let line in split(text ?? '', '\n'))
+			if (match(line, /^(ssh-ed25519|ecdsa-sha2-nistp256|ssh-rsa) [A-Za-z0-9+\/=]+/))
+				return trim(line);
+	}
+	return null;
+}
+
+let ended = false;
+let db = null, db_handle = null;   // dropbear, on this AP
+let down = null;                   // the GET: what goes to dropbear
+let up = null;                     // the POSTs: what dropbear says
+let up_busy = false, up_wait = '';
+let base = null, token = null;
+
+function quit(why) {
+	if (ended)
+		return;
+	ended = true;
+	log('terminal %s ended: %s', id, why);
+	db_handle?.delete();
+	db?.close();
+	if (down) {
+		down.disconnect();
+		down.free();
+	}
+	if (up) {
+		up.disconnect();
+		up.free();
+	}
+	uloop.end();
+}
+
+function client(path, cb) {
+	let uc = uclient.new(base + path, null, cb);
+	if (!uc)
+		return null;
+	if (cert && !uc.ssl_init({ ca_files: [cert], verify: true })) {
+		uc.free();
+		return null;
+	}
+	return uc;
+}
+
+let up_go;
+
+// up_done takes the manager's answer to what went up, and sends what came
+// meanwhile.
+function up_done(code) {
+	up_busy = false;
+	if (code != 204 && code != 200)
+		return quit(code ? sprintf('the manager answered %d to what dropbear said', code) : 'what dropbear said did not reach the manager');
+	if (length(up_wait))
+		up_go();
+}
+
+up_go = function() {
+	if (up_busy || ended || !length(up_wait))
+		return;
+	let body = substr(up_wait, 0, UP_MOST);
+	up_wait = substr(up_wait, length(body));
+	if (!up) {
+		let uc;
+		uc = client('/v1/ap/terminal/' + id, {
+			header_done: function() {},
+			data_read: function() {
+				while (length(uc.read() ?? ''))
+					;
+			},
+			data_eof: function() {
+				if (uc == up)
+					up_done(uc.status()?.status ?? 0);
+			},
+			error: function(cb, code) {
+				if (uc == up && up_busy)
+					up_done(0);
+			},
+		});
+		if (!uc)
+			return quit('cannot make a connection to the manager');
+		uc.set_timeout(15000);
+		up = uc;
+	}
+	up_busy = true;
+	if (!up.connect() || !up.request('POST', {
+		headers: { 'User-Agent': 'aeolus-shell', 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/octet-stream' },
+		post_data: body,
+	}))
+		up_done(0);
+};
+
+// on_db takes what dropbear says, for the manager.
+function on_db() {
+	let b = db.recv(16384, socket.MSG_DONTWAIT);
+	if (b == null)
+		return;
+	if (!length(b))
+		return quit('dropbear ended the session');
+	up_wait += b;
+	up_go();
+}
+
+function main() {
+	if (!match(id ?? '', /^[0-9a-f]{32}$/)) {
+		warn('usage: aeolus-shell <terminal ID> [-u <manager URL>] [-t <token file>] [-c <certificate, or none>]\n');
+		exit(2);
+	}
+	base = url ?? rtrim(cursor().get('aeolus', 'agent', 'url') ?? '', '/');
+	token = read(token_file);
+	if (!base || !token) {
+		note('terminal %s: the agent is not set up', id);
+		exit(1);
+	}
+	let key = host_key();
+	if (!key) {
+		note('terminal %s: dropbear has no host key to name', id);
+		exit(1);
+	}
+	uloop.init();
+	db = socket.connect('127.0.0.1', 22);
+	if (!db) {
+		note('terminal %s: cannot reach dropbear: %s', id, socket.error());
+		exit(1);
+	}
+	db_handle = uloop.handle(db, on_db, uloop.ULOOP_READ);
+	let uc;
+	uc = client('/v1/ap/terminal/' + id, {
+		header_done: function() {
+			let code = uc.status()?.status;
+			if (code != 200)
+				return quit(sprintf('the manager answered %s', code));
+			log('terminal %s open', id);
+		},
+		data_read: function() {
+			let chunk;
+			while (length(chunk = uc.read() ?? ''))
+				if (db.send(chunk) == null)
+					return quit('dropbear went: ' + socket.error());
+		},
+		data_eof: function() {
+			quit('the manager ended it');
+		},
+		error: function(cb, code) {
+			quit('connection error ' + code);
+		},
+	});
+	if (!uc) {
+		note('terminal %s: cannot make a connection to the manager', id);
+		exit(1);
+	}
+	down = uc;
+	// The answer lasts as long as the terminal: the manager ends it.
+	uc.set_timeout(24 * 3600 * 1000);
+	if (!uc.connect() || !uc.request('GET', { headers: { 'User-Agent': 'aeolus-shell', 'Authorization': 'Bearer ' + token, 'Aeolus-Host-Key': key } })) {
+		note('terminal %s: cannot connect to %s', id, base);
+		exit(1);
+	}
+	uloop.run();
+	quit('done');
+}
+
+main();

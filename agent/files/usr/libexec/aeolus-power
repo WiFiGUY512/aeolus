@@ -1,0 +1,144 @@
+#!/usr/bin/ucode -S
+// aeolus-power: holds each radio at the transmit power Aeolus sets for it
+// (0349), with iw, which a running radio takes at once: a change of power
+// sets no radio up again, as netifd's txpower does. netifd sets a radio
+// with no txpower to its own power as it sets it up, so this holds it again
+// once hostapd has made its networks anew. The agent runs this after each
+// apply and every few minutes, and the net hotplug when an interface comes.
+//
+//	aeolus-power              every radio: held where a power is set and it
+//	                          does not hold it yet; let go, back to its own,
+//	                          where it held one and none is set now
+//	aeolus-power <interface>  an interface hostapd has just made: once its
+//	                          network is up, a radar check included, as above
+//	aeolus-power -a           after an apply: as above, now, and again 20 and
+//	                          60 seconds on, as netifd sets a radio whose
+//	                          settings it reloads to its own power, its
+//	                          interfaces kept, some seconds after the apply
+//
+// The powers are the renderer's, in the agent's package: the aeolus_power
+// section, an option a radio, by its section's name, in dBm. What it holds
+// is in /var/run/aeolus/power/, a file a radio: the power, the wiphy, and the
+// index of the radio's first network's interface, which a radio set up again
+// does not keep (aeolus.power). A radio that sends louder than it holds it
+// at is held again, whatever the file says.
+
+'use strict';
+
+import * as fs from 'fs';
+import { cursor } from 'uci';
+import { connect } from 'ubus';
+import { openlog, syslog, LOG_PID, LOG_DAEMON, LOG_INFO, LOG_WARNING } from 'log';
+import * as wifinames from 'aeolus.wifinames';   // netifd's Wi-Fi status through a radio being set up again (0301)
+import * as power from 'aeolus.power';
+
+const HELD = '/var/run/aeolus/power';
+const WAIT = 90;   // seconds a new interface's network has to come up, a radar check included
+
+openlog('aeolus', LOG_PID, LOG_DAEMON);
+let bus = connect();
+let want = power.wanted(cursor().get_all('aeolus', 'aeolus_power'));
+
+function read(path) {
+	let v = fs.readfile(path);
+	return v == null ? null : trim(v);
+}
+
+// wireless is netifd's account of the radios. settled, it is once netifd has
+// finished setting up any it is setting up again, which it does after each
+// apply, as this runs (0301). It waits a while at most.
+function wireless(settled) {
+	let ask = () => bus?.call('network.wireless', 'status') ?? {};
+	return settled ? wifinames.settle(ask) : ask();
+}
+
+// up says hostapd has the interface's network up, on its channel.
+function up(ifname) {
+	return bus?.call(`hostapd.${ifname}`, 'get_status')?.status == 'ENABLED';
+}
+
+function phy_of(ifname) {
+	let p = read(`/sys/class/net/${ifname}/phy80211/name`);
+	return p != null && match(p, /^phy[0-9]+$/) ? p : null;
+}
+
+// radios is each radio netifd lists, with the wiphy and the interface index
+// of its first AP network whose interface is there, by name.
+function radios(st) {
+	let out = [];
+	for (let name in sort(keys(st ?? {}))) {
+		let ifs = [];
+		for (let i in st[name].interfaces ?? [])
+			if (i.ifname && i.config?.mode == 'ap' && fs.access(`/sys/class/net/${i.ifname}`))
+				push(ifs, i.ifname);
+		let first = sort(ifs)[0];
+		push(out, { radio: name, phy: first ? phy_of(first) : null, index: first ? read(`/sys/class/net/${first}/ifindex`) : null, ifname: first,
+			power: first ? bus?.call('iwinfo', 'info', { device: first })?.txpower : null });
+	}
+	return out;
+}
+
+function was() {
+	let out = {};
+	for (let f in fs.lsdir(HELD) ?? []) {
+		let h = power.held(fs.readfile(`${HELD}/${f}`));
+		if (h)
+			out[f] = h;
+		else
+			fs.unlink(`${HELD}/${f}`);
+	}
+	return out;
+}
+
+function run(steps, by) {
+	for (let s in steps) {
+		let cmd = power.command(s);
+		if (cmd && system(cmd + ' >/dev/null 2>&1') != 0) {
+			syslog(LOG_WARNING, '%s: its power could not be %s', s.radio, s.do == 'hold' ? sprintf('set to %d dBm', s.power) : 'let go');
+			continue;
+		}
+		if (s.do == 'hold') {
+			fs.mkdir('/var/run/aeolus');
+			fs.mkdir(HELD);
+			fs.writefile(`${HELD}/${s.radio}`, power.said(s.power, s.phy, by[s.radio]?.index ?? ''));
+			syslog(LOG_INFO, '%s: transmit power %d dBm (%s)', s.radio, s.power, s.why);
+		}
+		else if (s.do == 'shared')
+			syslog(LOG_WARNING, '%s: its power is set to %d dBm, but %s is another radio\'s too: left as it is', s.radio, s.power, s.phy);
+		else {
+			fs.unlink(`${HELD}/${s.radio}`);
+			if (s.do == 'let_go')
+				syslog(LOG_INFO, '%s: transmit power its own again', s.radio);
+		}
+	}
+}
+
+// pass looks at every radio once, and does what aeolus.power says.
+function pass() {
+	let st = wireless(true), list = radios(st), by = {};
+	for (let r in list)
+		by[r.radio] = r;
+	run(power.plan(list, was(), want, !length(wifinames.pending(st))), by);
+}
+
+let only = ARGV[0];
+if (only == '-a') {
+	pass();
+	sleep(20000);
+	pass();
+	sleep(40000);
+	pass();
+	exit(0);
+}
+if (only) {
+	// A new interface: once its network is up, its radio is held again,
+	// as netifd set it to its own power as it set it up.
+	let deadline = time() + WAIT;
+	while (!up(only)) {
+		if (time() >= deadline)
+			exit(0);
+		sleep(2000);
+	}
+}
+
+pass();

@@ -1,0 +1,64 @@
+{
+	"about": "A tunnel that carries a VNI into the AP's own bridge (0335): helios, to a monitoring server, carries VNI 9003 on the untagged network, VLAN 1 of br-lan as the uplink carries it untagged. The VNI is aeolus_b9003, from the management interface, a port of br-lan untagged in VLAN 1, with a firewall rule letting it in; it is not one of the tunnels the prober probes.",
+	"current": "shed-current.json",
+	"facts": {
+		"prober": true,
+		"veth": true,
+		"ap": "ap-a0046082275e",
+		"uplink": "wan",
+		"management": "lan",
+		"vxlan": true,
+		"nft_bridge": true,
+		"radios": {
+			"radio0": {
+				"htmodes": [
+					"HT20",
+					"HT40",
+					"VHT20",
+					"VHT40",
+					"VHT80",
+					"VHT80+80",
+					"VHT160"
+				]
+			},
+			"radio1": {
+				"htmodes": [
+					"HT20",
+					"HT40"
+				]
+			}
+		}
+	},
+	"intent": {
+		"system": {
+			"country": "US",
+			"poll": 60
+		},
+		"network": {
+			"lab": {
+				"ssid": "Aeolus Lab",
+				"security": "wpa2-psk",
+				"passphrase": "fixture-passphrase-1",
+				"transport": {
+					"primary": {
+						"type": "vlan",
+						"vlan": 20
+					}
+				}
+			}
+		},
+		"concentrators": {
+			"helios": {
+				"address": "192.168.1.44",
+				"port": 4789,
+				"mtu": 1450,
+				"probe_interval": 30,
+				"bridged": {
+					"untagged": {
+						"vni": 9003
+					}
+				}
+			}
+		}
+	}
+}

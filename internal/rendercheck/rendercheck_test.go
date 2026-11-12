@@ -1,0 +1,1795 @@
+package rendercheck
+
+import (
+	"encoding/json"
+	"fmt"
+	"path"
+	"strings"
+	"testing"
+
+	"github.com/WiFiGUY512/aeolus/internal/schema"
+	"github.com/WiFiGUY512/aeolus/internal/uci"
+)
+
+const pass = "home-wi-fi-passphrase-42"
+
+// intent is a composed config as compose.AP builds it, secrets opened. The
+// AP has no 6 GHz radio, so the 6g settings do not apply to it.
+const intent = `{
+	"radio": {
+		"2g": {"channel": 6, "width": 20},
+		"5g": {"enabled": true, "channel": "auto", "width": 80, "power": 20},
+		"6g": {"width": 160}
+	},
+	"system": {"country": "US", "tz": "America/Chicago", "ntp": ["0.pool.ntp.org", "1.pool.ntp.org"], "syslog": "192.168.20.50:514", "poll": 60},
+	"network": {
+		"sweet": {"ssid": "Home Wi-Fi", "security": "wpa2-psk", "passphrase": "` + pass + `", "roaming": {"ft": true}, "multicast_to_unicast": true,
+			"transport": {"primary": {"type": "vxlan", "concentrator": "homelab", "vni": 20, "probe": "192.168.20.1"}}},
+		"sweet-iot": {"ssid": "Home_Wi-Fi_IoT", "security": "wpa2-psk", "passphrase": "` + pass + `", "bands": ["2g"], "hidden": true, "isolation": true,
+			"transport": {"primary": {"type": "vlan", "vlan": 30}}},
+		"old": {"enabled": false, "ssid": "Old", "security": "open", "transport": {"primary": {"type": "vlan", "vlan": 40}}}
+	},
+	"concentrators": {"homelab": {"address": "1.1.1.2", "port": 4789, "mtu": 1450, "probe_interval": 20}}
+}`
+
+// rendered carries the intent, plus a section Aeolus did not make.
+const rendered = `package wireless
+
+config wifi-device 'radio0'
+	option band '2g'
+	option channel '6'
+	option htmode 'HE20'
+	option country 'US'
+
+config wifi-device 'radio1'
+	option band '5g'
+	option noscan '1'
+	option channel 'auto'
+	option htmode 'VHT80'
+	list channels '36'
+	list channels '52'
+	list channels '100'
+	list channels '116'
+	list channels '132'
+	list channels '149'
+	option country 'US'
+
+config wifi-iface 'aeolus_sweet_radio0'
+	option device 'radio0'
+	option mode 'ap'
+	option rnr '1'
+	option ssid 'Home Wi-Fi'
+	option encryption 'psk2+ccmp'
+	option key '` + pass + `'
+	option multicast_to_unicast '1'
+	option ft_over_ds '0'
+	option ft_psk_generate_local '1'
+	option nasid 'ap-a0046082275e/radio0/5584392f'
+	option aeolus_ft 'sweet'
+	list hostapd_bss_options 'pmk_r1_push=1'
+	list hostapd_bss_options 'rxkh_file=/etc/aeolus-ft/aeolus_sweet_radio0'
+	option ieee80211r '1'
+	option network 'aeolus_sweet'
+
+config wifi-iface 'aeolus_sweet_radio1'
+	option device 'radio1'
+	option mode 'ap'
+	option rnr '1'
+	option ssid 'Home Wi-Fi'
+	option encryption 'psk2'
+	option key '` + pass + `'
+	option multicast_to_unicast '1'
+	option ft_over_ds '0'
+	option ft_psk_generate_local '1'
+	option nasid 'ap-a0046082275e/radio1/5584392f'
+	option aeolus_ft 'sweet'
+	list hostapd_bss_options 'pmk_r1_push=1'
+	list hostapd_bss_options 'rxkh_file=/etc/aeolus-ft/aeolus_sweet_radio1'
+	option ieee80211r '1'
+	option network 'aeolus_sweet'
+
+config wifi-iface 'aeolus_sweet_iot_radio0'
+	option device 'radio0'
+	option mode 'ap'
+	option rnr '1'
+	option ssid 'Home_Wi-Fi_IoT'
+	option encryption 'psk2'
+	option key '` + pass + `'
+	option hidden '1'
+	option isolate '1'
+	option network 'aeolus_sweet_iot'
+
+config wifi-iface 'default_radio0'
+	option device 'radio0'
+	option ssid 'OpenWrt'
+
+package network
+
+config interface 'lan'
+	option proto 'dhcp'
+	option device 'br-lan.1'
+
+config interface 'aeolus_sweet'
+	option proto 'none'
+	option device 'br-vx20'
+
+config interface 'aeolus_sweet_iot'
+	option proto 'none'
+	option device 'br-lan.30'
+
+config device
+	option type '8021q'
+	option ifname 'lan'
+	option vid '20'
+	option name 'lan.20'
+
+config bridge-vlan
+	option device 'br-lan'
+	option vlan '30'
+
+config interface 'aeolus_20'
+	option proto 'vxlan'
+	option peeraddr '1.1.1.2'
+	option port '4789'
+	option vid '20'
+	option mtu '1450'
+	option tunlink 'lan'
+
+config device 'aeolus_20_br'
+	option type 'bridge'
+	option name 'br-vx20'
+	option bridge_empty '1'
+	list ports 'aeolus_20'
+
+package firewall
+
+config zone
+	option name 'lan'
+	list network 'lan'
+
+config rule 'aeolus_vxlan_20'
+	option name 'Aeolus VXLAN 20'
+	option src 'lan'
+	option proto 'udp'
+	option src_ip '1.1.1.2'
+	option dest_port '4789'
+	option target 'ACCEPT'
+
+config include 'aeolus_clamp'
+	option type 'nftables'
+	option path '/etc/aeolus/clamp.nft'
+	option position 'ruleset-post'
+
+package system
+
+config system
+	option zonename 'America/Chicago'
+	option timezone 'CST6CDT,M3.2.0,M11.1.0'
+	option log_ip '192.168.20.50'
+	option log_port '514'
+
+config timeserver 'ntp'
+	list server '1.pool.ntp.org'
+	list server '0.pool.ntp.org'
+
+package aeolus
+
+config agent 'agent'
+	option url 'https://aeolus.example.com:8443'
+	option uplink 'wan'
+	option poll '60'
+
+config probe 'aeolus_20'
+	option vni '20'
+	option interval '20'
+	list address '192.168.20.1'
+
+config power 'aeolus_power'
+	option radio1 '20'
+`
+
+func check(t *testing.T, text string) []string {
+	t.Helper()
+	var doc map[string]any
+	if err := json.Unmarshal([]byte(intent), &doc); err != nil {
+		t.Fatal(err)
+	}
+	c, err := uci.Parse(text)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return Check(doc, c)
+}
+
+func TestRenderedIntentPasses(t *testing.T) {
+	if p := check(t, rendered); len(p) != 0 {
+		t.Fatalf("problems: %v", p)
+	}
+}
+
+func TestEachRuleCatchesItsMistake(t *testing.T) {
+	cases := []struct {
+		name, old, new, want string
+	}{
+		{"channel", "option channel 'auto'", "option channel '36'", "wireless.radio1: channel is \"36\""},
+		{"width", "option htmode 'VHT80'", "option htmode 'HE40'", "want a 80 MHz mode"},
+		{"power", "\toption radio1 '20'\n", "\toption radio1 '17'\n", "aeolus.aeolus_power: radio1 is \"17\", want \"20\""},
+		{"power held", "\nconfig power 'aeolus_power'\n\toption radio1 '20'\n", "", "aeolus.aeolus_power: a power is set, but the section is missing"},
+		{"power of netifd's", "list channels '149'\n", "list channels '149'\n\toption txpower '20'\n", "txpower is \"20\", want none: the agent holds a set power with iw (0349)"},
+		{"power of no radio", "\toption radio1 '20'\n", "\toption radio1 '20'\n\toption radio0 '20'\n", "aeolus.aeolus_power: radio0 is \"20\", but no power is set for it"},
+		{"enabled", "list channels '149'\n", "list channels '149'\n\toption disabled '1'\n", "radio.5g.enabled is true"},
+		{"country", "option htmode 'HE20'\n\toption country 'US'", "option htmode 'HE20'", "wireless.radio0: country is missing"},
+		{"missing iface", "config wifi-iface 'aeolus_sweet_iot_radio0'", "config wifi-iface 'something_else'", "no wifi-iface aeolus_sweet_iot_radio0 on radio0"},
+		{"ssid", "option ssid 'Home_Wi-Fi_IoT'", "option ssid 'Home Wi-Fi IoT'", "ssid is \"Home Wi-Fi IoT\""},
+		{"encryption", "option encryption 'psk2+ccmp'", "option encryption 'sae'", "encryption is \"sae\", want \"psk2\""},
+		{"hidden", "option hidden '1'\n", "", "hidden is \"\", want on"},
+		{"isolation", "option isolate '1'", "option isolate '0'", "isolate is \"0\", want on"},
+		{"multicast to unicast", "option multicast_to_unicast '1'", "option multicast_to_unicast '0'", "aeolus_sweet_radio0: multicast_to_unicast is \"0\""},
+		{"multicast default", "option isolate '1'", "option isolate '1'\n\toption multicast_to_unicast '1'", "multicast_to_unicast is \"1\", want none, for OpenWrt's default"},
+		{"low ack default", "option isolate '1'", "option isolate '1'\n\toption disassoc_low_ack '0'", "disassoc_low_ack is \"0\", want none, for OpenWrt's default"},
+		{"pmf default", "option isolate '1'", "option isolate '1'\n\toption ieee80211w '1'", "ieee80211w is \"1\", want none, for OpenWrt's default"},
+		{"roaming", "option ieee80211r '1'\n\toption network 'aeolus_sweet'\n\nconfig wifi-iface 'aeolus_sweet_radio1'", "option network 'aeolus_sweet'\n\nconfig wifi-iface 'aeolus_sweet_radio1'", "aeolus_sweet_radio0: ieee80211r"},
+		{"key holder", "\toption nasid 'ap-a0046082275e/radio0/5584392f'\n", "", "aeolus_sweet_radio0: nasid is \"\", want a NAS-Identifier of the BSS's own"},
+		{"key holders' file", "list hostapd_bss_options 'rxkh_file=/etc/aeolus-ft/aeolus_sweet_radio1'", "list hostapd_bss_options 'rxkh_file=/tmp/x'", "aeolus_sweet_radio1: hostapd_bss_options is"},
+		{"keys pushed", "\tlist hostapd_bss_options 'pmk_r1_push=1'\n\tlist hostapd_bss_options 'rxkh_file=/etc/aeolus-ft/aeolus_sweet_radio0'", "\tlist hostapd_bss_options 'rxkh_file=/etc/aeolus-ft/aeolus_sweet_radio0'", "aeolus_sweet_radio0: hostapd_bss_options is"},
+		{"transition disable unasked", "\tlist hostapd_bss_options 'rxkh_file=/etc/aeolus-ft/aeolus_sweet_radio0'\n", "\tlist hostapd_bss_options 'rxkh_file=/etc/aeolus-ft/aeolus_sweet_radio0'\n\tlist hostapd_bss_options 'transition_disable=0x01'\n", "aeolus_sweet_radio0: hostapd_bss_options is"},
+		{"no 802.11r", "option hidden '1'", "option hidden '1'\n\toption aeolus_ft 'sweet-iot'", "aeolus_ft is set, but the network has no 802.11r"},
+		{"key caching", "option hidden '1'", "option hidden '1'\n\toption okc '1'", "okc is \"1\", want off for wpa2-psk"},
+		{"interface", "config interface 'aeolus_sweet_iot'", "config interface 'aeolus_things'", "network interface aeolus_sweet_iot does not exist"},
+		{"no network interface", "config interface 'aeolus_sweet_iot'", "config interface 'aeolus_things'", "network.sweet-iot: no interface aeolus_sweet_iot"},
+		{"vlan path", "option device 'br-lan.30'", "option device 'br-lan.31'", "interface aeolus_sweet_iot is on \"br-lan.31\", want the primary's VLAN 30"},
+		{"tunnel path", "option device 'br-vx20'", "option device 'br-lan.20'", "interface aeolus_sweet is on \"br-lan.20\", want the primary's tunnel bridge br-vx20"},
+		{"device", "option device 'radio1'", "option device 'radio0'", "aeolus_sweet_radio1: device is \"radio0\""},
+		{"stale", "config wifi-iface 'default_radio0'", "config wifi-iface 'aeolus_old_radio0'", "wireless.aeolus_old_radio0: no network calls for it"},
+		{"bridge vlan", "option vlan '30'", "option vlan '31'", "sweet-iot.transport.primary: VLAN 30"},
+		{"no tunnel", "config interface 'aeolus_20'", "config interface 'aeolus_21'", "no tunnel aeolus_20 to 1.1.1.2 with VNI 20"},
+		{"tunnel peer", "option peeraddr '1.1.1.2'", "option peeraddr '1.1.1.3'", "network.aeolus_20: peeraddr is \"1.1.1.3\", want \"1.1.1.2\""},
+		{"tunnel proto", "option proto 'vxlan'", "option proto 'vxlan6'", "network.aeolus_20: proto is \"vxlan6\""},
+		{"tunnel vni", "option vid '20'\n\toption mtu", "option vid '21'\n\toption mtu", "network.aeolus_20: vid is \"21\""},
+		{"tunnel mtu", "option mtu '1450'", "option mtu '1500'", "aeolus_20: mtu is \"1500\""},
+		{"uplink mtu", "option device 'br-lan.1'", "option device 'br-lan.1'\n\toption mtu '1499'", "an MTU of 1450 needs 1500 on the AP's uplink, lan (br-lan.1), which carries 1499"},
+		{"tunnel port", "option port '4789'", "option port '8472'", "port is \"8472\""},
+		{"tunlink", "\toption tunlink 'lan'\n", "", "aeolus_20: tunlink is missing"},
+		{"tunlink names", "option tunlink 'lan'", "option tunlink 'wan'", "tunlink \"wan\" names no interface"},
+		{"primary started", "option tunlink 'lan'", "option tunlink 'lan'\n\toption auto '0'", "the tunnel is not started"},
+		{"tunnel bridge", "option name 'br-vx20'", "option name 'br-lan'", "network.aeolus_20_br: want a bridge br-vx20"},
+		{"bridge carries", "list ports 'aeolus_20'", "list ports 'lan1'", "the bridge does not carry the tunnel aeolus_20"},
+		{"firewall rule", "config rule 'aeolus_vxlan_20'", "config rule 'other'", "firewall.aeolus_vxlan_20: no rule letting the tunnel in from 1.1.1.2"},
+		{"rule source", "option src_ip '1.1.1.2'", "option src_ip '0.0.0.0/0'", "firewall.aeolus_vxlan_20: src_ip is \"0.0.0.0/0\""},
+		{"rule zone", "\toption src 'lan'\n", "", "firewall.aeolus_vxlan_20: src is missing"},
+		{"clamp", "config include 'aeolus_clamp'", "config include 'other'", "MTU 1450 needs the MSS clamp"},
+		{"no firewall", "package firewall", "package fire", "package firewall is missing"},
+		{"zonename", "option zonename 'America/Chicago'", "option zonename 'UTC'", "zonename is \"UTC\""},
+		{"timezone", "option timezone 'CST6CDT,M3.2.0,M11.1.0'", "option timezone 'GMT0'", "timezone is \"GMT0\""},
+		{"ntp", "\tlist server '0.pool.ntp.org'\n", "", "system.ntp: servers"},
+		{"syslog", "option log_port '514'", "option log_port '515'", "log_port is \"515\""},
+		{"no wireless", "package wireless", "package wifi", "package wireless is missing"},
+		{"no network", "package network", "package net", "package network is missing"},
+		{"poll", "option poll '60'", "option poll '30'", "aeolus.agent: poll is \"30\""},
+		{"no agent", "config agent 'agent'", "config agent 'other'", "aeolus: no agent section"},
+		{"no probe", "config probe 'aeolus_20'", "config probe 'other'", "aeolus.aeolus_20: no probe section for the tunnel"},
+		{"probe interval", "option interval '20'", "option interval '30'", "aeolus.aeolus_20: interval is \"30\", want \"20\""},
+		{"probe address", "list address '192.168.20.1'", "list address '192.168.20.2'", "aeolus.aeolus_20: probe addresses are [192.168.20.2], want [192.168.20.1]"},
+		{"stale probe", "config probe 'aeolus_20'", "config probe 'aeolus_99'\n\toption vni '99'\n\nconfig probe 'aeolus_20'", "aeolus.aeolus_99: no tunnel, tunnel port, network with a fallback or VLAN on the uplink calls for it"},
+	}
+	for _, c := range cases {
+		if !strings.Contains(rendered, c.old) {
+			t.Fatalf("%s: fixture lacks %q", c.name, c.old)
+		}
+		got := strings.Join(check(t, strings.Replace(rendered, c.old, c.new, 1)), "\n")
+		if !strings.Contains(got, c.want) {
+			t.Errorf("%s: want %q in:\n%s", c.name, c.want, got)
+		}
+	}
+}
+
+func TestBandSteering(t *testing.T) {
+	var doc map[string]any
+	if err := json.Unmarshal([]byte(strings.Replace(intent, `"roaming": {"ft": true},`, `"roaming": {"ft": true}, "band_steering": true,`, 1)), &doc); err != nil {
+		t.Fatal(err)
+	}
+	check := func(text string) string {
+		t.Helper()
+		c, err := uci.Parse(text)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return strings.Join(Check(doc, c), "\n")
+	}
+	// Without the daemon's section, and without 11k and 11v on the
+	// network: band_steering is the older name of steering.suggest (0138).
+	got := check(rendered)
+	for _, want := range []string{
+		"aeolus.aeolus_steer: a network has its clients steered, but the section is missing",
+		"aeolus_sweet_radio0: ieee80211k is \"\", want on",
+		"aeolus_sweet_radio0: bss_transition is \"\", want on",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing %q in:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "usteer") {
+		t.Errorf("an AP without usteer is none the worse, yet: %s", got)
+	}
+	asked := strings.ReplaceAll(rendered, "\toption ieee80211r '1'\n", "\toption ieee80211r '1'\n\toption ieee80211k '1'\n\toption bss_transition '1'\n")
+	const section = "\npackage aeolus\n\nconfig steer 'aeolus_steer'\n%s"
+	const usteer = "\npackage usteer\n\nconfig usteer\n\toption network 'lan'\n\toption band_steering_interval '%s'\n\toption max_neighbor_reports '24'\n%s"
+	if !strings.Contains(asked, "\npackage aeolus\n") {
+		t.Fatal("the fixture has no aeolus package to put the section in")
+	}
+	with := func(lists string) string {
+		return strings.Replace(asked, "\npackage aeolus\n", fmt.Sprintf(section, lists)+"\n", 1)
+	}
+	for _, c := range []struct {
+		lists, interval, ssids, want string
+	}{
+		{"\tlist suggest 'sweet'\n", "0", "", ""},
+		{"\tlist suggest 'sweet'\n", "30000", "", "usteer: band_steering_interval is \"30000\", want \"0\""},
+		{"\tlist suggest 'sweet'\n", "0", "\tlist ssid_list 'Home Wi-Fi'\n", "usteer is to steer nothing"},
+		{"\tlist suggest 'sweet'\n\tlist hold_back 'sweet'\n", "0", "", "aeolus.aeolus_steer: hold_back is [\"sweet\"], want []"},
+		{"\tlist suggest 'iot'\n", "0", "", "aeolus.aeolus_steer: suggest is [\"iot\"], want [\"sweet\"]"},
+		{"\tlist suggest 'sweet'\n\toption kick '1'\n", "0", "", "aeolus.aeolus_steer: kick is \"1\", and nothing calls for it"},
+	} {
+		got := check(with(c.lists) + fmt.Sprintf(usteer, c.interval, c.ssids))
+		if c.want == "" && (strings.Contains(got, "steer") || strings.Contains(got, "ieee80211k") || strings.Contains(got, "bss_transition")) {
+			t.Errorf("steered right, yet: %s", got)
+		}
+		if c.want != "" && !strings.Contains(got, c.want) {
+			t.Errorf("want %q in:\n%s", c.want, got)
+		}
+	}
+	// usteer's own 8 neighbours a list, or none said, leave BSSes out of it
+	// (0228).
+	for _, n := range []string{"\toption max_neighbor_reports '8'\n", ""} {
+		u := strings.Replace(fmt.Sprintf(usteer, "0", ""), "\toption max_neighbor_reports '24'\n", n, 1)
+		if got := check(with("\tlist suggest 'sweet'\n") + u); !strings.Contains(got, "usteer: max_neighbor_reports is") {
+			t.Errorf("max_neighbor_reports %q passed: %s", n, got)
+		}
+	}
+	// Each way is a switch of its own: hold back alone asks no client
+	// anything, so it turns on neither 11k nor 11v; sticky does, and says
+	// the signal under which a client is weak; steering.suggest set off
+	// wins over the older name.
+	ways := func(steering string) map[string]any {
+		var d map[string]any
+		if err := json.Unmarshal([]byte(strings.Replace(intent, `"roaming": {"ft": true},`, `"roaming": {"ft": true}, "band_steering": true, "steering": `+steering+`,`, 1)), &d); err != nil {
+			t.Fatal(err)
+		}
+		return d
+	}
+	for _, c := range []struct {
+		steering, text, want string
+	}{
+		{`{"suggest": false, "hold_back": true}`, strings.Replace(rendered, "\npackage aeolus\n", fmt.Sprintf(section, "\tlist hold_back 'sweet'\n")+"\n", 1), ""},
+		{`{"suggest": false, "sticky": true, "sticky_signal": -70}`, with("\tlist sticky 'sweet=-70'\n\tlist sticky_with 'sweet margin=5 floor=-65 hold_down=10'\n"), ""},
+		{`{"suggest": false, "sticky": true}`, with("\tlist sticky 'sweet=-70'\n\tlist sticky_with 'sweet margin=5 floor=-65 hold_down=10'\n"), "aeolus.aeolus_steer: sticky is [\"sweet=-70\"], want [\"sweet=-80\"]"},
+		// Sticky's other settings (0289), as set, and as unset where not.
+		{`{"suggest": false, "sticky": true, "sticky_margin": 8, "sticky_floor": -60, "sticky_hold_down": 15}`,
+			with("\tlist sticky 'sweet=-80'\n\tlist sticky_with 'sweet margin=8 floor=-60 hold_down=15'\n"), ""},
+		{`{"suggest": false, "sticky": true, "sticky_margin": 8}`, with("\tlist sticky 'sweet=-80'\n\tlist sticky_with 'sweet margin=5 floor=-65 hold_down=10'\n"),
+			"aeolus.aeolus_steer: sticky_with is [\"sweet margin=5 floor=-65 hold_down=10\"], want [\"sweet margin=8 floor=-65 hold_down=10\"]"},
+		// An agent from before them renders none: refused until it is the manager's own.
+		{`{"suggest": false, "sticky": true}`, with("\tlist sticky 'sweet=-80'\n"), "aeolus.aeolus_steer: sticky_with is [], want [\"sweet margin=5 floor=-65 hold_down=10\"]"},
+		// On the scan radios too (0324): listed with sticky, and not without it.
+		{`{"suggest": false, "sticky": true, "sticky_scan": true}`,
+			with("\tlist sticky 'sweet=-80'\n\tlist sticky_with 'sweet margin=5 floor=-65 hold_down=10'\n\tlist sticky_scan 'sweet'\n"), ""},
+		{`{"suggest": false, "sticky": true, "sticky_scan": true}`,
+			with("\tlist sticky 'sweet=-80'\n\tlist sticky_with 'sweet margin=5 floor=-65 hold_down=10'\n"), `aeolus.aeolus_steer: sticky_scan is [], want ["sweet"]`},
+		{`{"suggest": false}`, rendered, ""},
+	} {
+		parsed, err := uci.Parse(c.text)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := strings.Join(Check(ways(c.steering), parsed), "\n")
+		if c.want == "" && (strings.Contains(got, "steer") || strings.Contains(got, "ieee80211k") || strings.Contains(got, "bss_transition")) {
+			t.Errorf("%s, rendered right, yet: %s", c.steering, got)
+		}
+		if c.want != "" && !strings.Contains(got, c.want) {
+			t.Errorf("%s: want %q in:\n%s", c.steering, c.want, got)
+		}
+	}
+	// Where clients belong (0319): an entry a client, by MAC, here where the
+	// manager marked this AP one it belongs on, the bands where named, and
+	// the hold, written out where unset.
+	homed := func(homes string) map[string]any {
+		d := ways(`{"suggest": true}`)
+		var h map[string]any
+		if err := json.Unmarshal([]byte(homes), &h); err != nil {
+			t.Fatal(err)
+		}
+		d["homes"] = h
+		return d
+	}
+	const rules = `{"02:00:00:00:00:0b": {"aps": ["ap-2005b6df64e0"], "hold": 20},
+		"02:00:00:00:00:0a": {"aps": ["ap-30862def2fff", "ap-2005b6df64e0"], "bands": ["5g", "6g"], "here": true}}`
+	both := "\tlist suggest 'sweet'\n\tlist home '02:00:00:00:00:0a here aps=ap-30862def2fff,ap-2005b6df64e0 bands=5g,6g hold=30'\n" +
+		"\tlist home '02:00:00:00:00:0b aps=ap-2005b6df64e0 hold=20'\n"
+	for _, c := range []struct{ homes, lists, want string }{
+		{rules, both, ""},
+		{rules, "\tlist suggest 'sweet'\n", `aeolus.aeolus_steer: home is [], want ["02:00:00:00:00:0a here`},
+		{`{}`, both, `aeolus.aeolus_steer: home is ["02:00:00:00:00:0a here`},
+		{rules, strings.Replace(both, " here", "", 1), `want ["02:00:00:00:00:0a here aps=`},
+		{rules, strings.Replace(both, "hold=20", "hold=30", 1), `aps=ap-2005b6df64e0 hold=20"]`},
+		// Of the nearest (0321), with no APs, and missing it.
+		{`{"02:00:00:00:00:0c": {"nearest": true}}`, "\tlist suggest 'sweet'\n\tlist home '02:00:00:00:00:0c nearest hold=30'\n", ""},
+		{`{"02:00:00:00:00:0c": {"nearest": true}}`, "\tlist suggest 'sweet'\n", `want ["02:00:00:00:00:0c nearest hold=30"]`},
+	} {
+		parsed, err := uci.Parse(with(c.lists))
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := strings.Join(Check(homed(c.homes), parsed), "\n")
+		if c.want == "" && strings.Contains(got, "steer") {
+			t.Errorf("homes %s, rendered right, yet: %s", c.homes, got)
+		}
+		if c.want != "" && !strings.Contains(got, c.want) {
+			t.Errorf("homes %s: want %q in:\n%s", c.homes, c.want, got)
+		}
+	}
+
+	// With no network asking, there is no section, and usteer steers nothing.
+	var none map[string]any
+	if err := json.Unmarshal([]byte(intent), &none); err != nil {
+		t.Fatal(err)
+	}
+	c, err := uci.Parse(with("\tlist suggest 'sweet'\n") + fmt.Sprintf(usteer, "30000", ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got = strings.Join(Check(none, c), "\n")
+	for _, want := range []string{"usteer: band_steering_interval is \"30000\", want \"0\"", "aeolus.aeolus_steer: no network has its clients steered, but the section is there"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("with no network steered, missing %q in: %s", want, got)
+		}
+	}
+}
+
+func TestSNMP(t *testing.T) {
+	const community = "secret-community"
+	var on, off map[string]any
+	if err := json.Unmarshal([]byte(`{"system": {"snmp": {"enabled": true, "community": "`+community+`", "location": "Shed",
+		"v3": {"user": "monitor", "auth": "auth-passphrase", "privacy": "privacy-passphrase"}}}}`), &on); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal([]byte(`{"system": {}}`), &off); err != nil {
+		t.Fatal(err)
+	}
+	check := func(doc map[string]any, text string) string {
+		t.Helper()
+		c, err := uci.Parse(text)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out []string
+		for _, p := range Check(doc, c) {
+			if strings.HasPrefix(p, "snmpd") {
+				out = append(out, p)
+			}
+		}
+		return strings.Join(out, "\n")
+	}
+	const good = `package snmpd
+config agent 'agent'
+	option agentaddress 'UDP:161,UDP6:161'
+config com2sec 'aeolus_v2c'
+	option secname 'ro'
+	option source 'default'
+	option community '` + community + `'
+config com2sec6 'aeolus_v2c6'
+	option secname 'ro'
+	option source 'default'
+	option community '` + community + `'
+config access 'aeolus_ro'
+	option group 'ro'
+	option write 'none'
+config system 'system'
+	option sysLocation 'Shed'
+config v3 'aeolus_v3'
+	option username 'monitor'
+	option auth_type 'SHA'
+	option auth_pass 'auth-passphrase'
+	option privacy_type 'AES'
+	option privacy_pass 'privacy-passphrase'
+	option allow_write '0'
+config snmpd 'general'
+	option enabled '1'
+	option snmp_version 'v1/v2c/v3'
+`
+	if got := check(on, good); got != "" {
+		t.Fatalf("problems with the right config: %s", got)
+	}
+	for _, c := range []struct{ name, old, new, want string }{
+		{"off", "option enabled '1'", "option enabled '0'", `enabled is "0", want "1"`},
+		{"community", "option community '" + community + "'\nconfig com2sec6", "option community 'public'\nconfig com2sec6", "communities do not match"},
+		{"write", "option write 'none'", "option write 'all'", "write is \"all\", want none"},
+		{"auth", "option auth_pass 'auth-passphrase'", "option auth_pass 'other-passphrase'", "auth_pass does not match"},
+		{"privacy type", "option privacy_type 'AES'", "option privacy_type 'DES'", `privacy_type is "DES", want "AES"`},
+		{"version", "option snmp_version 'v1/v2c/v3'", "option snmp_version 'v1/v2c'", "want one with v3"},
+		{"location", "option sysLocation 'Shed'", "option sysLocation 'office'", `sysLocation is "office"`},
+	} {
+		if !strings.Contains(good, c.old) {
+			t.Fatalf("%s: fixture lacks %q", c.name, c.old)
+		}
+		got := check(on, strings.Replace(good, c.old, c.new, 1))
+		if !strings.Contains(got, c.want) {
+			t.Errorf("%s: want %q in:\n%s", c.name, c.want, got)
+		}
+		for _, secret := range []string{community, "auth-passphrase", "privacy-passphrase", "other-passphrase"} {
+			if strings.Contains(got, secret) {
+				t.Errorf("%s: a secret is quoted: %s", c.name, got)
+			}
+		}
+	}
+	// Off: nothing may answer, so OpenWrt's default communities must go.
+	if got := check(off, "package snmpd\nconfig snmpd 'general'\n\toption enabled '0'\n"); got != "" {
+		t.Fatalf("off: %s", got)
+	}
+	if got := check(off, "package snmpd\nconfig com2sec 'public'\n\toption community 'public'\nconfig snmpd 'general'\n\toption enabled '0'\n"); !strings.Contains(got, "1 communities are set, want none") {
+		t.Fatalf("off with a community left: %s", got)
+	}
+	// Without snmpd: fine while off, refused while on.
+	if got := check(off, "package wireless\n"); got != "" {
+		t.Fatalf("off, no snmpd: %s", got)
+	}
+	if got := check(on, "package wireless\n"); !strings.Contains(got, "install it (apk add snmpd-ssl)") {
+		t.Fatalf("on, no snmpd: %s", got)
+	}
+}
+
+func TestPorts(t *testing.T) {
+	var doc map[string]any
+	if err := json.Unmarshal([]byte(`{"ports": {
+		"lan2": {"enabled": true, "mode": "access", "untagged": 30},
+		"lan3": {"enabled": false, "mode": "trunk", "untagged": 0, "tagged": [10, 20]},
+		"lan9": {"mode": "access", "untagged": 10}}}`), &doc); err != nil {
+		t.Fatal(err)
+	}
+	check := func(doc map[string]any, text string) string {
+		t.Helper()
+		c, err := uci.Parse(text)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return strings.Join(Check(doc, c), "\n")
+	}
+	const good = `package network
+config device
+	option name 'br-lan'
+	option type 'bridge'
+	list ports 'lan1'
+	list ports 'lan2'
+	list ports 'lan3'
+	list ports 'wan'
+config bridge-vlan 'vlan1'
+	option device 'br-lan'
+	option vlan '1'
+	list ports 'wan:u*'
+	list ports 'lan1:u*'
+config bridge-vlan 'vlan10'
+	option device 'br-lan'
+	option vlan '10'
+	list ports 'wan:t'
+	list ports 'lan3:t'
+config bridge-vlan 'vlan20'
+	option device 'br-lan'
+	option vlan '20'
+	list ports 'wan:t'
+	list ports 'lan3:t'
+config bridge-vlan 'aeolus_vlan30'
+	option device 'br-lan'
+	option vlan '30'
+	list ports 'wan:t'
+	list ports 'lan2:u*'
+config device 'aeolus_port_lan3'
+	option name 'lan3'
+	option enabled '0'
+package aeolus
+config agent 'agent'
+	option uplink 'wan'
+config watch 'aeolus_watch10'
+	option vlan '10'
+	option device 'wan'
+	option tagged '1'
+config watch 'aeolus_watch20'
+	option vlan '20'
+	option device 'wan'
+	option tagged '1'
+config watch 'aeolus_watch30'
+	option vlan '30'
+	option device 'wan'
+	option tagged '1'
+`
+	// lan9 is not on this AP, so it is not judged.
+	if got := check(doc, good); got != "" {
+		t.Fatalf("problems with the right config: %s", got)
+	}
+	for _, c := range []struct{ name, old, new, want string }{
+		{"off", "option enabled '0'", "option enabled '1'", "ports.lan3: the port is on, want off"},
+		{"untagged", "list ports 'lan2:u*'", "list ports 'lan2:t'", "ports.lan2: VLAN 30 is tagged, want untagged"},
+		{"missing", "list ports 'wan:t'\n\tlist ports 'lan3:t'\nconfig bridge-vlan 'vlan20'", "list ports 'wan:t'\nconfig bridge-vlan 'vlan20'", "ports.lan3: VLAN 10 is not on the port, want tagged"},
+		{"left over", "list ports 'lan1:u*'", "list ports 'lan1:u*'\n\tlist ports 'lan2:u*'", "ports.lan2: VLAN 1 is untagged, want not on the port"},
+		{"uplink", "list ports 'wan:t'\n\tlist ports 'lan2:u*'", "list ports 'lan2:u*'", "ports.lan2: the uplink wan does not carry VLAN 30 tagged"},
+		{"no bridge", "option type 'bridge'", "option type '8021q'", `ports: the uplink "wan" is in no bridge`},
+	} {
+		if !strings.Contains(good, c.old) {
+			t.Fatalf("%s: fixture lacks %q", c.name, c.old)
+		}
+		if got := check(doc, strings.Replace(good, c.old, c.new, 1)); !strings.Contains(got, c.want) {
+			t.Errorf("%s: want %q in:\n%s", c.name, c.want, got)
+		}
+	}
+	// The uplink is the AP's management.
+	var uplink map[string]any
+	if err := json.Unmarshal([]byte(`{"ports": {"wan": {"enabled": false}}}`), &uplink); err != nil {
+		t.Fatal(err)
+	}
+	if got := check(uplink, good); !strings.Contains(got, "ports.wan: the uplink carries the AP's management") {
+		t.Fatalf("the uplink: %s", got)
+	}
+}
+
+func TestTunnelFallbackAndIPv6(t *testing.T) {
+	var doc map[string]any
+	if err := json.Unmarshal([]byte(`{"network": {"sweet": {"transport": {
+		"primary": {"type": "vlan", "vlan": 20},
+		"fallback": {"type": "vxlan", "concentrator": "dc", "vni": 5000}}}},
+		"concentrators": {"dc": {"address": "[2001:db8::2]", "port": 4789, "mtu": 1500}}}`), &doc); err != nil {
+		t.Fatal(err)
+	}
+	check := func(text string) string {
+		t.Helper()
+		c, err := uci.Parse(text)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return strings.Join(Check(doc, c), "\n")
+	}
+	// A network with a fallback has a bridge of its own, which neither
+	// transport is configured in (0061): a veth pair for the VLAN primary,
+	// and the fallback's tunnel, stopped, with no bridge of its own.
+	const good = `package wireless
+package network
+config device
+	option name 'br-lan'
+	option type 'bridge'
+	option mtu '9000'
+	list ports 'wan'
+	list ports 'avp5584392f'
+config interface 'lan'
+	option proto 'dhcp'
+	option device 'br-lan.1'
+config bridge-vlan 'vlan20'
+	option device 'br-lan'
+	option vlan '20'
+	list ports 'wan:t'
+	list ports 'avp5584392f:u*'
+config device 'aeolus_n5584392f_p'
+	option type 'veth'
+	option name 'avp5584392f'
+	option peer_name 'anp5584392f'
+config interface 'aeolus_5000'
+	option proto 'vxlan6'
+	option peer6addr '2001:db8::2'
+	option vid '5000'
+	option mtu '1500'
+	option tunlink 'lan'
+	option auto '0'
+config device 'aeolus_n5584392f'
+	option type 'bridge'
+	option name 'br-n5584392f'
+	option bridge_empty '1'
+config interface 'aeolus_sweet'
+	option proto 'none'
+	option device 'br-n5584392f'
+package firewall
+config rule 'aeolus_vxlan_5000'
+	option src 'lan'
+	option proto 'udp'
+	option src_ip '2001:db8::2'
+	option dest_port '4789'
+	option target 'ACCEPT'
+package aeolus
+config agent 'agent'
+	option uplink 'wan'
+config watch 'aeolus_watch20'
+	option vlan '20'
+	option device 'wan'
+	option tagged '1'
+config probe 'aeolus_5000'
+	option vni '5000'
+	option interval '30'
+config probe 'aeolus_vlan20'
+	option vlan '20'
+	option device 'wan'
+	option tagged '1'
+	option interval '30'
+config switch 'aeolus_n5584392f'
+	option network 'sweet'
+	option bridge 'br-n5584392f'
+	option mode 'report'
+	option primary 'anp5584392f'
+	option primary_vlan '20'
+	option fallback 'aeolus_5000'
+	option fallback_vni '5000'
+`
+	// MTU 1500 needs no clamp, and an unset port is vxlan's default. The
+	// jumbo bridge carries the tunnel's 1570-byte packets.
+	if got := check(good); got != "" {
+		t.Fatalf("problems with the right config: %s", got)
+	}
+	// Without it, the uplink is Linux's 1500 (0056).
+	if got := check(strings.Replace(good, "\toption mtu '9000'\n", "", 1)); !strings.Contains(got,
+		"network.sweet.transport.fallback: an MTU of 1500 needs 1570 on the AP's uplink, lan (br-lan.1), which carries 1500") {
+		t.Fatalf("a 1500 uplink: %s", got)
+	}
+	// The interface's own MTU counts first.
+	if got := check(strings.Replace(good, "\toption device 'br-lan.1'\n", "\toption device 'br-lan.1'\n\toption mtu '1500'\n", 1)); !strings.Contains(got, "which carries 1500") {
+		t.Fatalf("the interface's MTU: %s", got)
+	}
+	if got := check(strings.Replace(good, "\toption auto '0'\n", "", 1)); !strings.Contains(got, "the fallback's tunnel is started; without HA mode, it waits") {
+		t.Fatalf("a started fallback: %s", got)
+	}
+	if got := check(strings.Replace(good, "\toption mode 'report'\n", "\toption mode 'report'\n\toption holddown '60'\n", 1)); !strings.Contains(got,
+		`aeolus.aeolus_n5584392f: holddown is "60", but the network does not switch (report mode)`) {
+		t.Fatalf("a hold-down in report mode: %s", got)
+	}
+
+	// Automatic switching (0061): the plan says how, and in HA mode the
+	// fallback's tunnel is started.
+	checkAuto := func(ha bool, text string) string {
+		t.Helper()
+		var d map[string]any
+		raw, _ := json.Marshal(doc)
+		if err := json.Unmarshal(raw, &d); err != nil {
+			t.Fatal(err)
+		}
+		tr := d["network"].(map[string]any)["sweet"].(map[string]any)["transport"].(map[string]any)
+		tr["switching"], tr["ha"], tr["holddown"] = "automatic", ha, 60.0
+		c, err := uci.Parse(text)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return strings.Join(Check(d, c), "\n")
+	}
+	automatic := strings.Replace(good, "\toption mode 'report'\n",
+		"\toption mode 'automatic'\n\toption ha '0'\n\toption failback 'revertive'\n\toption holddown '60'\n", 1)
+	if got := checkAuto(false, automatic); got != "" {
+		t.Fatalf("automatic switching: %s", got)
+	}
+	if got := checkAuto(false, good); !strings.Contains(got, `aeolus.aeolus_n5584392f: mode is "report", want "automatic"`) {
+		t.Fatalf("automatic switching, planned as report: %s", got)
+	}
+	withHA := strings.Replace(automatic, "\toption ha '0'\n", "\toption ha '1'\n", 1)
+	if got := checkAuto(true, strings.Replace(withHA, "\toption auto '0'\n", "", 1)); got != "" {
+		t.Fatalf("HA mode: %s", got)
+	}
+	if got := checkAuto(true, withHA); !strings.Contains(got, "network.aeolus_5000: the tunnel is not started") {
+		t.Fatalf("HA mode with the fallback stopped: %s", got)
+	}
+}
+
+// A tunnel can start from a VLAN of the uplink (0063): from an interface of
+// Aeolus's own there, with an address by DHCP, routes in a table of their
+// own and no DNS servers taken, in a zone that rejects what comes in, which
+// is where the tunnel's rule lets it in from.
+func TestTunnelStartsFromAVLAN(t *testing.T) {
+	var doc map[string]any
+	parse := func(underlay int) {
+		t.Helper()
+		if err := json.Unmarshal([]byte(fmt.Sprintf(`{"network": {"sweet": {"transport": {
+			"primary": {"type": "vxlan", "concentrator": "arista", "vni": 50}}}},
+			"concentrators": {"arista": {"address": "1.1.1.2", "port": 4789, "mtu": 1500, "underlay_vlan": %d}}}`, underlay)), &doc); err != nil {
+			t.Fatal(err)
+		}
+	}
+	parse(20)
+	check := func(text string) string {
+		t.Helper()
+		c, err := uci.Parse(text)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return strings.Join(Check(doc, c), "\n")
+	}
+	const good = `package wireless
+package network
+config device
+	option name 'br-lan'
+	option type 'bridge'
+	option mtu '9000'
+config interface 'lan'
+	option proto 'dhcp'
+	option device 'br-lan.1'
+config bridge-vlan 'vlan20'
+	option device 'br-lan'
+	option vlan '20'
+config interface 'aeolus_vlan20_tunnels'
+	option proto 'dhcp'
+	option device 'br-lan.20'
+	option ip4table '1020'
+	option peerdns '0'
+config interface 'aeolus_50'
+	option proto 'vxlan'
+	option peeraddr '1.1.1.2'
+	option vid '50'
+	option mtu '1500'
+	option tunlink 'aeolus_vlan20_tunnels'
+config device 'aeolus_50_br'
+	option type 'bridge'
+	option name 'br-vx50'
+	list ports 'aeolus_50'
+config interface 'aeolus_sweet'
+	option proto 'none'
+	option device 'br-vx50'
+package firewall
+config zone 'aeolus_zone_ul'
+	option name 'aeolus_ul'
+	option input 'REJECT'
+	option output 'ACCEPT'
+	option forward 'REJECT'
+	list network 'aeolus_vlan20_tunnels'
+config rule 'aeolus_vxlan_50'
+	option src 'aeolus_ul'
+	option proto 'udp'
+	option src_ip '1.1.1.2'
+	option dest_port '4789'
+	option target 'ACCEPT'
+package aeolus
+config probe 'aeolus_50'
+	option vni '50'
+	option interval '30'
+`
+	if got := check(good); got != "" {
+		t.Fatalf("problems with the right config: %s", got)
+	}
+	for _, c := range []struct{ name, old, new, want string }{
+		{"from management", "option tunlink 'aeolus_vlan20_tunnels'", "option tunlink 'lan'",
+			`network.aeolus_50: tunlink is "lan", want aeolus_vlan20_tunnels, as the tunnel starts from VLAN 20 (0063)`},
+		{"no interface", "config interface 'aeolus_vlan20_tunnels'", "config interface 'other'", "network.aeolus_vlan20_tunnels: no interface for the tunnels that start from VLAN 20"},
+		{"another VLAN", "option device 'br-lan.20'", "option device 'br-lan.30'", `device is "br-lan.30", want VLAN 20 on the uplink's bridge`},
+		{"not carried", "option vlan '20'", "option vlan '21'", "VLAN 20 is not in the network config"},
+		{"static", "option proto 'dhcp'\n\toption device 'br-lan.20'", "option proto 'static'\n\toption device 'br-lan.20'", `proto is "static", want "dhcp"`},
+		{"main table", "\toption ip4table '1020'\n", "", `network.aeolus_vlan20_tunnels: ip4table is missing, want "1020"`},
+		{"its DNS", "\toption peerdns '0'\n", "", `network.aeolus_vlan20_tunnels: peerdns is missing, want "0"`},
+		{"no zone", "list network 'aeolus_vlan20_tunnels'", "list network 'lan'", "firewall: want aeolus_vlan20_tunnels in the zone aeolus_ul"},
+		{"open zone", "option input 'REJECT'", "option input 'ACCEPT'", `firewall.aeolus_zone_ul: input is "ACCEPT", want "REJECT"`},
+		{"let in elsewhere", "option src 'aeolus_ul'", "option src 'lan'", `firewall.aeolus_vxlan_50: src is "lan", want "aeolus_ul"`},
+	} {
+		if !strings.Contains(good, c.old) {
+			t.Fatalf("%s: fixture lacks %q", c.name, c.old)
+		}
+		if got := check(strings.Replace(good, c.old, c.new, 1)); !strings.Contains(got, c.want) {
+			t.Errorf("%s: want %q in:\n%s", c.name, c.want, got)
+		}
+	}
+	// 0 is the management VLAN, as unset is.
+	parse(0)
+	if got := check(good); !strings.Contains(got, "network.aeolus_50: the tunnel starts from aeolus_vlan20_tunnels, want the management interface (0063)") {
+		t.Fatalf("the management VLAN: %s", got)
+	}
+	if got := check(strings.Replace(good, "option tunlink 'aeolus_vlan20_tunnels'", "option tunlink 'lan'", 1)); strings.Contains(got, "tunlink") || strings.Contains(got, "starts from") {
+		t.Fatalf("from management, as it should: %s", got)
+	}
+	// The VLAN the AP is managed on is its management interface's (0084):
+	// here lan, on VLAN 1 of the uplink's bridge.
+	parse(1)
+	managed := strings.Replace(good, "option tunlink 'aeolus_vlan20_tunnels'", "option tunlink 'lan'", 1)
+	managed = strings.Replace(managed, "option src 'aeolus_ul'", "option src 'lan'", 1)
+	managed = strings.Replace(managed, "\toption mtu '9000'\n", "\toption mtu '9000'\n\tlist ports 'wan'\n", 1)
+	managed += "config agent 'agent'\n\toption uplink 'wan'\n"
+	if got := check(managed); strings.Contains(got, "aeolus_50:") || strings.Contains(got, "aeolus_vxlan_50") {
+		t.Fatalf("from the VLAN it is managed on: %s", got)
+	}
+	// Off the uplink's bridge, lan is on no VLAN of the uplink: VLAN 1 is
+	// any other, and wants Aeolus's own interface.
+	if got := check(strings.Replace(managed, "\tlist ports 'wan'\n", "", 1)); !strings.Contains(got, `tunlink is "lan", want aeolus_vlan1_tunnels`) {
+		t.Fatalf("lan off the uplink's bridge: %s", got)
+	}
+}
+
+// A network with a fallback has a bridge of its own, br-n and its hash,
+// which its Wi-Fi joins and neither transport is configured in: the prober
+// attaches the one that carries it (0061). A VLAN transport reaches it
+// through a veth pair whose VLAN end is in the uplink's bridge, untagged in
+// the VLAN, and is probed on the uplink from the VLAN's MAC; a VXLAN
+// transport is its tunnel, with no bridge of its own. The prober's plan says
+// which is which.
+func TestNetworkWithAFallback(t *testing.T) {
+	var doc map[string]any
+	if err := json.Unmarshal([]byte(`{"network": {"lab": {"transport": {
+		"primary": {"type": "vxlan", "concentrator": "arista", "vni": 50},
+		"fallback": {"type": "vlan", "vlan": 20, "probe": "192.168.20.1"}}}},
+		"concentrators": {"arista": {"address": "1.1.1.2", "port": 4789, "mtu": 1450}}}`), &doc); err != nil {
+		t.Fatal(err)
+	}
+	check := func(text string) string {
+		t.Helper()
+		c, err := uci.Parse(text)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return strings.Join(CheckAP(doc, c, "ap-a0046082275e"), "\n")
+	}
+	if h := NetHash("lab"); h != "626092f4" {
+		t.Fatalf("NetHash(lab) = %s", h)
+	}
+	const good = `package wireless
+package network
+config device
+	option name 'br-lan'
+	option type 'bridge'
+	list ports 'wan'
+	list ports 'avf626092f4'
+config interface 'lan'
+	option proto 'dhcp'
+	option device 'br-lan.1'
+config bridge-vlan 'vlan20'
+	option device 'br-lan'
+	option vlan '20'
+	list ports 'wan:t'
+	list ports 'avf626092f4:u*'
+config interface 'aeolus_50'
+	option proto 'vxlan'
+	option peeraddr '1.1.1.2'
+	option port '4789'
+	option vid '50'
+	option mtu '1450'
+	option tunlink 'lan'
+config device 'aeolus_n626092f4_f'
+	option type 'veth'
+	option name 'avf626092f4'
+	option peer_name 'anf626092f4'
+config device 'aeolus_n626092f4'
+	option type 'bridge'
+	option name 'br-n626092f4'
+	option bridge_empty '1'
+	option macaddr '02:82:27:5e:00:50'
+config interface 'aeolus_lab'
+	option proto 'none'
+	option device 'br-n626092f4'
+package firewall
+config zone
+	option name 'lan'
+	list network 'lan'
+config rule 'aeolus_vxlan_50'
+	option src 'lan'
+	option proto 'udp'
+	option src_ip '1.1.1.2'
+	option dest_port '4789'
+	option target 'ACCEPT'
+config include 'aeolus_clamp'
+	option type 'nftables'
+	option path '/etc/aeolus/clamp.nft'
+package aeolus
+config agent 'agent'
+	option uplink 'wan'
+config probe 'aeolus_50'
+	option vni '50'
+	option interval '30'
+	option mac '02:82:27:5e:00:50'
+config probe 'aeolus_vlan20'
+	option vlan '20'
+	option device 'wan'
+	option tagged '1'
+	option interval '30'
+	list address '192.168.20.1'
+	option mac '06:82:27:5e:00:20'
+config switch 'aeolus_n626092f4'
+	option network 'lab'
+	option bridge 'br-n626092f4'
+	option mode 'report'
+	option primary 'aeolus_50'
+	option primary_vni '50'
+	option fallback 'anf626092f4'
+	option fallback_vlan '20'
+config watch 'aeolus_watch20'
+	option vlan '20'
+	option device 'wan'
+	option tagged '1'
+	option mac '06:82:27:5e:00:20'
+`
+	if got := check(good); got != "" {
+		t.Fatalf("problems with the right config: %s", got)
+	}
+	for _, c := range []struct{ name, old, new, want string }{
+		{"not on its bridge", "option device 'br-n626092f4'", "option device 'br-lan.20'", `network.lab: interface aeolus_lab is on "br-lan.20", want the network's own bridge br-n626092f4 (0061)`},
+		{"no bridge", "config device 'aeolus_n626092f4'\n", "config device 'other_bridge'\n", "network.aeolus_n626092f4: want a bridge br-n626092f4 of the network's own, as it has a fallback (0061)"},
+		{"transport configured", "\toption bridge_empty '1'\n", "\toption bridge_empty '1'\n\tlist ports 'aeolus_50'\n", "network.aeolus_n626092f4: the bridge has [aeolus_50] configured"},
+		{"bridge MAC", "option macaddr '02:82:27:5e:00:50'", "option macaddr '06:82:27:5e:00:20'", `network.aeolus_n626092f4: macaddr is "06:82:27:5e:00:20", want "02:82:27:5e:00:50"`},
+		{"no veth", "config device 'aeolus_n626092f4_f'", "config device 'other_veth'", "network.aeolus_n626092f4_f: want a veth pair, avf626092f4 and anf626092f4, for VLAN 20 (0061)"},
+		{"veth ends", "option peer_name 'anf626092f4'", "option peer_name 'anp626092f4'", "want a veth pair, avf626092f4 and anf626092f4"},
+		{"veth off the uplink", "\tlist ports 'avf626092f4'\n", "", "network.lab.transport.fallback: the veth's VLAN end avf626092f4 is not in the uplink's bridge"},
+		{"veth tagged", "list ports 'avf626092f4:u*'", "list ports 'avf626092f4:t'", "network.lab.transport.fallback: the veth's VLAN end avf626092f4 is not untagged in VLAN 20"},
+		{"no plan", "config switch 'aeolus_n626092f4'", "config switch 'other_plan'", "aeolus.aeolus_n626092f4: no plan for the prober, which attaches the transport that carries network lab (0061)"},
+		{"plan primary", "option primary 'aeolus_50'", "option primary 'anf626092f4'", `aeolus.aeolus_n626092f4: primary is "anf626092f4", want "aeolus_50"`},
+		{"plan fallback", "option fallback_vlan '20'", "option fallback_vlan '21'", `aeolus.aeolus_n626092f4: fallback_vlan is "21", want "20"`},
+		{"plan mode", "option mode 'report'", "option mode 'automatic'", `aeolus.aeolus_n626092f4: mode is "automatic", want "report"`},
+		{"no VLAN probe", "config probe 'aeolus_vlan20'", "config probe 'other_probe'", "aeolus.aeolus_vlan20: no probe for VLAN 20, which a network with a fallback, or one that goes off the air when lost, uses (0061, 0201)"},
+		{"no watch", "config watch 'aeolus_watch20'", "config watch 'other_watch'", "aeolus.aeolus_watch20: no watch for VLAN 20, which the AP carries on its uplink for the intent; the prober tells from it whether the VLAN reaches the AP (0064)"},
+		{"watch untagged", "option tagged '1'\n\toption mac '06:82:27:5e:00:20'", "option tagged '0'\n\toption mac '06:82:27:5e:00:20'", `aeolus.aeolus_watch20: tagged is "0", want "1"`},
+		{"watch MAC", "option tagged '1'\n\toption mac '06:82:27:5e:00:20'", "option tagged '1'\n\toption mac '06:82:27:5e:00:21'", `aeolus.aeolus_watch20: mac is "06:82:27:5e:00:21", want "06:82:27:5e:00:20"`},
+		{"stale watch", "config watch 'aeolus_watch20'", "config watch 'aeolus_watch21'\n\toption vlan '21'\nconfig watch 'aeolus_watch20'", "aeolus.aeolus_watch21: no tunnel, tunnel port, network with a fallback or VLAN on the uplink calls for it"},
+		{"VLAN probe untagged", "option tagged '1'", "option tagged '0'", `aeolus.aeolus_vlan20: tagged is "0", want "1"`},
+		{"VLAN probe address", "list address '192.168.20.1'", "list address '192.168.20.2'", "aeolus.aeolus_vlan20: probe addresses are [192.168.20.2], want [192.168.20.1]"},
+		{"VLAN probe MAC", "option mac '06:82:27:5e:00:20'", "option mac '02:82:27:5e:00:20'", `aeolus.aeolus_vlan20: mac is "02:82:27:5e:00:20", want "06:82:27:5e:00:20"`},
+		{"stale plan", "config switch 'aeolus_n626092f4'", "config switch 'aeolus_nffffffff'\n\toption network 'gone'\n\nconfig switch 'aeolus_n626092f4'", "aeolus.aeolus_nffffffff: no tunnel, tunnel port, network with a fallback or VLAN on the uplink calls for it"},
+	} {
+		if !strings.Contains(good, c.old) {
+			t.Fatalf("%s: fixture lacks %q", c.name, c.old)
+		}
+		if got := check(strings.Replace(good, c.old, c.new, 1)); !strings.Contains(got, c.want) {
+			t.Errorf("%s: want %q in:\n%s", c.name, c.want, got)
+		}
+	}
+}
+
+// A tunnel port is out of the uplink's bridge, and carries its VNIs on their
+// tunnels' bridges: the port for the untagged one, an 802.1Q device of it
+// for each tagged one (0058).
+func TestTunnelPort(t *testing.T) {
+	var doc map[string]any
+	if err := json.Unmarshal([]byte(`{"ports": {"lan3": {"mode": "tunnel", "vxlan": {
+		"untagged": {"tunnel": "arista", "vni": 50, "probe": "192.168.50.1"}, "10": {"tunnel": "arista", "vni": 10}}}},
+		"concentrators": {"arista": {"address": "1.1.1.2", "port": 4789, "mtu": 1500}}}`), &doc); err != nil {
+		t.Fatal(err)
+	}
+	check := func(text string) string {
+		t.Helper()
+		c, err := uci.Parse(text)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return strings.Join(Check(doc, c), "\n")
+	}
+	const good = `package network
+config device
+	option name 'br-lan'
+	option type 'bridge'
+	option mtu '9000'
+	list ports 'lan1'
+	list ports 'wan'
+config bridge-vlan 'vlan1'
+	option device 'br-lan'
+	option vlan '1'
+	list ports 'wan:u*'
+	list ports 'lan1:u*'
+config interface 'lan'
+	option proto 'dhcp'
+	option device 'br-lan.1'
+config interface 'aeolus_50'
+	option proto 'vxlan'
+	option peeraddr '1.1.1.2'
+	option port '4789'
+	option vid '50'
+	option mtu '1500'
+	option tunlink 'lan'
+config device 'aeolus_50_br'
+	option type 'bridge'
+	option name 'br-vx50'
+	list ports 'aeolus_50'
+	list ports 'lan3'
+config interface 'aeolus_50_ports'
+	option proto 'none'
+	option device 'br-vx50'
+config interface 'aeolus_10'
+	option proto 'vxlan'
+	option peeraddr '1.1.1.2'
+	option port '4789'
+	option vid '10'
+	option mtu '1500'
+	option tunlink 'lan'
+config device 'aeolus_10_br'
+	option type 'bridge'
+	option name 'br-vx10'
+	list ports 'aeolus_10'
+	list ports 'lan3.10'
+config interface 'aeolus_10_ports'
+	option proto 'none'
+	option device 'br-vx10'
+config device 'aeolus_port_lan3_10'
+	option type '8021q'
+	option ifname 'lan3'
+	option vid '10'
+	option name 'lan3.10'
+package firewall
+config rule 'aeolus_vxlan_50'
+	option src 'lan'
+	option proto 'udp'
+	option src_ip '1.1.1.2'
+	option dest_port '4789'
+	option target 'ACCEPT'
+config rule 'aeolus_vxlan_10'
+	option src 'lan'
+	option proto 'udp'
+	option src_ip '1.1.1.2'
+	option dest_port '4789'
+	option target 'ACCEPT'
+package aeolus
+config agent 'agent'
+	option uplink 'wan'
+config probe 'aeolus_50'
+	option vni '50'
+	option interval '30'
+	list address '192.168.50.1'
+config probe 'aeolus_10'
+	option vni '10'
+	option interval '30'
+config guard 'aeolus_guard_lan3'
+	option port 'lan3'
+	list device 'lan3'
+	list device 'lan3.10'
+`
+	if got := check(good); got != "" {
+		t.Fatalf("problems with the right config: %s", got)
+	}
+	for _, c := range []struct{ name, old, new, want string }{
+		// The loop guard sends on the port and on its 802.1Q devices (0059).
+		{"no guard", "config guard 'aeolus_guard_lan3'", "config guard 'other'", "aeolus.aeolus_guard_lan3: no loop guard for lan3, which is on a tunnel"},
+		{"guard devices", "\tlist device 'lan3.10'\n", "", "aeolus.aeolus_guard_lan3: guards [lan3], want [lan3 lan3.10]"},
+		{"port probe", "list address '192.168.50.1'", "list address '192.168.50.9'", "aeolus.aeolus_50: probe addresses are [192.168.50.9], want [192.168.50.1]"},
+		{"still in br-lan", "list ports 'lan1'\n", "list ports 'lan1'\n\tlist ports 'lan3'\n", "ports.lan3: the port is still in the uplink's bridge br-lan"},
+		{"still on a VLAN", "list ports 'lan1:u*'", "list ports 'lan1:u*'\n\tlist ports 'lan3:u*'", "ports.lan3: VLAN 1 of the uplink's bridge still has the port"},
+		{"untagged not bridged", "list ports 'lan3'\n", "", "ports.lan3.vxlan.untagged: lan3 is not in the tunnel's bridge br-vx50"},
+		{"tagged not bridged", "list ports 'lan3.10'\n", "", "ports.lan3.vxlan.10: lan3.10 is not in the tunnel's bridge br-vx10"},
+		{"wrong VLAN device", "option vid '10'\n\toption name 'lan3.10'", "option vid '11'\n\toption name 'lan3.10'", "network.aeolus_port_lan3_10: want an 802.1Q device lan3.10, VLAN 10 on lan3"},
+		// netifd makes a bridge only for an interface on it, so a VNI only
+		// ports carry needs one of its own, with no address.
+		{"bridge not held", "config interface 'aeolus_10_ports'\n\toption proto 'none'\n\toption device 'br-vx10'\n", "",
+			"ports.lan3.vxlan.10: no interface is on the tunnel's bridge br-vx10, so netifd never makes it and lan3.10 is on nothing"},
+		{"bridge held with an address", "config interface 'aeolus_50_ports'\n\toption proto 'none'", "config interface 'aeolus_50_ports'\n\toption proto 'dhcp'",
+			"ports.lan3.vxlan.untagged: no interface is on the tunnel's bridge br-vx50"},
+		{"tunnel not started", "option vid '10'\n\toption mtu '1500'\n\toption tunlink 'lan'", "option vid '10'\n\toption mtu '1500'\n\toption tunlink 'lan'\n\toption auto '0'", "the tunnel is not started"},
+	} {
+		if !strings.Contains(good, c.old) {
+			t.Fatalf("%s: fixture lacks %q", c.name, c.old)
+		}
+		if got := check(strings.Replace(good, c.old, c.new, 1)); !strings.Contains(got, c.want) {
+			t.Errorf("%s: want %q in:\n%s", c.name, c.want, got)
+		}
+	}
+	// Back in access mode, the port must be in the uplink's bridge again.
+	doc["ports"] = map[string]any{"lan3": map[string]any{"mode": "access", "untagged": float64(1)}}
+	if got := check(good); !strings.Contains(got, "ports.lan3: the port is not in the uplink's bridge br-lan") {
+		t.Fatalf("access, still on the tunnel: %s", got)
+	}
+}
+
+// The MAC an AP uses on a segment says which AP and which segment (0060).
+func TestSegmentMAC(t *testing.T) {
+	for _, c := range []struct {
+		ap, kind string
+		n        int
+		want     string
+	}{
+		{"ap-a0046082275e", "vni", 50, "02:82:27:5e:00:50"},
+		{"ap-a0046082275e", "vni", 1234, "02:82:27:5e:12:34"},
+		{"ap-a0046082275e", "vni", 9999, "02:82:27:5e:99:99"},
+		{"ap-a0046082275e", "vni", 10000, "0a:82:27:5e:27:10"},
+		{"ap-a0046082275e", "vni", 70000, "0a:82:27:5e:11:70"},
+		{"ap-a0046082275e", "vlan", 20, "06:82:27:5e:00:20"},
+		{"ap-a0046082275e", "vlan", 4094, "06:82:27:5e:40:94"},
+		{"office-ap", "vni", 50, ""},
+		{"ap-A0046082275E", "vni", 50, ""},
+	} {
+		if got := SegmentMAC(c.ap, c.kind, c.n); got != c.want {
+			t.Errorf("SegmentMAC(%q, %s, %d) = %q, want %q", c.ap, c.kind, c.n, got, c.want)
+		}
+	}
+}
+
+// Checked for an AP, a tunnel's bridge and its probe take the AP's MAC for
+// the segment (0060).
+func TestTheTunnelsMACIsTheAPs(t *testing.T) {
+	var doc map[string]any
+	if err := json.Unmarshal([]byte(intent), &doc); err != nil {
+		t.Fatal(err)
+	}
+	check := func(text string) string {
+		t.Helper()
+		c, err := uci.Parse(text)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return strings.Join(CheckAP(doc, c, "ap-a0046082275e"), "\n")
+	}
+	got := check(rendered)
+	for _, want := range []string{
+		"network.aeolus_20_br: macaddr is missing, want \"02:82:27:5e:00:20\"",
+		"aeolus.aeolus_20: mac is missing, want \"02:82:27:5e:00:20\"",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("want %q in:\n%s", want, got)
+		}
+	}
+	good := strings.Replace(strings.Replace(rendered,
+		"option name 'br-vx20'", "option name 'br-vx20'\n\toption macaddr '02:82:27:5e:00:20'", 1),
+		"option interval '20'", "option interval '20'\n\toption mac '02:82:27:5e:00:20'", 1)
+	if got := check(good); got != "" {
+		t.Fatalf("problems with the AP's MACs: %s", got)
+	}
+	if got := check(strings.Replace(good, "macaddr '02:82:27:5e:00:20'", "macaddr '02:82:27:5e:00:21'", 1)); !strings.Contains(got, "macaddr is \"02:82:27:5e:00:21\"") {
+		t.Fatalf("another MAC: %s", got)
+	}
+}
+
+func TestAWrongKeyIsNeverQuoted(t *testing.T) {
+	got := strings.Join(check(t, strings.Replace(rendered, "option key '"+pass+"'", "option key 'wrong-passphrase-1'", 1)), "\n")
+	if !strings.Contains(got, "key does not match the passphrase") {
+		t.Fatalf("problems: %s", got)
+	}
+	if strings.Contains(got, pass) || strings.Contains(got, "wrong-passphrase-1") {
+		t.Fatalf("a problem quotes a key: %s", got)
+	}
+}
+
+// A 5 GHz width must fit the channel, even one Aeolus did not set.
+func TestWidthMustFitTheChannel(t *testing.T) {
+	c, err := uci.Parse(`package wireless
+config wifi-device 'a'
+	option band '5g'
+	option noscan '1'
+	option channel '149'
+	option htmode 'VHT160'
+config wifi-device 'b'
+	option band '5g'
+	option noscan '1'
+	option channel '36'
+	option htmode 'HE160'
+config wifi-device 'c'
+	option band '5g'
+	option noscan '1'
+	option channel '165'
+	option htmode 'VHT160'
+config wifi-device 'd'
+	option band '5g'
+	option noscan '1'
+	option channel 'auto'
+	option htmode 'VHT160'
+config wifi-device 'e'
+	option band '2g'
+	option channel '13'
+	option htmode 'HT40'
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := strings.Join(Check(map[string]any{}, c), "\n")
+	for _, want := range []string{
+		"wireless.a: channel 149 cannot use a 160 MHz width; that needs a channel from 36–64 or 100–128",
+		"wireless.c: channel 165 cannot use a 160 MHz width",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing %q in: %s", want, got)
+		}
+	}
+	for _, ok := range []string{"wireless.b:", "wireless.d:", "wireless.e:"} {
+		if strings.Contains(got, ok) {
+			t.Errorf("%s should pass: %s", ok, got)
+		}
+	}
+}
+
+func TestPowerAutoMeansNoTxpower(t *testing.T) {
+	var doc map[string]any
+	if err := json.Unmarshal([]byte(`{"radio": {"5g": {"power": "auto"}}}`), &doc); err != nil {
+		t.Fatal(err)
+	}
+	c, err := uci.Parse("package wireless\nconfig wifi-device 'radio1'\n\toption band '5g'\n\toption noscan '1'\n\toption txpower '20'\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(Check(doc, c), "\n"); !strings.Contains(got, "want none for auto") {
+		t.Fatalf("problems: %s", got)
+	}
+}
+
+func TestAutomaticChannelLists(t *testing.T) {
+	var doc map[string]any
+	if err := json.Unmarshal([]byte(`{"radio": {"2g": {"channel": "auto"}, "5g": {"channel": "auto"}}}`), &doc); err != nil {
+		t.Fatal(err)
+	}
+	check := func(text string) string {
+		t.Helper()
+		c, err := uci.Parse(text)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return strings.Join(Check(doc, c), "\n")
+	}
+	// 2.4 GHz picks from 1, 6 and 11; 5 GHz from 36–161: channel
+	// compatibility keeps it off 165–177 (0232).
+	five := "config wifi-device 'radio0'\n\toption band '5g'\n\toption noscan '1'\n\toption channel 'auto'\n"
+	ok := "package wireless\nconfig wifi-device 'radio1'\n\toption band '2g'\n\toption channel 'auto'\n\tlist channels '1'\n\tlist channels '6'\n\tlist channels '11'\n" +
+		five + "\tlist channels '36'\n\tlist channels '40'\n\tlist channels '44'\n\tlist channels '48'\n\tlist channels '52'\n\tlist channels '56'\n\tlist channels '60'\n\tlist channels '64'\n\tlist channels '100'\n\tlist channels '104'\n\tlist channels '108'\n\tlist channels '112'\n\tlist channels '116'\n\tlist channels '120'\n\tlist channels '124'\n\tlist channels '128'\n\tlist channels '132'\n\tlist channels '136'\n\tlist channels '140'\n\tlist channels '144'\n\tlist channels '149'\n\tlist channels '153'\n\tlist channels '157'\n\tlist channels '161'\n"
+	if got := check(ok); strings.Contains(got, "channels") {
+		t.Fatalf("problems: %s", got)
+	}
+	if got := check("package wireless\nconfig wifi-device 'radio1'\n\toption band '2g'\n\toption channel 'auto'\n"); !strings.Contains(got, `wireless.radio1: channels is [], want ["1" "6" "11"]`) {
+		t.Fatalf("2.4 GHz without the list: %s", got)
+	}
+	if got := check("package wireless\nconfig wifi-device 'radio0'\n\toption band '5g'\n\toption noscan '1'\n\toption channel 'auto'\n\tlist channels '36'\n"); !strings.Contains(got, `wireless.radio0: channels is ["36"], want ["36" "40"`) {
+		t.Fatalf("5 GHz with a stale list: %s", got)
+	}
+	if got := check("package wireless\n" + five); !strings.Contains(got, `wireless.radio0: channels is [], want ["36"`) || !strings.Contains(got, `"157" "161"]`) {
+		t.Fatalf("5 GHz without the list: %s", got)
+	}
+	// Compatibility off: every channel, the upper ones too.
+	doc["radio"].(map[string]any)["5g"].(map[string]any)["compatible"] = false
+	if got := check("package wireless\n" + five); !strings.Contains(got, `"165" "169" "173" "177"]`) {
+		t.Fatalf("compatibility off: %s", got)
+	}
+}
+
+// With DFS avoided, an automatic channel is picked outside DFS and a channel
+// the AP keeps must not be a DFS one; allowed, nothing holds the AP to
+// avoiding them (0071).
+func TestDFS(t *testing.T) {
+	checkDoc := func(raw, text string) string {
+		t.Helper()
+		var doc map[string]any
+		if err := json.Unmarshal([]byte(raw), &doc); err != nil {
+			t.Fatal(err)
+		}
+		c, err := uci.Parse("package wireless\n" + text)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return strings.Join(Check(doc, c), "\n")
+	}
+	check := func(dfs, text string) string {
+		t.Helper()
+		return checkDoc(`{"radio": {"5g": {"dfs": "`+dfs+`"}}}`, text)
+	}
+	avoid := check("avoid", `config wifi-device 'a'
+	option band '5g'
+	option noscan '1'
+	option channel 'auto'
+	option acs_exclude_dfs '1'
+config wifi-device 'b'
+	option band '5g'
+	option noscan '1'
+	option channel 'auto'
+	option acs_exclude_dfs '0'
+config wifi-device 'c'
+	option band '5g'
+	option noscan '1'
+	option channel '100'
+	option htmode 'VHT80'
+config wifi-device 'd'
+	option band '5g'
+	option noscan '1'
+	option channel '48'
+	option htmode 'HE80'
+	option acs_exclude_dfs '0'
+config wifi-device 'e'
+	option band '5g'
+	option noscan '1'
+	option channel '48'
+	option htmode 'HE160'
+config wifi-device 'f'
+	option band '5g'
+	option noscan '1'
+	option channel '36'
+	option acs_exclude_dfs '1'
+`)
+	for _, want := range []string{
+		`wireless.b: acs_exclude_dfs is "0", want it on for radio.5g.dfs avoid`,
+		"wireless.c: channel 100 at 80 MHz uses DFS channels, but radio.5g.dfs is avoid",
+		"wireless.e: channel 48 at 160 MHz uses DFS channels, but radio.5g.dfs is avoid",
+		`wireless.f: acs_exclude_dfs is "1", want it off for radio.5g.dfs avoid`,
+	} {
+		if !strings.Contains(avoid, want) {
+			t.Errorf("missing %q in: %s", want, avoid)
+		}
+	}
+	for _, ok := range []string{"wireless.a:", "wireless.d:"} {
+		if strings.Contains(avoid, ok) {
+			t.Errorf("%s should pass: %s", ok, avoid)
+		}
+	}
+	allow := check("allow", `config wifi-device 'a'
+	option band '5g'
+	option noscan '1'
+	option channel 'auto'
+	option acs_exclude_dfs '1'
+config wifi-device 'b'
+	option band '5g'
+	option noscan '1'
+	option channel '100'
+	option acs_exclude_dfs '0'
+`)
+	if !strings.Contains(allow, `wireless.a: acs_exclude_dfs is "1", want it off for radio.5g.dfs allow`) || strings.Contains(allow, "wireless.b:") {
+		t.Errorf("allow: %s", allow)
+	}
+	// Where the radio looks before it uses a DFS channel (0120), an
+	// automatic channel is picked outside them at its start, as with avoid;
+	// a channel set, DFS or not, is used as set. Allowed, or look-first, its
+	// name from before, it looks where radio resource management moves
+	// radios (0328); without RRM it picks, as allow does above.
+	look := checkDoc(`{"rrm": {"enabled": true}, "radio": {"5g": {"dfs": "look-first"}}}`, `config wifi-device 'a'
+	option band '5g'
+	option noscan '1'
+	option channel 'auto'
+	option acs_exclude_dfs '1'
+config wifi-device 'b'
+	option band '5g'
+	option noscan '1'
+	option channel 'auto'
+config wifi-device 'c'
+	option band '5g'
+	option noscan '1'
+	option channel '100'
+	option htmode 'VHT80'
+config wifi-device 'd'
+	option band '5g'
+	option noscan '1'
+	option channel '36'
+	option acs_exclude_dfs '1'
+`)
+	for _, want := range []string{
+		`wireless.b: acs_exclude_dfs is "", want it on for radio.5g.dfs look-first`,
+		`wireless.d: acs_exclude_dfs is "1", want it off for radio.5g.dfs look-first`,
+	} {
+		if !strings.Contains(look, want) {
+			t.Errorf("missing %q in: %s", want, look)
+		}
+	}
+	for _, ok := range []string{"wireless.a:", "wireless.c:"} {
+		if strings.Contains(look, ok) {
+			t.Errorf("%s should pass: %s", ok, look)
+		}
+	}
+	// Allowed, set or not, with RRM moving radios: it looks where it has a
+	// whole block outside DFS at its width among its channels, and picks
+	// where it has none: at 160 MHz, or with only DFS channels in its set.
+	radios := `config wifi-device 'a'
+	option band '5g'
+	option noscan '1'
+	option channel 'auto'
+	option htmode 'HE80'
+	option acs_exclude_dfs '1'
+config wifi-device 'b'
+	option band '5g'
+	option noscan '1'
+	option channel 'auto'
+	option htmode 'HE160'
+config wifi-device 'c'
+	option band '5g'
+	option noscan '1'
+	option channel 'auto'
+	option htmode 'HE40'
+	list channels '52'
+	list channels '100'
+config wifi-device 'd'
+	option band '5g'
+	option noscan '1'
+	option channel 'auto'
+	option htmode 'HE40'
+	option acs_exclude_dfs '1'
+	list channels '36'
+	list channels '100'
+`
+	for _, doc := range []string{`{"rrm": {"enabled": true}, "radio": {"5g": {"dfs": "allow"}}}`, `{"rrm": {"enabled": true}}`} {
+		got := checkDoc(doc, radios)
+		for _, ok := range []string{"wireless.a:", "wireless.b:", "wireless.c:", "wireless.d:"} {
+			if strings.Contains(got, ok) {
+				t.Errorf("%s: %s should pass: %s", doc, ok, got)
+			}
+		}
+	}
+	got := checkDoc(`{"rrm": {"enabled": true, "moves": false}}`, radios)
+	for _, want := range []string{
+		`wireless.a: acs_exclude_dfs is "1", want it off for radio.5g.dfs allow, which lets hostapd pick here (0328)`,
+		`wireless.d: acs_exclude_dfs is "1", want it off for radio.5g.dfs allow, which lets hostapd pick here (0328)`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("RRM moving no radio, missing %q in: %s", want, got)
+		}
+	}
+	got = checkDoc(`{"rrm": {"enabled": true}}`, strings.Replace(radios, "\toption htmode 'HE80'\n\toption acs_exclude_dfs '1'\n", "\toption htmode 'HE80'\n", 1))
+	if want := `wireless.a: acs_exclude_dfs is "", want it on for radio.5g.dfs allow, which looks first here (0328)`; !strings.Contains(got, want) {
+		t.Errorf("missing %q in: %s", want, got)
+	}
+}
+
+// Where the 5 GHz radio looks before it uses a DFS channel (0120, 0328),
+// the daemon's section lets it move the radio to one, unless it moves no
+// radio; nowhere else may it.
+func TestLookFirstTellsTheDaemon(t *testing.T) {
+	check := func(doc, text string) string {
+		t.Helper()
+		var d map[string]any
+		if err := json.Unmarshal([]byte(doc), &d); err != nil {
+			t.Fatal(err)
+		}
+		c, err := uci.Parse(text)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return strings.Join(CheckAP(d, c, "ap-a0046082275e"), "\n")
+	}
+	// The 5 GHz radio, automatic at 80 MHz, as rendered.
+	five := "package wireless\nconfig wifi-device 'radio0'\n\toption band '5g'\n\toption noscan '1'\n\toption channel 'auto'\n" +
+		"\toption htmode 'HE80'\n\toption acs_exclude_dfs '1'\n"
+	section := five + "package aeolus\nconfig rrm 'aeolus_rrm'\n\toption enabled '1'\n\toption ap 'ap-a0046082275e'\n" +
+		"\toption moves '1'\n\toption window '02:00-05:00'\n\toption margin '20'\n\toption apart '250'\n"
+	with := strings.Replace(section, "\toption moves '1'\n", "\toption moves '1'\n\toption dfs '1'\n", 1)
+	// Allowed, or look-first, its name from before, or unset, the default
+	// (0328): it looks.
+	for _, look := range []string{`{"rrm": {"enabled": true}, "radio": {"5g": {"dfs": "look-first"}}}`, `{"rrm": {"enabled": true}, "radio": {"5g": {"dfs": "allow"}}}`, `{"rrm": {"enabled": true}}`} {
+		if got := check(look, with); strings.Contains(got, "aeolus_rrm") {
+			t.Errorf("%s, and the daemon told: %s", look, got)
+		}
+		if got := check(look, section); !strings.Contains(got, `aeolus.aeolus_rrm: dfs is "", want 1`) {
+			t.Errorf("%s, and the daemon not told: %s", look, got)
+		}
+	}
+	const nothing = `aeolus.aeolus_rrm: dfs is "1", but nothing has the daemon move a radio to a DFS channel here`
+	if got := check(`{"rrm": {"enabled": true}, "radio": {"5g": {"dfs": "avoid"}}}`, with); !strings.Contains(got, nothing) {
+		t.Errorf("avoid, and the daemon told: %s", got)
+	}
+	// At 160 MHz every 5 GHz block holds DFS channels: it picks.
+	if got := check(`{"rrm": {"enabled": true}, "radio": {"5g": {"dfs": "allow"}}}`, strings.Replace(with, "HE80", "HE160", 1)); !strings.Contains(got, nothing) {
+		t.Errorf("allow at 160 MHz, and the daemon told: %s", got)
+	}
+	// It moves no radio: there is no one to go there.
+	still := `{"rrm": {"enabled": true, "moves": false}, "radio": {"5g": {"dfs": "look-first"}}}`
+	if got := check(still, strings.Replace(section, "moves '1'", "moves '0'", 1)); strings.Contains(got, "aeolus_rrm") {
+		t.Errorf("look-first with no moves: %s", got)
+	}
+	if got := check(still, strings.Replace(with, "moves '1'", "moves '0'", 1)); !strings.Contains(got, nothing) {
+		t.Errorf("look-first with no moves, and the daemon told: %s", got)
+	}
+}
+
+// Radio resource management on puts the daemon's section in the agent's
+// package, naming the AP; off, there is none (0073).
+func TestRRM(t *testing.T) {
+	check := func(rrm string, text string) string {
+		t.Helper()
+		var doc map[string]any
+		if err := json.Unmarshal([]byte(`{"rrm": `+rrm+`}`), &doc); err != nil {
+			t.Fatal(err)
+		}
+		c, err := uci.Parse(text)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return strings.Join(CheckAP(doc, c, "ap-a0046082275e"), "\n")
+	}
+	on, off := `{"enabled": true}`, `{"enabled": false}`
+	section := "package aeolus\nconfig rrm 'aeolus_rrm'\n\toption enabled '1'\n\toption ap 'ap-a0046082275e'\n" +
+		"\toption moves '1'\n\toption window '02:00-05:00'\n\toption margin '20'\n\toption apart '250'\n"
+	if got := check(on, section); strings.Contains(got, "aeolus_rrm") {
+		t.Errorf("on, with its section: %s", got)
+	}
+	if got := check(on, "package aeolus\n"); !strings.Contains(got, "aeolus.aeolus_rrm: radio resource management is on, but its section is missing") {
+		t.Errorf("on, without: %s", got)
+	}
+	if got := check(on, strings.Replace(section, "a0046082275e", "2005b6df64e0", 1)); !strings.Contains(got, `aeolus.aeolus_rrm: ap is "ap-2005b6df64e0", want "ap-a0046082275e"`) {
+		t.Errorf("another AP's: %s", got)
+	}
+	if got := check(off, section); !strings.Contains(got, "aeolus.aeolus_rrm: radio resource management is not on, but its section is there") {
+		t.Errorf("off, with its section: %s", got)
+	}
+	if got := check(off, "package aeolus\n"); strings.Contains(got, "aeolus_rrm") {
+		t.Errorf("off, without: %s", got)
+	}
+	// The policy for moves, set: the section must hold it, not the defaults.
+	policy := `{"enabled": true, "moves": false, "window": "22:30-04:00", "margin": 35}`
+	got := check(policy, section)
+	for _, want := range []string{`moves is "1", want "0"`, `window is "02:00-05:00", want "22:30-04:00"`, `margin is "20", want "35"`} {
+		if !strings.Contains(got, want) {
+			t.Errorf("the policy set, the defaults written: want %s, got %s", want, got)
+		}
+	}
+	set := strings.NewReplacer("moves '1'", "moves '0'", "02:00-05:00", "22:30-04:00", "margin '20'", "margin '35'").Replace(section)
+	if got := check(policy, set); strings.Contains(got, "aeolus_rrm") {
+		t.Errorf("the policy set, and written: %s", got)
+	}
+	// On an AP with a scan radio, the serving radios never scan (0081): the
+	// section must tell the daemon to listen through that radio (0116), and
+	// on an AP without one it must not, or the daemon would hear nothing.
+	scan := "package wireless\nconfig wifi-device 'radio2'\n\toption band '6g'\n\toption disabled '1'\n\toption airscan '1'\n"
+	through := section + "\toption scan 'airscan'\n"
+	if got := check(on, scan+through); strings.Contains(got, "aeolus_rrm") {
+		t.Errorf("on, with a scan radio, listening through it: %s", got)
+	}
+	if got := check(on, scan+section); !strings.Contains(got, `aeolus.aeolus_rrm: scan is "", want airscan: the AP has a scan radio, where the serving radios never scan (0081)`) {
+		t.Errorf("on, with a scan radio, its serving radios left to scan: %s", got)
+	}
+	if got := check(on, scan+"package aeolus\n"); !strings.Contains(got, "radio resource management is on, but its section is missing") {
+		t.Errorf("on, with a scan radio and no section: %s", got)
+	}
+	if got := check(on, through); !strings.Contains(got, `aeolus.aeolus_rrm: scan is "airscan", but the AP has no scan radio to listen through`) {
+		t.Errorf("on, listening through a scan radio the AP does not have: %s", got)
+	}
+}
+
+// The 802.11 generations a band allows (0089): 802.11b is legacy_rates, the
+// oldest is require_mode, and the mode's family lies between the oldest and
+// the newest. The short guard interval off is each short_gi option at 0.
+func TestModesAndShortGI(t *testing.T) {
+	check := func(radio, text string) string {
+		t.Helper()
+		var doc map[string]any
+		if err := json.Unmarshal([]byte(`{"radio": `+radio+`}`), &doc); err != nil {
+			t.Fatal(err)
+		}
+		c, err := uci.Parse("package wireless\n" + text)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return strings.Join(Check(doc, c), "\n")
+	}
+	got := check(`{"2g": {"modes": ["b", "g"]}, "5g": {"modes": ["ac", "ax"], "short_gi": false}}`, `config wifi-device 'a'
+	option band '2g'
+	option htmode 'NOHT'
+	option legacy_rates '1'
+config wifi-device 'b'
+	option band '2g'
+	option htmode 'HT20'
+config wifi-device 'c'
+	option band '5g'
+	option noscan '1'
+	option htmode 'HE80'
+	option require_mode 'ac'
+	option short_gi_20 '0'
+	option short_gi_40 '0'
+	option short_gi_80 '0'
+	option short_gi_160 '0'
+config wifi-device 'd'
+	option band '5g'
+	option noscan '1'
+	option htmode 'HT40'
+	option short_gi_80 '1'
+`)
+	for _, want := range []string{
+		`wireless.b: legacy_rates is "", want it on for 802.11b the oldest radio.2g.modes allows`,
+		`wireless.b: htmode is "HT20", want one of 802.11b to 802.11g, as radio.2g.modes allows`,
+		`wireless.d: require_mode is "", want "ac" for 802.11ac the oldest radio.5g.modes allows`,
+		`wireless.d: htmode is "HT40", want one of 802.11ac to 802.11ax, as radio.5g.modes allows`,
+		`wireless.d: short_gi_20 is "", want it off for radio.5g.short_gi false`,
+		`wireless.d: short_gi_80 is "1", want it off for radio.5g.short_gi false`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing %q in: %s", want, got)
+		}
+	}
+	for _, ok := range []string{"wireless.a:", "wireless.c:"} {
+		if strings.Contains(got, ok) {
+			t.Errorf("%s should pass: %s", ok, got)
+		}
+	}
+	// Without 802.11b, legacy_rates is off; the short guard interval on is
+	// OpenWrt's default, no option, and a 0 is caught.
+	got = check(`{"2g": {"modes": ["g", "n", "ax"], "short_gi": true}}`, `config wifi-device 'a'
+	option band '2g'
+	option htmode 'HE20'
+config wifi-device 'b'
+	option band '2g'
+	option htmode 'HE20'
+	option legacy_rates '1'
+	option require_mode 'n'
+	option short_gi_20 '0'
+`)
+	for _, want := range []string{
+		`wireless.b: legacy_rates is "1", want it off for 802.11g the oldest radio.2g.modes allows`,
+		`wireless.b: require_mode is "n", want "" for 802.11g the oldest radio.2g.modes allows`,
+		`wireless.b: short_gi_20 is "0", want it on for radio.2g.short_gi true`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing %q in: %s", want, got)
+		}
+	}
+	if strings.Contains(got, "wireless.a:") {
+		t.Errorf("wireless.a should pass: %s", got)
+	}
+}
+
+// The 802.11ax guard interval set for a band the AP serves is in the
+// agent's gi section, which aeolus-gi sets with iw; automatic, or none set,
+// there is no section (0089).
+func TestHEGuardInterval(t *testing.T) {
+	check := func(radio, text string) string {
+		t.Helper()
+		var doc map[string]any
+		if err := json.Unmarshal([]byte(`{"radio": `+radio+`}`), &doc); err != nil {
+			t.Fatal(err)
+		}
+		c, err := uci.Parse("package wireless\nconfig wifi-device 'radio0'\n\toption band '5g'\n\toption noscan '1'\nconfig wifi-device 'radio1'\n\toption band '2g'\n" +
+			"config wifi-device 'radio2'\n\toption band '6g'\n\toption airscan '1'\npackage aeolus\n" + text)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return strings.Join(Check(doc, c), "\n")
+	}
+	set := `{"5g": {"he_gi": 1600}, "2g": {"he_gi": "auto"}, "6g": {"he_gi": 800}}`
+	if got := check(set, "config gi 'aeolus_gi'\n\toption he_gi_5g '1.6'\n"); got != "" {
+		t.Errorf("1.6 on 5 GHz, automatic on 2.4, 6 GHz only the scan radio's: %s", got)
+	}
+	if got := check(set, ""); !strings.Contains(got, "aeolus.aeolus_gi: an 802.11ax guard interval is set, but the section is missing") {
+		t.Errorf("no section: %s", got)
+	}
+	got := check(set, "config gi 'aeolus_gi'\n\toption he_gi_5g '0.8'\n\toption he_gi_6g '0.8'\n")
+	for _, want := range []string{`aeolus.aeolus_gi: he_gi_5g is "0.8", want "1.6"`, `aeolus.aeolus_gi: he_gi_6g is "0.8", but no such guard interval is set`} {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing %q in: %s", want, got)
+		}
+	}
+	if got := check(`{"5g": {"he_gi": "auto"}}`, "config gi 'aeolus_gi'\n\toption he_gi_5g '1.6'\n"); !strings.Contains(got, "aeolus.aeolus_gi: no 802.11ax guard interval is set, but the section is there") {
+		t.Errorf("automatic, with a section: %s", got)
+	}
+}
+
+// Every schema field is either checked or deferred with a reason, and every
+// entry names a real field (0039).
+func TestCoverageMatchesTheSchema(t *testing.T) {
+	sch, err := schema.V1()
+	if err != nil {
+		t.Fatal(err)
+	}
+	used := map[string]bool{}
+	for _, leaf := range sch.Leaves() {
+		var by []string
+		for pattern := range Coverage {
+			if matches(pattern, leaf) {
+				by = append(by, pattern)
+				used[pattern] = true
+			}
+		}
+		if len(by) != 1 {
+			t.Errorf("%s is covered by %v, want exactly one entry", leaf, by)
+		}
+	}
+	for pattern := range Coverage {
+		if !used[pattern] {
+			t.Errorf("coverage entry %s names no field", pattern)
+		}
+	}
+}
+
+func matches(pattern, leaf string) bool {
+	p, l := strings.Split(pattern, "."), strings.Split(leaf, ".")
+	if len(p) != len(l) {
+		return false
+	}
+	for i := range p {
+		if ok, _ := path.Match(p[i], l[i]); !ok && p[i] != l[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// A port's speed (0094) is on its device section, that speed with full
+// duplex; auto is none at all.
+func TestPortSpeed(t *testing.T) {
+	check := func(ports, devices string) string {
+		t.Helper()
+		var doc map[string]any
+		if err := json.Unmarshal([]byte(`{"ports": `+ports+`}`), &doc); err != nil {
+			t.Fatal(err)
+		}
+		c, err := uci.Parse("package network\nconfig device\n\toption name 'br-lan'\n\toption type 'bridge'\n\tlist ports 'lan1'\n\tlist ports 'lan2'\n\tlist ports 'wan'\n" + devices +
+			"package aeolus\nconfig agent 'agent'\n\toption uplink 'wan'\n")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return strings.Join(Check(doc, c), "\n")
+	}
+	want := `{"lan1": {"speed": 1000}, "lan2": {"speed": "auto"}}`
+	if got := check(want, "config device 'aeolus_port_lan1'\n\toption name 'lan1'\n\toption speed '1000'\n\toption duplex '1'\n"); strings.Contains(got, "speed") {
+		t.Errorf("1000 full on lan1, none on lan2: %s", got)
+	}
+	got := check(want, "config device 'aeolus_port_lan1'\n\toption name 'lan1'\n\toption speed '100'\nconfig device\n\toption name 'lan2'\n\toption speed '1000'\n")
+	for _, w := range []string{`ports.lan1: the speed is [100], want 1000`, `ports.lan1: speed 100 is set without full duplex`, `ports.lan2: the speed is [1000], want auto`} {
+		if !strings.Contains(got, w) {
+			t.Errorf("missing %q in: %s", w, got)
+		}
+	}
+	if got := check(want, ""); !strings.Contains(got, "ports.lan1: the speed is [], want 1000") {
+		t.Errorf("no section for lan1: %s", got)
+	}
+}

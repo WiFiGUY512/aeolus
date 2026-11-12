@@ -1,0 +1,281 @@
+#!/bin/sh
+# Finds an Aeolus manager by its name and joins this AP to it (0151): for an
+# AP nothing has pointed at a manager, so that no one has to type the
+# manager's installer at it (0083).
+#
+#	aeolus-find look    what answers to the name, one a line; joins nothing
+#	aeolus-find once    look, and join the first that is a manager
+#	aeolus-find run     the service: look until this AP has a manager
+#
+# It looks only while the AP has no manager (aeolus.agent.url), and for the
+# name aeolus:
+#
+#   - in each domain the network's DHCP gave (its search list), asked of the
+#     DNS servers that DHCP gave, and not of this AP's own dnsmasq, whose
+#     rebind protection drops an answer that is a private address (0040);
+#   - by itself, asked of the same servers: a home router answers for its
+#     DHCP clients' names;
+#   - as aeolus.local by multicast DNS, on the uplink's network, where
+#     ucode's socket module is installed.
+#
+# An answer counts only where it is a private address (10/8, 172.16/12,
+# 192.168/16, 169.254/16, 100.64/10): a name out on the internet is never
+# taken for the manager, whatever a search list leads to. A domain is tried
+# as DHCP gave it, never its parents.
+#
+# What answers is then asked for the manager's installer, the one a person
+# would fetch with wget, and that is run: it installs this manager's agent
+# and joins the AP, which then waits in Landing Zone for a person to adopt
+# it (0033). The manager is trusted as found: whoever answers to the name
+# on this network is taken for it, once, and its certificate pinned from
+# then on, as with the installer fetched by hand.
+#
+# Its log: logread -e aeolus-find. To have none of it: /etc/init.d/aeolus-find
+# disable, or remove the package.
+
+NAME=aeolus
+PORT=8443
+# Where netifd keeps what DHCP gave: the servers and the search list. A
+# test gives its own, and its own place for the multicast asker.
+MDNS=${AEOLUS_FIND_MDNS:-/usr/libexec/aeolus-find-mdns}
+RESOLV=${AEOLUS_FIND_RESOLV:-}
+MOST_DOMAINS=6
+
+say() {
+	logger -t aeolus-find "$*" 2>/dev/null
+	echo "aeolus-find: $*" >&2
+}
+
+managed() {
+	[ -n "$(uci -q get aeolus.agent.url)" ]
+}
+
+# from_memory: whether this system runs from memory, as an installer or an
+# image on trial does: what it joined as would be gone at its next boot, so
+# it joins nothing. A system on flash has its root on flash, or over it.
+from_memory() {
+	case $(awk '$2 == "/" { t = $3 } END { print t }' "${AEOLUS_FIND_MOUNTS:-/proc/mounts}") in
+	rootfs | tmpfs | ramfs) return 0 ;;
+	esac
+	return 1
+}
+
+# private <address>: whether it is an IPv4 address no one reaches from the
+# internet
+private() {
+	echo "$1" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$' || return 1
+	oldifs=$IFS
+	IFS=.
+	set -- $1
+	IFS=$oldifs
+	for o in "$@"; do
+		[ "$o" -le 255 ] || return 1
+	done
+	case $1 in
+	10) return 0 ;;
+	192) [ "$2" = 168 ] ;;
+	169) [ "$2" = 254 ] ;;
+	172) [ "$2" -ge 16 ] && [ "$2" -le 31 ] ;;
+	100) [ "$2" -ge 64 ] && [ "$2" -le 127 ] ;;
+	*) return 1 ;;
+	esac
+}
+
+# given: the file with what DHCP gave
+given() {
+	for f in "$RESOLV" /tmp/resolv.conf.d/resolv.conf.auto /tmp/resolv.conf.auto /etc/resolv.conf; do
+		[ -n "$f" ] && [ -s "$f" ] && echo "$f" && return 0
+	done
+	return 1
+}
+
+# servers: the DNS servers DHCP gave, not this AP's own resolver
+servers() {
+	f=$(given) || return 0
+	sed -n 's/^nameserver[[:space:]][[:space:]]*\([0-9A-Fa-f:.]*\).*/\1/p' "$f" | grep -Ev '^(127\.|::1$|0\.0\.0\.0$)' | awk '!seen[$0]++'
+}
+
+# names: the names to ask for, the likeliest first
+names() {
+	f=$(given) || { echo "$NAME"; return 0; }
+	sed -n 's/^search[[:space:]][[:space:]]*//p' "$f" | tr ' \t' '\n\n' | tr A-Z a-z |
+		grep -E '^[a-z0-9-]+(\.[a-z0-9-]+)*\.?$' | sed 's/\.$//' | awk '!seen[$0]++' |
+		head -n $MOST_DOMAINS | sed "s/^/$NAME./"
+	echo "$NAME"
+}
+
+# answers: the IPv4 addresses in what nslookup said, read from stdin. The
+# server's own address comes before the Name line, and is not one.
+answers() {
+	awk '
+		/^Name:/ { on = 1; next }
+		on && /^Address/ {
+			for (i = 2; i <= NF; i++)
+				if ($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ && !seen[$i]++)
+					print $i
+		}'
+}
+
+# look: what answers to the name: "dns <name> <address> <server>" and
+# "mdns <name> <address>", a private address each
+look() {
+	found=
+	for n in $(names); do
+		for s in $(servers); do
+			for a in $(nslookup "$n" "$s" 2>/dev/null | answers); do
+				if ! private "$a"; then
+					say "$n is $a at $s: not a private address, so not taken for a manager"
+					continue
+				fi
+				case " $found " in *" $n/$a "*) continue ;; esac
+				found="$found $n/$a"
+				echo "dns $n $a $s"
+			done
+		done
+	done
+	if [ -x "$MDNS" ] && [ -e /usr/lib/ucode/socket.so ]; then
+		for a in $("$MDNS" "$NAME.local" 2>/dev/null); do
+			private "$a" || continue
+			case " $found " in *" $NAME.local/$a "*) continue ;; esac
+			found="$found $NAME.local/$a"
+			echo "mdns $NAME.local $a"
+		done
+	fi
+}
+
+# resolves <name> <address>: whether this AP's own resolver gives the name
+# that address, as the agent will need it to
+resolves() {
+	nslookup "$1" 2>/dev/null | answers | grep -qx "$2"
+}
+
+# The manager's name on dnsmasq's rebind_domain, so that it may answer with
+# a private address (0040, 0083): kept in aeolus.agent.rebind too, the list
+# of names Aeolus added, so the agent takes it out again should the manager
+# change (0069). unbind takes back what bind added, where the join failed.
+BOUND=
+BOUND_IN=
+bind() {
+	BOUND=
+	# The section is most often one with no name, dhcp.@dnsmasq[0].
+	s=$(uci -q show dhcp | sed -n 's/^dhcp\.\([^.=]*\)=dnsmasq$/\1/p' | head -n 1)
+	[ -n "$s" ] || return 0
+	for d in $(uci -q get "dhcp.$s.rebind_domain"); do
+		[ "$d" = "$1" ] && return 0
+	done
+	uci add_list "dhcp.$s.rebind_domain=$1"
+	[ -f /etc/config/aeolus ] || touch /etc/config/aeolus
+	uci -q get aeolus.agent >/dev/null || uci set aeolus.agent=agent
+	uci add_list aeolus.agent.rebind="$1"
+	uci commit dhcp
+	uci commit aeolus
+	/etc/init.d/dnsmasq reload >/dev/null 2>&1 || true
+	BOUND=$1
+	BOUND_IN=$s
+}
+unbind() {
+	[ -n "$BOUND" ] || return 0
+	uci -q del_list "dhcp.$BOUND_IN.rebind_domain=$BOUND"
+	uci -q del_list aeolus.agent.rebind="$BOUND"
+	BOUND=
+	uci commit dhcp
+	uci commit aeolus
+	/etc/init.d/dnsmasq reload >/dev/null 2>&1 || true
+}
+
+# join <url>: fetch that manager's installer and run it. 0 once the AP has
+# a manager; 2 where nothing there is a manager; 1 where one is, and the
+# join failed.
+join() {
+	tmp=$(mktemp -d) || return 1
+	got=
+	for try in 1 2 3; do
+		uclient-fetch -q -T 15 --no-check-certificate -O "$tmp/install" "$1/install" 2>/dev/null && got=1 && break
+		[ $try = 3 ] || sleep 2
+	done
+	if [ -z "$got" ] || ! head -n 1 "$tmp/install" | grep -q '^#!/bin/sh' || ! grep -q 'aeolus-enroll' "$tmp/install"; then
+		rm -rf "$tmp"
+		return 2
+	fi
+	say "a manager answers at $1: installing its agent and joining it"
+	sh "$tmp/install" </dev/null >"$tmp/log" 2>&1
+	rc=$?
+	while read -r line; do
+		say "  $line"
+	done <"$tmp/log"
+	rm -rf "$tmp"
+	[ $rc = 0 ] && managed
+}
+
+# once: look, and join the first that is a manager. 0 joined; 1 a manager
+# was found and not joined; 2 none found.
+once() {
+	seen=2
+	look >/tmp/aeolus-find.found
+	while read -r how n a s <&3; do
+		if [ "$how" = dns ]; then
+			# By its name, so that the manager may move; by its address
+			# where the name cannot be had here (as one with no domain
+			# cannot, of dnsmasq), or its certificate does not name it.
+			case $n in *.*) resolves "$n" "$a" || bind "$n" ;; esac
+			for wait in 1 2 3; do
+				resolves "$n" "$a" && break
+				sleep 2
+			done
+			if resolves "$n" "$a"; then
+				say "found $n, $a, by DNS at $s"
+				join "https://$n:$PORT"
+				case $? in 0) return 0 ;; 1) seen=1 ;; esac
+			fi
+			unbind
+		else
+			say "found $n, $a, by multicast DNS"
+		fi
+		join "https://$a:$PORT"
+		case $? in 0) return 0 ;; 1) seen=1 ;; esac
+	done 3</tmp/aeolus-find.found
+	return $seen
+}
+
+# run: look until this AP has a manager: each minute for the first ten,
+# then every ten; an hour after a manager was found and could not be
+# joined, which looking again sooner does not mend.
+run() {
+	if from_memory; then
+		say "this system runs from memory: not looking for a manager"
+		return 0
+	fi
+	n=0
+	while ! managed; do
+		if ip route show default 2>/dev/null | grep -q .; then
+			once
+			case $? in
+			0) break ;;
+			1) sleep 3600; continue ;;
+			esac
+		fi
+		n=$((n + 1))
+		if [ $n -le 10 ]; then sleep 60; else sleep 600; fi
+	done
+	say "this AP has a manager, $(uci -q get aeolus.agent.url): no longer looking"
+}
+
+case ${1:-} in
+look) look ;;
+once)
+	managed && { say "this AP has a manager, $(uci -q get aeolus.agent.url)"; exit 0; }
+	from_memory && { say "this system runs from memory: it joins nothing"; exit 0; }
+	once
+	;;
+run) run ;;
+# For the tests: the parts that only read.
+private) private "$2" ;;
+from-memory) from_memory ;;
+names) names ;;
+servers) servers ;;
+answers) answers ;;
+*)
+	echo "usage: aeolus-find look | once | run" >&2
+	exit 2
+	;;
+esac

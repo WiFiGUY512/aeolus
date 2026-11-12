@@ -1,0 +1,217 @@
+wanted { "ssid": "Aeolus Lab", "network": null, "eap": null, "bssids": [ "20:05:b6:df:64:ec" ], "channels": [ ], "band": "5g", "speed": { "url": "http://192.168.20.106", "host": "192.168.20.106", "port": 80 }, "dns_name": "openwrt.org", "ap": null, "roam": [ ] }
+wanted least { "ssid": "Aeolus Lab", "network": null, "eap": null, "bssids": [ ], "channels": [ ], "band": null, "speed": null, "dns_name": "example.com", "ap": null, "roam": [ ] }
+wanted named server { "url": "http://zephyrus.example.com:3000/", "host": "zephyrus.example.com", "port": 3000 }
+wanted remote { "name": "Cloudflare", "host": "speed.cloudflare.com", "port": 80, "down": "/__down?bytes=50000000", "up": "/__up", "body": 4194304 }
+wanted remote alone, unnamed { "name": "speed.example.net", "host": "speed.example.net", "port": 8080, "down": "/downloading", "up": "/upload", "body": 33554432 }
+wanted remote { "name": "Cloudflare", "host": "bad host", "port": 80, "down": "/__down?bytes=50000000", "up": "/__up", "body": 4194304 }: a test true, its remote server { "name": "Cloudflare", "unusable": true }
+wanted remote { "name": "Cloudflare", "host": "h\r\nX: y", "port": 80, "down": "/__down?bytes=50000000", "up": "/__up", "body": 4194304 }: a test true, its remote server { "name": "Cloudflare", "unusable": true }
+wanted remote { "name": "Cloudflare", "host": "speed.example.net\u0000\r\nX: y", "port": 80, "down": "/__down?bytes=50000000", "up": "/__up", "body": 4194304 }: a test true, its remote server { "name": "Cloudflare", "unusable": true }
+wanted remote { "name": "Cloudflare", "host": "speed.cloudflare.com", "port": 0, "down": "/__down?bytes=50000000", "up": "/__up", "body": 4194304 }: a test true, its remote server { "name": "Cloudflare", "unusable": true }
+wanted remote { "name": "Cloudflare", "host": "speed.cloudflare.com", "port": "80", "down": "/__down?bytes=50000000", "up": "/__up", "body": 4194304 }: a test true, its remote server { "name": "Cloudflare", "unusable": true }
+wanted remote { "name": "Cloudflare", "host": "speed.cloudflare.com", "port": 80, "down": "no-slash", "up": "/__up", "body": 4194304 }: a test true, its remote server { "name": "Cloudflare", "unusable": true }
+wanted remote { "name": "Cloudflare", "host": "speed.cloudflare.com", "port": 80, "down": "/a b", "up": "/__up", "body": 4194304 }: a test true, its remote server { "name": "Cloudflare", "unusable": true }
+wanted remote { "name": "Cloudflare", "host": "speed.cloudflare.com", "port": 80, "down": "/__down?bytes=50000000", "up": "/up\r\nHost: other", "body": 4194304 }: a test true, its remote server { "name": "Cloudflare", "unusable": true }
+wanted remote { "name": "Cloudflare", "host": "speed.cloudflare.com", "port": 80, "down": "/__down?bytes=50000000", "up": "/u\u0000\r\nX-Injected: 1\r\n\r\nGET /second HTTP/1.1", "body": 4194304 }: a test true, its remote server { "name": "Cloudflare", "unusable": true }
+wanted remote { "name": "Cloudflare", "host": "speed.cloudflare.com", "port": 80, "down": "/__down?bytes=50000000", "up": null, "body": 4194304 }: a test true, its remote server { "name": "Cloudflare", "unusable": true }
+wanted remote { "name": "Cloudflare", "host": "speed.cloudflare.com", "port": 80, "down": "/__down?bytes=50000000", "up": "/__up", "body": 12 }: a test true, its remote server { "name": "Cloudflare", "unusable": true }
+wanted remote { "name": "Cloudflare", "host": "speed.cloudflare.com", "port": 80, "down": "/__down?bytes=50000000", "up": "/__up", "body": 99999999 }: a test true, its remote server { "name": "Cloudflare", "unusable": true }
+wanted remote "cloudflare": a test true, its remote server { "name": "the remote server", "unusable": true }
+wanted null: null
+wanted { }: null
+wanted { "ssid": "" }: null
+wanted { "ssid": "x", "bssids": [ "not one" ] }: null
+wanted { "ssid": "x", "band": "60g" }: null
+wanted { "ssid": "x", "speed": "https://secure.example" }: null
+wanted { "ssid": "x", "speed": "http://host:99999" }: null
+wanted { "ssid": "x", "speed": "http://host/path" }: null
+wanted { "ssid": "x", "dns_name": "bad name" }: null
+wanted { "ssid": "a name of more than thirty-two bytes" }: null
+freqs 2g [ 2412, 2417, 2422, 2427, 2432, 2437, 2442, 2447, 2452, 2457, 2462, 2467, 2472 ]
+freqs 5g [ 5180, 5200, 5220, 5240, 5260, 5280, 5300, 5320, 5500, 5520, 5540, 5560, 5580, 5600, 5620, 5640, 5660, 5680, 5700, 5720, 5745, 5765, 5785, 5805, 5825 ]
+freqs 6g 59, from 5955 to 7115; any band 38
+where [ "2g", 1 ] [ "5g", 132 ] [ "6g", 197 ] [ "2g", 14 ] [ "6g", 2 ] null
+target the office AP { "bssids": [ "20:05:b6:df:64:e5", "20:05:b6:df:64:ec" ], "freqs": [ 2412, 5660 ], "heard": [ { "bssid": "20:05:b6:df:64:e5", "band": "2g", "channel": 1, "signal": -28 }, { "bssid": "20:05:b6:df:64:ec", "band": "5g", "channel": 132, "signal": -44 } ] }
+target the office AP on 5 GHz { "bssids": [ "20:05:b6:df:64:e5", "20:05:b6:df:64:ec" ], "freqs": [ 5660 ], "heard": [ { "bssid": "20:05:b6:df:64:ec", "band": "5g", "channel": 132, "signal": -44 } ] }
+target this AP itself on 2.4 GHz { "bssids": [ "32:86:2d:ef:2f:c0", "32:86:2d:ef:2f:d0" ], "freqs": [ 2437 ], "heard": [ { "bssid": "32:86:2d:ef:2f:d0", "band": "2g", "channel": 6, "signal": 0 } ] }
+target the office AP, moved on 5 GHz { "bssids": [ "20:05:b6:df:64:ec" ], "freqs": [ 5660, 5745 ], "heard": [ { "bssid": "20:05:b6:df:64:ec", "band": "5g", "channel": 132, "signal": -44 } ] }
+target an AP not heard, where it says it is [ 5785 ]
+freq_of [ 2484, 5745, 5935, 6135 ]; a channel not on its band null; refused null
+target an AP not heard: it looks on 13 channels, heard [ ]
+target the strongest other AP { "bssids": [ "20:05:b6:df:64:e5" ], "freqs": [ 2412 ], "heard": [ { "bssid": "20:05:b6:df:64:e5", "band": "2g", "channel": 1, "signal": -28 }, { "bssid": "20:05:b6:df:64:ec", "band": "5g", "channel": 132, "signal": -44 }, { "bssid": "aa:04:60:82:27:61", "band": "2g", "channel": 11, "signal": -84 } ] }
+target the strongest other AP on 5 GHz { "bssids": [ "20:05:b6:df:64:ec" ], "freqs": [ 5660 ], "heard": [ { "bssid": "20:05:b6:df:64:ec", "band": "5g", "channel": 132, "signal": -44 } ] }
+target none heard null null
+supplicant psk2:
+ctrl_interface=/var/run/aeolus/clienttest/wpa
+update_config=0
+sae_pwe=2
+network={
+	ssid=41656f6c7573204c6162
+	scan_ssid=1
+	bssid_accept=20:05:b6:df:64:ec
+	scan_freq=5660
+	freq_list=5660
+	key_mgmt=WPA-PSK
+	psk="fixture-passphrase-1"
+	disabled=1
+}
+supplicant sae: [ "key_mgmt=SAE", "ieee80211w=2", "sae_password=\"a \"quoted\" passphrase\"" ]
+supplicant sae-mixed: [ "key_mgmt=SAE WPA-PSK", "ieee80211w=1", "psk=\"a \"quoted\" passphrase\"" ]
+supplicant owe: [ "key_mgmt=OWE", "ieee80211w=2" ]
+supplicant none: [ "key_mgmt=NONE" ]
+supplicant psk-mixed+ccmp: [ "key_mgmt=WPA-PSK", "psk=\"a \"quoted\" passphrase\"" ]
+supplicant no target: "ctrl_interface=/var/run/aeolus/clienttest/wpa\nupdate_config=0\nsae_pwe=2\nnetwork={\n\tssid=78\n\tscan_ssid=1\n\tkey_mgmt=NONE\n\tdisabled=1\n}\n"
+supplicant { "encryption": "wpa2", "key": "x" }: { "why": "it signs clients in by 802.1X, and the test was given no user to sign in as" }
+supplicant { "encryption": "wpa3-mixed" }: { "why": "it signs clients in by 802.1X, and the test was given no user to sign in as" }
+supplicant { "encryption": "psk2", "ppsk": "1" }: { "why": "each device has a passphrase of its own from RADIUS there, and the test has none" }
+supplicant { "encryption": "psk2" }: { "why": "this AP has no passphrase for it" }
+supplicant { "encryption": "psk2", "key": "short" }: { "why": "its passphrase is one the test cannot hand to wpa_supplicant" }
+supplicant { "encryption": "psk2", "key": "two\nlines of it" }: { "why": "its passphrase is one the test cannot hand to wpa_supplicant" }
+supplicant { "encryption": "wep", "key": "fixture-passphrase-1" }: { "why": "its security, wep, is one the test does not know" }
+supplicant null: { "why": "this AP does not offer that network" }
+event "<3>CTRL-EVENT-SCAN-STARTED "
+   { "stage": "find", "what": "looks for the network" }
+event "<3>CTRL-EVENT-SCAN-RESULTS "
+   null
+event "<3>SME: Trying to authenticate with 20:05:b6:df:64:ec (SSID='Aeolus Lab' freq=5660 MHz)"
+   { "stage": "find", "what": "found it on 20:05:b6:df:64:ec, 5660 MHz", "ok": true, "bssid": "20:05:b6:df:64:ec", "freq": 5660 }
+event "<3>Trying to associate with 20:05:b6:df:64:ec (SSID='Aeolus Lab' freq=5660 MHz)"
+   { "stage": "auth", "what": "authenticated", "ok": true }
+event "<3>Associated with 20:05:b6:df:64:ec"
+   { "stage": "assoc", "what": "associated", "ok": true }
+event "<3>CTRL-EVENT-SUBNET-STATUS-UPDATE status=0"
+   null
+event "<3>WPA: Key negotiation completed with 20:05:b6:df:64:ec [PTK=CCMP GTK=CCMP]"
+   { "stage": "key", "what": "key handshake completed", "ok": true }
+event "<3>CTRL-EVENT-CONNECTED - Connection to 20:05:b6:df:64:ec completed [id=0 id_str=]"
+   { "stage": "key", "what": "let on to the network", "ok": true, "connected": true }
+event "<3>CTRL-EVENT-NETWORK-NOT-FOUND "
+   { "stage": "find", "what": "the network was not found", "ok": false, "notfound": true }
+event "<3>CTRL-EVENT-AUTH-REJECT 20:05:b6:df:64:e8 auth_type=0 auth_transaction=2 status_code=1"
+   { "stage": "auth", "what": "authentication refused (status 1)", "ok": false, "fail": true }
+event "<3>CTRL-EVENT-ASSOC-REJECT bssid=20:05:b6:df:64:e8 status_code=17"
+   { "stage": "assoc", "what": "association refused (status 17)", "ok": false, "fail": true }
+event "<3>WPA: 4-Way Handshake failed - pre-shared key may be incorrect"
+   { "stage": "key", "what": "the key handshake failed: a wrong passphrase, or its messages lost", "ok": false }
+event "<3>CTRL-EVENT-SSID-TEMP-DISABLED id=0 ssid=\"Aeolus Lab\" auth_failures=1 duration=10 reason=WRONG_KEY"
+   { "stage": "key", "what": "the key handshake failed each time: a wrong passphrase, or a link too weak for it", "ok": false, "fail": true }
+event "<3>CTRL-EVENT-SSID-TEMP-DISABLED id=0 ssid=\"Aeolus-PPSK\" auth_failures=2 duration=20 reason=CONN_FAILED"
+   { "stage": null, "what": "gave up: conn failed", "ok": false, "fail": true }
+event "<3>CTRL-EVENT-DISCONNECTED bssid=20:05:b6:df:64:ec reason=3 locally_generated=1"
+   { "stage": null, "what": "disconnected (reason 3)", "ok": false }
+event "OK"
+   null
+event null
+   null
+link 5 GHz, just joined { "signal": -45, "tx": null, "rx": { "mbps": 48.0, "how": "" } }
+link 2.4 GHz { "signal": -34, "tx": { "mbps": 143.3, "how": "HE-MCS 11 HE-NSS 1 HE-GI 0 HE-DCM 0" }, "rx": { "mbps": 143.3, "how": "HE-MCS 11 HE-NSS 1 HE-GI 0 HE-DCM 0" } }
+link of nothing { "signal": null, "tx": null, "rx": null }
+ping { "sent": 3, "got": 3, "min": 2.358, "avg": 4.131, "max": 7.61 }
+ping unanswered { "sent": 3, "got": 0, "min": null, "avg": null, "max": null }
+ping of nothing { "sent": 0, "got": 0, "min": null, "avg": null, "max": null }
+lease { "address": "192.168.20.108", "mask": 24, "router": "192.168.20.1", "dns": [ "192.168.20.254", "9.9.9.9" ], "server": "192.168.20.254", "lease": 86400 }
+lease, little said { "address": "10.0.0.7", "mask": 8, "router": null, "dns": [ ], "server": null, "lease": 0 }
+lease, none null null null
+dhcp said, given { "requests": 2, "offered": "192.168.10.186", "server": "192.168.10.254", "refused": false }
+dhcp unconfirmed { "requests": 4, "offered": "192.168.10.187", "server": "192.168.10.254", "refused": false } { "what": "offered 192.168.10.187 by 192.168.10.254, and none of its 4 requests was acknowledged in 20 s", "why": "a DHCP server offered 192.168.10.187 and never confirmed it" }
+dhcp refused { "requests": 1, "offered": "192.168.20.99", "server": "192.168.20.254", "refused": true } { "what": "offered 192.168.20.99 by 192.168.20.254, then refused it", "why": "the DHCP server refused it 192.168.20.99, which it had offered" }
+dhcp unanswered { "requests": 0, "offered": null, "server": null, "refused": false } { "what": "no answer to its DHCP requests in 20 s", "why": "no DHCP server gave it an address" }
+dhcp nothing { "requests": 0, "offered": null, "server": null, "refused": false } { "what": "no answer to its DHCP requests in 20 s", "why": "no DHCP server gave it an address" }
+dhcp asked once { "what": "offered 10.0.0.9 by 10.0.0.1, and its request was not acknowledged in 20 s", "why": "a DHCP server offered 10.0.0.9 and never confirmed it" }
+network "192.168.20.0" "10.16.0.0" "10.20.30.40" "0.0.0.0" null
+dns query 416501000001000000000000076578616d706c6503636f6d0000010001
+dns answer { "rcode": 0, "answers": 2, "address": "104.20.23.154" }
+dns no such name { "rcode": 3, "answers": 0, "address": null }
+dns another question null, the question itself null, cut short { "rcode": 0, "answers": 2, "address": null } null
+rate 21.0 1912.4 null
+between: looking at clients true, idle true, sweeping false, scanning false, no status false
+between: a scan due in 3 s false, in 4 s true, a sweep due now false, 10 s late false, long past true, nothing said of the next true
+credentials: by ID { "encryption": "sae", "key": "the lab one", "ppsk": null, "ft": false }, another network with the SSID { "encryption": "none", "key": null, "ppsk": null, "ft": false }, an ID with a hyphen { "encryption": "psk2", "key": "two", "ppsk": "1", "ft": false }
+credentials: an ID the AP has no section for null, its section under another SSID null, no ID { "encryption": "psk2", "key": "made by hand", "ppsk": null, "ft": false }, an ID that is none null
+dfs: channel 132 true, 36 and 149 false, 2.4 GHz and 6 GHz false, 48 with 52 true, none false
+wanted with a user { "method": "peap", "identity": "aeolus-test", "password": "a \"quoted\" pass" }
+wanted with a user: no password null, a method there is none of null, a name too long null
+enterprise wpa2: { "conf": "ctrl_interface=/var/run/x/wpa\nupdate_config=0\nsae_pwe=2\nnetwork={\n\tssid=41656f6c75732d456e7465727072697365\n\tscan_ssid=1\n\tbssid_accept=20:05:b6:df:64:ed\n\tscan_freq=5220\n\tfreq_list=5220\n\tkey_mgmt=WPA-EAP\n\teap=PEAP\n\tidentity=61656f6c75732d74657374\n\tpassword=61202271756f746564222070617373\n\tphase2=\"auth=MSCHAPV2\"\n\tdisabled=1\n}\n" }
+enterprise wpa3: { "conf": "ctrl_interface=/var/run/x/wpa\nupdate_config=0\nsae_pwe=2\nnetwork={\n\tssid=41656f6c75732d456e7465727072697365\n\tscan_ssid=1\n\tbssid_accept=20:05:b6:df:64:ed\n\tscan_freq=5220\n\tfreq_list=5220\n\tkey_mgmt=WPA-EAP-SHA256\n\tieee80211w=2\n\teap=PEAP\n\tidentity=61656f6c75732d74657374\n\tpassword=61202271756f746564222070617373\n\tphase2=\"auth=MSCHAPV2\"\n\tdisabled=1\n}\n" }
+enterprise wpa3-mixed: { "conf": "ctrl_interface=/var/run/x/wpa\nupdate_config=0\nsae_pwe=2\nnetwork={\n\tssid=41656f6c75732d456e7465727072697365\n\tscan_ssid=1\n\tbssid_accept=20:05:b6:df:64:ed\n\tscan_freq=5220\n\tfreq_list=5220\n\tkey_mgmt=WPA-EAP WPA-EAP-SHA256\n\tieee80211w=1\n\teap=PEAP\n\tidentity=61656f6c75732d74657374\n\tpassword=61202271756f746564222070617373\n\tphase2=\"auth=MSCHAPV2\"\n\tdisabled=1\n}\n" }
+enterprise wpa: { "why": "its security, wpa, is one the test does not know" }
+enterprise by TTLS: { "conf": "ctrl_interface=/var/run/x/wpa\nupdate_config=0\nsae_pwe=2\nnetwork={\n\tssid=41656f6c75732d456e7465727072697365\n\tscan_ssid=1\n\tkey_mgmt=WPA-EAP\n\teap=TTLS\n\tidentity=75\n\tpassword=70\n\tphase2=\"auth=PAP\"\n\tdisabled=1\n}\n" }
+enterprise with no user: { "why": "it signs clients in by 802.1X, and the test was given no user to sign in as" }
+eap event { "stage": "signin", "what": "sign-in started" }
+eap event null
+eap event { "stage": "signin", "what": "signs in by PEAP" }
+eap event null
+eap event { "stage": "signin", "what": "signed in", "ok": true }
+eap event { "stage": "signin", "what": "the sign-in was refused", "ok": false, "fail": true }
+all of it: passed, stage done, reason ""
+   passed: joined in 0.6 s, address in 0.3 s, gateway 4 ms, DNS 42 ms, 21 down / 22.1 up Mbit/s
+no speed server: passed, stage done, reason ""
+   passed: joined in 0.6 s, address in 0.3 s, gateway 4 ms, DNS 42 ms
+joined, and nothing more asked: passed, stage done, reason ""
+   passed: joined in 2.6 s
+never found: failed, stage find, reason "it was not found there in 17 looks"
+   failed at find: it was not found there in 17 looks
+wrong passphrase: failed, stage key, reason "wrong passphrase"
+   failed at key: wrong passphrase
+no address: failed, stage dhcp, reason "no DHCP server gave it an address"
+   failed at dhcp: no DHCP server gave it an address
+a lease with no gateway: failed, stage gateway, reason "DHCP gave it no gateway"
+   failed at gateway: DHCP gave it no gateway
+a lease with no DNS server: failed, stage dns, reason "DHCP gave it no DNS server"
+   failed at dns: DHCP gave it no DNS server
+neigh: reachable "28:e7:1d:d2:d0:13", stale "28:e7:1d:d2:d0:13", failed null, incomplete null, nothing null
+a gateway that answers ARP and no ping: passed, stage done, reason ""
+   passed: joined in 0.6 s, address in 0.3 s, gateway there, no ping, DNS 42 ms, 21 down / 22.1 up Mbit/s
+gateway silent: failed, stage gateway, reason "its gateway, 192.168.20.1, does not answer"
+   failed at gateway: its gateway, 192.168.20.1, does not answer
+DNS silent: failed, stage dns, reason "its DNS server, 192.168.20.254, does not answer"
+   failed at dns: its DNS server, 192.168.20.254, does not answer
+DNS has no such name: failed, stage dns, reason "its DNS server, 192.168.20.254, has no address for nowhere.invalid"
+   failed at dns: its DNS server, 192.168.20.254, has no address for nowhere.invalid
+speed server unreachable: passed, stage done, reason ""
+   passed: joined in 0.6 s, address in 0.3 s, gateway 4 ms, DNS 42 ms, no speed to http://192.168.20.106: Connection refused
+both speeds: passed, stage done, reason ""
+   passed: joined in 0.6 s, address in 0.3 s, gateway 4 ms, DNS 42 ms, 21 down / 22.1 up Mbit/s, 480 down / 39 up Mbit/s to Cloudflare
+the remote speed alone: passed, stage done, reason ""
+   passed: joined in 0.6 s, address in 0.3 s, gateway 4 ms, DNS 42 ms, 480 down / 39 up Mbit/s to Cloudflare
+the remote server unreachable: passed, stage done, reason ""
+   passed: joined in 0.6 s, address in 0.3 s, gateway 4 ms, DNS 42 ms, 21 down / 22.1 up Mbit/s, no speed to Cloudflare: its name was not found
+a reason that is not plain text: failed, stage find, reason "caf?? a long reason that goes on and on and on, a long reason that goes on and on and on, a long reason that goes on and on and on, a long reason that goes on and on and on, a long reason that goes on"
+   failed at find: caf?? a long reason that goes on and on and on, a long reason that goes on and on and on, a long reason that goes on and on and on, a long reason that goes on and on and on, a long reason that goes on
+the sign-in refused: failed, stage signin, reason "the sign-in was refused"
+   failed at signin: the sign-in was refused
+way out, full size: { "target": "one.one.one.one", "largest": 1500, "tcp": 1500, "what": "full-size packets, 1500 bytes, reach one.one.one.one" }
+way out, clamped: { "target": "one.one.one.one", "largest": 1408, "tcp": 1400, "what": "packets over 1408 bytes sent without DF are lost on the way to one.one.one.one; TCP here sends 1400, so it gets through" }
+way out, lost: { "target": "one.one.one.one", "largest": 1408, "tcp": 1472, "lost": true, "what": "packets over 1408 bytes sent without DF are lost on the way to one.one.one.one, and TCP here sends 1472", "why": "packets over 1408 bytes without DF are lost on the way out, and TCP here sends 1472, so IoT clients that send without DF stall: clamp TCP's MSS to 1368 or less at the internet router" }
+way out, TCP not measured: { "target": "one.one.one.one", "largest": 1408, "what": "packets over 1408 bytes sent without DF are lost on the way to one.one.one.one; TCP could not be measured" }
+full-size packets out: passed, stage done, reason ""
+   passed: joined in 0.6 s, address in 0.3 s, gateway 4 ms, DNS 42 ms, 21 down / 22.1 up Mbit/s, full-size packets out
+packets out to 1408, TCP clamped: passed, stage done, reason ""
+   passed: joined in 0.6 s, address in 0.3 s, gateway 4 ms, DNS 42 ms, 21 down / 22.1 up Mbit/s, packets out to 1408 bytes
+packets over 1408 lost, TCP sends 1472: failed, stage path, reason "packets over 1408 bytes without DF are lost on the way out, and TCP here sends 1472, so IoT clients that send without DF stall: clamp TCP's MSS to 1368 or less at the internet router"
+   failed at path: packets over 1408 bytes without DF are lost on the way out, and TCP here sends 1472, so IoT clients that send without DF stall: clamp TCP's MSS to 1368 or less at the internet router
+wanted roam [ [ "20:05:b6:df:64:e5", "20:05:b6:df:64:ec" ], [ "aa:04:60:82:27:61" ] ]
+wanted roam [ "20:05:b6:df:64:e5" ]: null
+wanted roam [ [ ] ]: null
+wanted roam [ [ "nope" ] ]: null
+wanted roam [ [ 1 ] ]: null
+wanted roam "all": null
+wanted roam [ [ "20:05:b6:df:64:e5" ], [ "20:05:b6:df:64:e5" ], [ "20:05:b6:df:64:e5" ], [ "20:05:b6:df:64:e5" ], [ "20:05:b6:df:64:e5" ], [ "20:05:b6:df:64:e5" ], [ "20:05:b6:df:64:e5" ], [ "20:05:b6:df:64:e5" ], [ "20:05:b6:df:64:e5" ] ]: null
+wanted roam over the wire: null
+roam targets on 2.4 GHz [ { "bssid": "20:05:b6:df:64:e5", "band": "2g", "freq": 2412, "signal": -28 }, { "bssid": "aa:04:60:82:27:61", "band": "2g", "freq": 2462, "signal": -84 } ]
+roam targets on 5 GHz [ { "bssid": "20:05:b6:df:64:ec", "band": "5g", "freq": 5660, "signal": -44 } ]
+roam targets none asked [ ], none heard [ ]
+supplicant sae with 802.11r: [ "key_mgmt=FT-SAE SAE" ]
+supplicant sae-mixed with 802.11r: [ "key_mgmt=FT-SAE SAE FT-PSK WPA-PSK" ]
+supplicant psk2 with 802.11r: [ "key_mgmt=FT-PSK WPA-PSK" ]
+supplicant owe with 802.11r: [ "key_mgmt=OWE" ]
+supplicant wpa2 with 802.11r: [ "key_mgmt=FT-EAP WPA-EAP" ]
+supplicant wpa3 with 802.11r: [ "key_mgmt=FT-EAP WPA-EAP-SHA256" ]
+supplicant wpa3-mixed with 802.11r: [ "key_mgmt=FT-EAP WPA-EAP WPA-EAP-SHA256" ]
+credentials with 802.11r { "encryption": "sae", "key": "k", "ppsk": null, "ft": true }
+roam kinds [ "ft", "ft", "full", "cached", "keys", "cached", "keys" ]
+roamed by 802.11r: passed, stage done, reason ""
+   passed: joined in 0.6 s, address in 0.3 s, gateway 4 ms, DNS 42 ms, 21 down / 22.1 up Mbit/s, roamed 3 of 3 times (802.11r 2x 11 ms, full 1x 152 ms)
+a roam not let on: passed, stage done, reason ""
+   passed: joined in 0.6 s, address in 0.3 s, gateway 4 ms, DNS 42 ms, 21 down / 22.1 up Mbit/s, roamed 1 of 2 times (802.11r 1x 14 ms)
+no roam let on: passed, stage done, reason ""
+   passed: joined in 0.6 s, address in 0.3 s, gateway 4 ms, DNS 42 ms, 21 down / 22.1 up Mbit/s, roamed 0 of 1 times

@@ -1,0 +1,197 @@
+hmac 1 b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7
+hmac 2 5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843
+hmac 6 60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54
+hmac nul 87d8812da03a093483bf8317ca299305d7fc01f98c7cb59c946710304dec7331
+advert dd1102ae010101a0046082275ec0a80126415a
+read { "ap": "ap-a0046082275e", "address": "192.168.1.38", "port": 16730 }
+read later version { "ap": "ap-a0046082275e", "address": "192.168.1.38", "port": 16730 }
+read other OUI null
+read short null
+advert bad ID null
+advert bad address null
+open { "v": 1, "t": "hello", "ap": "ap-2005b6df64e0", "at": 1000, "seq": 7, "sees": [ "ap-a0046082275e" ] }
+open tampered null
+open other key null
+open version 2 null
+open not an AP null
+fresh first true
+fresh skewed false
+fresh again false
+fresh next true
+fresh older false
+choose { "2g": [ "ap-000000000002", "ap-000000000004", "ap-000000000006" ], "5g": [ "ap-000000000005", "ap-000000000001" ] }
+smooth -70 -65.0
+visits 2g 11 [ 2412, 2437, 2462 ]
+visits 2g 3 [ 2412, 2437, 2462, 2422 ]
+visits 2g set [ 2412, 2422, 2437, 2462 ]
+visits 5g 149 [ 5180, 5200, 5220, 5240, 5745, 5765, 5785, 5805, 5825 ]
+visits 5g 100 dfs 25
+visits 6g set [ 5975, 6055, 6135 ]
+visits 6g psc 15 [ 5975, 6055, 6135 ]
+visits 6g own [ 5975, 6055, 5955 ]
+band 2g 5g null
+weight 1 0.5 0 0
+cost quiet 0
+cost busy 47.25
+cost no noise 110
+blend 40 36.0 20.0
+pick free 6
+pick all used 1
+pick alike 6
+pick unknown is near 6
+pick none null
+covers [ 11 ] [ 149, 153 ] [ 149, 153, 157, 161 ] [ 165, 169 ] [ 100, 104, 108, 112, 116, 120, 124, 128 ]
+blocks 20 [ 36, 40, 44, 48, 149 ]
+blocks 40 [ { "channel": 36, "cost": 30, "now": 20, "blotted_by": [ ], "members": [ 36, 40 ], "visits": 0 }, { "channel": 44, "cost": 8, "now": 8, "blotted_by": [ "ap-000000000001" ], "members": [ 44, 48 ], "visits": 0 } ]
+blocks 40 primary [ 149 ]
+blocks 2g [ [ 1 ], [ 6 ], [ 11 ] ]
+radar true false true false
+reason shared "shared"
+reason all used, further "shared"
+reason all used, not far enough null
+reason better "better"
+reason not by the margin null
+reason start "start"
+reason interference "interference"
+reason busy, nowhere better null
+reason free to shared null
+reason same block null
+first worse true
+first alike false true
+window [ 120, 300 ] [ 1350, 255 ] [ 489, 540 ] null
+in window true false true true false true false
+switch 2g 6 { "freq": 2437, "center_freq1": 2437, "bandwidth": 20, "sec_channel_offset": 0, "ht": true, "vht": false, "he": false, "bcn_count": 10 }
+switch 2g 11 he { "freq": 2462, "center_freq1": 2462, "bandwidth": 20, "sec_channel_offset": 0, "ht": true, "vht": false, "he": true, "bcn_count": 10 }
+switch 2g 11 40 { "freq": 2462, "center_freq1": 2452, "bandwidth": 40, "sec_channel_offset": -1, "ht": true, "vht": false, "he": false, "bcn_count": 10 }
+switch 2g 6 40 { "freq": 2437, "center_freq1": 2447, "bandwidth": 40, "sec_channel_offset": 1, "ht": true, "vht": false, "he": false, "bcn_count": 10 }
+switch 2g 7 40 { "freq": 2442, "center_freq1": 2432, "bandwidth": 40, "sec_channel_offset": -1, "ht": true, "vht": false, "he": false, "bcn_count": 10 }
+switch 5g 36 he40 { "freq": 5180, "center_freq1": 5190, "bandwidth": 40, "sec_channel_offset": 1, "ht": true, "vht": true, "he": true, "bcn_count": 10 }
+switch 5g 40 vht40 { "freq": 5200, "center_freq1": 5190, "bandwidth": 40, "sec_channel_offset": -1, "ht": true, "vht": true, "he": false, "bcn_count": 10 }
+switch 5g 157 vht80 { "freq": 5785, "center_freq1": 5775, "bandwidth": 80, "sec_channel_offset": 1, "ht": true, "vht": true, "he": false, "bcn_count": 10 }
+switch 5g 161 vht80 { "freq": 5805, "center_freq1": 5775, "bandwidth": 80, "sec_channel_offset": -1, "ht": true, "vht": true, "he": false, "bcn_count": 10 }
+switch 5g 165 40 { "freq": 5825, "center_freq1": 5835, "bandwidth": 40, "sec_channel_offset": 1, "ht": true, "vht": true, "he": true, "bcn_count": 10 }
+switch 5g 36 legacy { "freq": 5180, "center_freq1": 5180, "bandwidth": 20, "sec_channel_offset": 0, "ht": false, "vht": false, "he": false, "bcn_count": 10 }
+switch 6g 133 he80 { "freq": 6615, "center_freq1": 6625, "bandwidth": 80, "sec_channel_offset": -1, "ht": false, "vht": false, "he": true, "bcn_count": 10 }
+switch 6g 5 he80 { "freq": 5975, "center_freq1": 5985, "bandwidth": 80, "sec_channel_offset": -1, "ht": false, "vht": false, "he": true, "bcn_count": 10 }
+switch 6g 37 he160 { "freq": 6135, "center_freq1": 6185, "bandwidth": 160, "sec_channel_offset": -1, "ht": false, "vht": false, "he": true, "bcn_count": 10 }
+switch 6g 21 eht80 { "freq": 6055, "center_freq1": 6065, "bandwidth": 80, "sec_channel_offset": -1, "ht": false, "vht": false, "he": true, "bcn_count": 10, "eht": true }
+switch 6g 5 20 { "freq": 5975, "center_freq1": 5975, "bandwidth": 20, "sec_channel_offset": 0, "ht": false, "vht": false, "he": true, "bcn_count": 10 }
+switch 6g 5 320 null
+chan switch 52 he40 CHAN_SWITCH 10 5260 sec_channel_offset=1 center_freq1=5270 bandwidth=40 ht vht he
+chan switch 56 he40 CHAN_SWITCH 10 5280 sec_channel_offset=-1 center_freq1=5270 bandwidth=40 ht vht he
+chan switch 100 vht20 CHAN_SWITCH 10 5500 center_freq1=5500 bandwidth=20 ht vht
+chan switch 108 eht80 CHAN_SWITCH 10 5540 sec_channel_offset=1 center_freq1=5530 bandwidth=80 ht vht he eht
+chan switch 132 ht40 CHAN_SWITCH 10 5660 sec_channel_offset=1 center_freq1=5670 bandwidth=40 ht
+chan switch 6g 133 he80 CHAN_SWITCH 10 6615 sec_channel_offset=-1 center_freq1=6625 bandwidth=80 he
+power none heard { "step": 3, "why": "looking", "count": 0, "weakest": null }
+power two of three { "step": 3, "why": "looking", "count": 2, "weakest": -65 }
+power weakest low { "step": 3, "why": "below", "count": 3, "weakest": -74 }
+power at target { "step": 0, "why": "target", "count": 3, "weakest": -68 }
+power well above { "step": -3, "why": "above", "count": 3, "weakest": -62 }
+power near the ceiling { "step": 1, "why": "below", "count": 1, "weakest": -80 }
+power at the ceiling { "step": 0, "why": "ceiling", "count": 1, "weakest": -80 }
+power at the floor { "step": 0, "why": "floor", "count": 1, "weakest": -40 }
+power near the floor { "step": -2, "why": "above", "count": 1, "weakest": -40 }
+power ignores junk { "step": 0, "why": "target", "count": 2, "weakest": -66 }
+lonely [ { "mac": "aa:aa:aa:aa:aa:02", "signal": -75, "est": -82, "need": 10, "other": -73 }, { "mac": "24:58:7c:eb:b8:8c", "signal": -72, "est": -79, "need": 7, "other": null } ]
+lonely, one measured [ { "mac": "aa:aa:aa:aa:aa:02", "signal": -75, "est": -82, "need": 10, "other": -73 }, { "mac": "24:58:7c:eb:b8:8c", "signal": -72, "est": -60, "need": -12, "other": null, "measured": true } ]
+floor 10, at a ceiling of 10 10, none null
+fit: 6 heard, 25 hears, the last [ "aa:bb:cc:dd:ee:18", "2g", -64 ], within true
+fit 900: 6 heard, 11 hears, within true
+fit small: true
+distress none { "distress": false, "why": null, "scanning": 0, "left": 0, "ratio": [ 0.02, 0.02 ] }
+distress scanning { "distress": true, "why": "scanning", "scanning": 2, "left": 0, "ratio": [ 0.02, 0.02 ] }
+distress one scanning { "distress": false, "why": null, "scanning": 1, "left": 0, "ratio": [ 0.02, 0.02 ] }
+distress leaving { "distress": true, "why": "leaving", "scanning": 0, "left": 3, "ratio": [ 0.02, 0.02 ] }
+distress retries { "distress": true, "why": "retries", "scanning": 0, "left": 0, "ratio": [ 0.02, 0.222 ] }
+distress retries, too few sent { "distress": false, "why": null, "scanning": 0, "left": 0, "ratio": [ 0.02, null ] }
+distress retries, more than sent { "distress": true, "why": "retries", "scanning": 0, "left": 0, "ratio": [ 0.02, 1.0 ] }
+distress everywhere { "distress": false, "why": "everywhere", "scanning": 0, "left": 3, "ratio": [ 0.02, 0.02 ] }
+distress, the other calm { "distress": true, "why": "leaving", "scanning": 0, "left": 3, "ratio": [ 0.02, 0.02 ] }
+swept aps { "ap-2005b6df64e0 2g": -30, "ap-2005b6df64e0 5g": -44 }
+swept tails [ "05:b6:df:64:e2", "05:b6:df:64:e8" ]
+swept other { "bssid": "22:05:b6:df:64:e2", "ssid": "a 5 GHz network with the 2.4 GHz", "band": "5g", "channel": 36, "signal": -70 }
+swept other { "bssid": "5c:83:6c:d6:df:c0", "ssid": "Home Wi-Fi", "band": "2g", "channel": 1, "signal": -43 }
+swept other { "bssid": "5c:83:6c:d6:df:c2", "ssid": "caf??", "band": "2g", "channel": 8, "signal": 0 }
+swept networks { "5g 36": [ -70 ], "2g 1": [ -43 ], "2g 3": [ -60 ], "2g 8": [ 0 ] }
+around 2g 1 [ -43, -72 ]
+around 2g 6 [ -78, -12 ]
+around 2g 11 [ -18 ]
+around 5g 36 [ -70 ]
+around 5g 40 [ ]
+swept nothing { "aps": { }, "tails": [ ], "others": [ ], "networks": { } }
+beacon advert { "bssid": "30:86:2d:bc:a5:d0", "advert": { "ap": "ap-30862dbca5ff", "address": "192.168.1.73", "port": 16730 } }
+beacon without one null
+a probe response null
+cut short null
+nothing null
+the beacon filter [ [ 48, 0, 0, 3 ], [ 100, 0, 0, 8 ], [ 7, 0, 0, 0 ], [ 48, 0, 0, 2 ], [ 12, 0, 0, 0 ], [ 7, 0, 0, 0 ], [ 80, 0, 0, 0 ], [ 21, 0, 1, 128 ], [ 6, 0, 0, 1024 ], [ 6, 0, 0, 0 ] ]
+swept by advert { "ap-30862dbca5ff 2g": -7 }, tails [ "86:2d:bc:a5:d0" ], others 1
+printable "Home Wi-Fi" null null "???"
+dfs state 100 { "radar": true, "state": "usable", "cac": 60 }
+dfs state 104 { "radar": true, "state": "usable", "cac": 60 }
+dfs state 120 { "radar": true, "state": "usable", "cac": 600 }
+dfs state 132 { "radar": true, "state": "available", "cac": 60 }
+dfs state 136 { "radar": true, "state": "unavailable", "cac": 60 }
+dfs state 144 { "radar": false, "state": null, "cac": null }
+dfs states of nothing { }
+clear: free to check true, a long check false, radar found false, not allowed false
+clear: checked true, no radar there true, outside radar true, nothing known false
+shut { "5g 100": 1791782800, "5g 104": 1791782800, "5g 132": 1791696400 }
+barred: shut an hour ago true, at 80 MHz true, a day and an hour ago false, never false, outside radar false, another band false, nothing shut false
+fallback 36 44 149 null null null
+radar reason: better than both "better"
+radar reason: a free move does as well null
+radar reason: no better than where it is null
+radar reason: where it is is the best without one "better"
+radar reason: shared, and every other is too "shared"
+radar reason: shared, and another is free null
+radar reason: nowhere to go without one "better"
+radar reason: nothing null
+wanted a DFS block clearly best: plain null, far [ 100, "better" ]
+wanted both: plain [ 44, "better" ], far [ 100, "better" ]
+wanted a free move is as good: plain [ 44, "better" ], far null
+wanted the best is not DFS: plain [ 44, "better" ], far null
+wanted interference goes at once, not to DFS: plain [ 44, "interference" ], far null
+wanted just started: plain [ 44, "start" ], far null
+wanted on a DFS block, another clearly better: plain null, far [ 132, "better" ]
+wanted no DFS allowed: plain [ 44, "better" ], far null
+wanted nothing rated: plain null, far null
+left lately: an hour ago true, a day and an hour ago false, claimed only false, another band false, in a block true, nothing false
+wanted better, back where it left: plain null, far null
+wanted better, back where it left, and another better: plain [ 11, "better" ], far null
+wanted shared, back where it left: plain null, far null
+wanted better, not left: plain [ 11, "better" ], far null
+wanted interference, back where it left: plain [ 6, "interference" ], far null
+wanted just started, back where it left: plain [ 6, "start" ], far null
+wanted back where it left, no rule: plain [ 6, "better" ], far null
+blocks 40 visits [ 1, 0 ]
+load said { "busy": 23.4, "clients": 7.0, "retried": 0.123 }, stale null, no such band null, nothing null
+load heard { "busy": 23.4, "clients": 7, "retried": 0.1 }, out of range null, partly { "busy": null, "clients": 3, "retried": null }, junk null
+energy_of fresh { "149": 0.147, "153": 0.339, "44": 0.044 }
+energy_of 6g { "5": 0.09 }
+energy_of stale { }, ahead { }, none { }
+floor_of { "100": -107, "149": -106, "153": -104 }, stale { }
+followed { "clients": 4, "kept": 2, "back": 1, "gone": 1 }
+followed nothing { "clients": 0, "kept": 0, "back": 0, "gone": 0 } { "clients": 1, "kept": 0, "back": 0, "gone": 1 }
+allowed 40 [ 36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144, 149, 153, 157, 161 ]
+allowed 80 [ 36, 40, 44, 48, 149, 153, 157, 161 ], 20 [ 36, 40 ], 2.4 [ 1, 6, 11 ], 6 [ 1, 5, 9, 13, 17, 21, 25, 29 ], none null
+blocks a radio at 40 may go to [ 36, 44, 149, 157 ], best 44
+covers 6g [ 17, 21, 25, 29 ] [ 1, 5, 9, 13, 17, 21, 25, 29 ] [ 5 ] [ 5 ]
+visits 6g 160 [ 5975, 6055, 6135, 6215 ]
+visits 6g 80 [ 5975, 6055, 6135 ]
+blocks 6g 80 [ [ 5, 10, [ 1, 5, 9, 13 ] ], [ 21, 30, [ 17, 21, 25, 29 ] ], [ 37, 5, [ 33, 37, 41, 45 ] ] ]
+blocks 6g 160 [ [ 5, 30, [ 1, 5, 9, 13, 17, 21, 25, 29 ] ], [ 37, 5, [ 33, 37, 41, 45, 49, 53, 57, 61 ] ] ]
+blocks 6g 80 used [ [ 5, [ "ap-000000000001", "ap-000000000002" ] ], [ 21, [ "ap-000000000001" ] ], [ 37, [ ] ] ]
+blocks 6g 160 used [ [ 5, [ "ap-000000000001", "ap-000000000002" ] ], [ 37, [ ] ] ]
+blocks 6g 160 unrated [ 37 ]
+span 5g 157/40 [ 5775, 5815 ], 6g 5/160 [ 5945, 6105 ], 6g 37/160 [ 6105, 6265 ], 2g 6 [ 2427, 2447 ], none null
+too near at 250: 6g 5/160 by 5g 157/40 true, 6g 37/160 false, 5g 157/40 by 6g 5/160 true, 5g 36/40 by 6g 5/160 false
+never: at 0 false, at 100 false, one band false, 2.4 GHz false
+widen: to 36/160 { "to": { "channel": 36, "cost": 45, "blotted_by": [ ], "members": [ 36, 40 ], "visits": 2 }, "why": "wide" }
+widen: not among others null
+widen: not notably worse null
+widen: the best of two 100
+widen: none null null
+switch to 36/160 CHAN_SWITCH 5 5180 sec_channel_offset=1 center_freq1=5250 bandwidth=160 ht vht he
+switch back to 36/80 CHAN_SWITCH 5 5180 sec_channel_offset=1 center_freq1=5210 bandwidth=80 ht vht he

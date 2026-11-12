@@ -1,0 +1,53 @@
+#!/bin/sh
+# Rolls an agent update back (0079). The agent being replaced copies this
+# script, its own copy, to /tmp and starts it there, detached, just before it
+# installs the new bundle and restarts into it; so a broken bundle can't break
+# its own way back.
+#
+#	aeolus-rollback <bundle hash> [seconds]
+#
+# The new agent confirms itself once it has been up a while, reached the
+# manager, and every Aeolus instance runs: it clears the trial marker. If the
+# marker for this bundle is still there when the time is up, the files the
+# update replaced go back, the rollback is recorded for the old agent to
+# report, and the service restarts with the old agent.
+#
+# AEOLUS_DIR, AEOLUS_ROOT and AEOLUS_RESTART are for its tests: the agent's
+# directory, the root the files go back under, and how to restart.
+hash=$1 wait=${2:-180}
+dir=${AEOLUS_DIR:-/etc/aeolus}
+root=${AEOLUS_ROOT:-}
+# rpcd's rc object restarts the service: rpcd runs the init script in its
+# own service. Where there is none, the init script, run from here, out of
+# the agent's service (below).
+restart_agent() {
+	ubus call rc init '{"name":"aeolus","action":"restart"}' >/dev/null 2>&1 ||
+		/etc/init.d/aeolus restart
+}
+restart=${AEOLUS_RESTART:-restart_agent}
+case $hash in *[!0-9a-f]* | "") exit 2 ;; esac
+
+# Started by the agent, this runs in the agent's procd service, and on
+# OpenWrt main (cgroups) the restart into the new agent kills every process
+# in it: out of it first, or nothing is left to roll back.
+grep -q ':/services/' /proc/$$/cgroup 2>/dev/null &&
+	echo $$ >/sys/fs/cgroup/cgroup.procs 2>/dev/null
+
+sleep "$wait"
+[ -f "$dir/agent.trial" ] || exit 0
+grep -qx "hash=$hash" "$dir/agent.trial" || exit 0
+version=$(sed -n 's/^version=//p' "$dir/agent.trial" | tr -cd 'A-Za-z0-9._-')
+if command -v logger >/dev/null; then
+	logger -t aeolus "agent $version did not confirm itself within $wait s; putting the old one back"
+fi
+
+# Each backed-up file goes back where it was, with its mode.
+if [ -d "$dir/agent.prev" ]; then
+	(cd "$dir/agent.prev" && find . -type f) | while read -r f; do
+		cp -p "$dir/agent.prev/${f#./}" "$root/${f#./}"
+	done
+fi
+printf '{"hash":"%s","version":"%s","state":"rolled-back","why":"it did not confirm itself within %s s","at":%s}\n' \
+	"$hash" "$version" "$wait" "$(date +%s)" >"$dir/agent.result"
+rm -f "$dir/agent.trial"
+$restart

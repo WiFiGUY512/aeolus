@@ -1,0 +1,10 @@
+builds in the agent: { "libubox.so": [ "20260721", "20261103" ], "libucode.so": [ "20261009" ] }
+two: agent true, fine false, nothing false
+{ "lib": "libblobmsg_json.so", "builds": [ "20260721", "20261103" ], "procs": [ "usteerd" ] }
+{ "lib": "libubox.so", "builds": [ "20260721", "20261103" ], "procs": [ "aeolus-agent", "usteerd", "ustpd" ] }
+none: [ ]
+name of "/usr/bin/ucode\u0000-S\u0000/usr/sbin/aeolus-agent\u0000keys\u0000": "aeolus-agent"
+name of "/sbin/ustpd\u0000": "ustpd"
+name of "/usr/sbin/hostapd\u0000-s\u0000-g\u0000/var/run/hostapd/global\u0000": "hostapd"
+name of "": null
+name of null: null

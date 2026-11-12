@@ -1,0 +1,105 @@
+{
+	"about": "An Arista C-360 whose network that goes off the air when lost (0201) has moved from VLAN 30 to VLAN 99, while another network stays on VLAN 30: the VLAN 30 probe goes, though the bridge-vlan of the same name stays for the other network.",
+	"current": "c360-current.json",
+	"facts": {
+		"uplink": "eth0",
+		"radios": {
+			"radio0": {
+				"htmodes": [
+					"HE20",
+					"HE40",
+					"HE80",
+					"HE160"
+				]
+			},
+			"radio1": {
+				"htmodes": [
+					"HE20",
+					"HE40"
+				]
+			},
+			"radio3": {
+				"htmodes": [
+					"HE20",
+					"HE40",
+					"HE80",
+					"HE160"
+				]
+			}
+		}
+	},
+	"intent": {
+		"system": {
+			"country": "US",
+			"poll": 60
+		},
+		"rrm": {
+			"enabled": true
+		},
+		"radio": {
+			"2g": {
+				"enabled": true,
+				"channel": 6,
+				"width": 20
+			},
+			"5g": {
+				"enabled": true,
+				"channel": 36,
+				"width": 80
+			},
+			"6g": {
+				"enabled": true,
+				"channel": 37,
+				"width": 80
+			}
+		},
+		"network": {
+			"home": {
+				"ssid": "Aeolus Home",
+				"security": "wpa2-psk",
+				"passphrase": "fixture-passphrase-2",
+				"transport": {
+					"primary": {
+						"type": "vlan",
+						"vlan": 30
+					}
+				}
+			},
+			"lab": {
+				"ssid": "Aeolus Lab",
+				"security": "wpa3-sae",
+				"passphrase": "fixture-passphrase-1",
+				"transport": {
+					"primary": {
+						"type": "vlan",
+						"vlan": 99
+					},
+					"down_when_lost": true
+				}
+			}
+		}
+	},
+	"kept": [
+		"network.aeolus_vlan30",
+		"aeolus.aeolus_vlan99",
+		"aeolus.aeolus_rrm"
+	],
+	"gone": [
+		"aeolus.aeolus_vlan30",
+		"wireless.aeolus_lab_radio2"
+	],
+	"extra": {
+		"aeolus": {
+			"aeolus_vlan30": {
+				".anonymous": false,
+				".type": "probe",
+				".name": "aeolus_vlan30",
+				".index": 98,
+				"vlan": "30",
+				"device": "eth0",
+				"tagged": "1",
+				"interval": "30"
+			}
+		}
+	}
+}

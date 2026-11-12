@@ -1,0 +1,3220 @@
+// Package rendercheck decides whether the UCI an AP rendered carries its
+// intent (0008, 0039): the manager's half of the render check. What it
+// checks is the rendering contract the agent is written against.
+//
+// Aeolus names what it renders, so the check knows what to look at: each
+// network's wifi-iface is aeolus_<network>_<radio>. Sections without that
+// prefix are not judged, except radios, which carry the Location settings.
+package rendercheck
+
+import (
+	"cmp"
+	"fmt"
+	"hash/fnv"
+	"maps"
+	"regexp"
+	"slices"
+	"sort"
+	"strconv"
+	"strings"
+
+	"github.com/WiFiGUY512/aeolus/internal/radio"
+	"github.com/WiFiGUY512/aeolus/internal/schema"
+	"github.com/WiFiGUY512/aeolus/internal/uci"
+)
+
+// folded says why a kind of AP's own settings (0092) are not checked as
+// they are: the manager folds them into the AP's plain ones, which are.
+const folded = "not sent to APs as it is: the manager folds a kind of AP's settings into its APs' plain ones (0092)"
+
+// Coverage says how the render check covers every field of the v1 schema:
+// "" means it is checked; anything else says why not yet. "*" stands for any
+// one name. A test holds it to the schema, so no field is left out unnoticed.
+var Coverage = map[string]string{
+	"radio.*.enabled":    "",
+	"radio.*.channel":    "",
+	"radio.*.width":      "",
+	"radio.*.power":      "",
+	"radio.*.dfs":        "",
+	"radio.*.compatible": "",
+	"radio.*.channels":   "",
+	"radio.*.psc":        "",
+
+	"radio.*.non_overlapping": "",
+	"radio.*.modes":           "",
+	"radio.*.short_gi":        "",
+	"radio.*.he_gi":           "",
+	"radio.*.min_signal":      "",
+	"radio.*.beacon_interval": "",
+	"radio.*.twt":             "",
+	"radio.*.bss_color":       "",
+	"radio.*.beamformer":      "",
+	"radio.*.beamformee":      "",
+	"radio.*.mu_mimo":         "",
+
+	"system.country":               "",
+	"system.captures":              "",
+	"system.ble_proxy":             "",
+	"system.internet":              "",
+	"system.tz":                    "",
+	"system.ntp":                   "",
+	"system.syslog":                "",
+	"system.poll":                  "",
+	"system.speed_server":          "not in UCI: the manager gives it to an AP with a client test (0121)",
+	"system.speed_server_remote":   "not in UCI: the manager gives it to an AP with a client test (0134)",
+	"system.agent":                 "not in UCI: each poll's Aeolus-Agent header names the bundle the AP runs (0079)",
+	"system.ssh_keys":              "kept in dropbear's authorized_keys by the agent (0197), not UCI",
+	"system.dns_log.url":           "not in UCI, and not sent to an AP: the manager asks the DNS server's log itself (0154)",
+	"system.dns_log.token":         "not in UCI, and not sent to an AP: the manager asks the DNS server's log itself (0154)",
+	"system.switches.addresses":    "not in UCI, and not sent to an AP: the manager reads the switches itself (0168)",
+	"system.switches.user":         "not in UCI, and not sent to an AP: the manager reads the switches itself (0168)",
+	"system.switches.password":     "not in UCI, and not sent to an AP: the manager reads the switches itself (0168)",
+	"system.place.address":         "not in UCI, and not sent to an AP: only the manager's map draws it (0169)",
+	"system.place.latitude":        "not in UCI, and not sent to an AP: only the manager's map draws it (0169)",
+	"system.place.longitude":       "not in UCI, and not sent to an AP: only the manager's map draws it (0169)",
+	"system.management.vlan":       layout,
+	"system.management.addressing": layout,
+	"system.management.address":    layout,
+	"system.management.gateway":    layout,
+	"system.management.dns":        layout,
+
+	"ports.*.enabled":  "",
+	"ports.*.speed":    "",
+	"uplink.stp":       "",
+	"uplink.bond":      "",
+	"ports.*.uplink":   "the agent's own setting (0040), not the intent's",
+	"ports.*.mode":     "",
+	"ports.*.untagged": "",
+	"ports.*.tagged":   "",
+	"ports.*.bond":     "LACP is not applied yet; the config check holds it (0053)",
+
+	"ports.*.vxlan.*.tunnel": "",
+	"ports.*.vxlan.*.vni":    "",
+	"ports.*.vxlan.*.probe":  "",
+
+	"concentrators.*.bridged.*.vni": "",
+
+	"network.*.enabled":                   "",
+	"network.*.test":                      "",
+	"network.*.ssid":                      "",
+	"network.*.hidden":                    "",
+	"network.*.bands":                     "",
+	"network.*.security":                  "",
+	"network.*.passphrase":                "",
+	"network.*.isolation":                 "",
+	"network.*.max_clients":               "",
+	"network.*.blocked":                   "",
+	"network.*.replace_own":               "what it takes out is the AP's own, of which the check has no say; the agent's render tests have it (0137)",
+	"network.*.dtim":                      "",
+	"network.*.radius.auth_server":        "",
+	"network.*.radius.auth_port":          "",
+	"network.*.radius.auth_secret":        "",
+	"network.*.radius.acct_server":        "",
+	"network.*.radius.acct_port":          "",
+	"network.*.radius.acct_secret":        "",
+	"network.*.radius.nas_id":             "",
+	"network.*.radius.mac_auth":           "",
+	"network.*.radius.passphrases":        "",
+	"network.*.radius.vlans":              "",
+	"network.*.radius.vlan_required":      "",
+	"network.*.radius.das.client":         "",
+	"network.*.radius.das.secret":         "",
+	"network.*.radius.das.port":           "",
+	"network.*.alert_after":               "not sent to APs: the manager's, for its alerts (0182)",
+	"network.*.dhcp_servers":              "not sent to APs: the manager's, for its alerts (0160)",
+	"network.*.radius.test.user":          "not in UCI: the manager hands it to an AP with a client test (0124)",
+	"network.*.radius.test.password":      "not in UCI: the manager hands it to an AP with a client test (0124)",
+	"network.*.radius.test.method":        "not in UCI: the manager hands it to an AP with a client test (0124)",
+	"network.*.keys.vlans":                "",
+	"network.*.roaming.ft":                "",
+	"network.*.roaming.rrm":               "",
+	"network.*.roaming.btm":               "",
+	"network.*.multicast_to_unicast":      "",
+	"network.*.disassoc_low_ack":          "",
+	"network.*.transition_disable":        "",
+	"network.*.pmf":                       "",
+	"network.*.band_steering":             "",
+	"network.*.steering.suggest":          "",
+	"network.*.steering.community":        "",
+	"network.*.steering.keep_6g":          "",
+	"network.*.steering.hold_back":        "",
+	"network.*.steering.sticky":           "",
+	"network.*.steering.sticky_signal":    "",
+	"network.*.steering.sticky_margin":    "",
+	"network.*.steering.sticky_floor":     "",
+	"network.*.steering.sticky_hold_down": "",
+	"network.*.steering.sticky_scan":      "",
+	"system.snmp.enabled":                 "",
+	"system.snmp.community":               "",
+	"system.snmp.v3.user":                 "",
+	"system.snmp.v3.auth":                 "",
+	"system.snmp.v3.privacy":              "",
+	"system.snmp.location":                "",
+	"system.snmp.contact":                 "",
+	"network.*.rate_limit.down_kbps":      "no standard UCI form; the agent's own setting, checked with it in M5",
+	"network.*.rate_limit.up_kbps":        "no standard UCI form; the agent's own setting, checked with it in M5",
+	"network.*.transport.*.type":          "",
+	"network.*.transport.*.vlan":          "",
+	"network.*.transport.*.concentrator":  "",
+	"network.*.transport.*.vni":           "",
+	"network.*.transport.*.probe":         "", // a VLAN transport's is not used until switching (0059)
+	"network.*.transport.switching":       "", // the prober's plan (0061)
+	"network.*.transport.ha":              "",
+	"network.*.transport.failback":        "",
+	"network.*.transport.holddown":        "",
+	"network.*.transport.down_when_lost":  "", // the prober's plan (0201)
+
+	"concentrators.*.address":         "",
+	"concentrators.*.port":            "",
+	"templates.*":                     "not sent to APs: the manager applies the AP's template (0085)",
+	"notify.ntfy":                     "not sent to APs: the manager sends alerts (0101)",
+	"maintenance.on":                  "not sent to APs: the manager holds alerts (0218)",
+	"maintenance.until":               "not sent to APs: the manager holds alerts (0218)",
+	"maintenance.why":                 "not sent to APs: the manager holds alerts (0218)",
+	"maintenance.hold":                "", // a test window (0344): k.hold, as the manager sends it in hold, with until and why
+	"homes.*.aps":                     "", // where a client belongs (0319): k.steer, as homeEntries has it
+	"homes.*.bands":                   "",
+	"homes.*.hold":                    "",
+	"homes.*.nearest":                 "",
+	"notify.webhook":                  "not sent to APs: the manager sends alerts (0101)",
+	"notify.severity":                 "not sent to APs: the manager sends alerts (0101)",
+	"notify.resolved":                 "not sent to APs: the manager sends alerts (0101)",
+	"rogues.known":                    "not sent to APs: the manager tells rogues (0106)",
+	"system.updates.automatic":        "not sent to APs: the manager's own releases (0183)",
+	"system.updates.window":           "not sent to APs: the manager's own releases (0183)",
+	"system.updates.channel":          "not sent to APs: the manager's own releases (0282)",
+	"system.advisor.enabled":          "not sent to APs: the manager's advisor (0205)",
+	"system.advisor.key":              "not sent to APs: the manager's advisor (0205)",
+	"system.advisor.model":            "not sent to APs: the manager's advisor (0205)",
+	"system.advisor.every":            "not sent to APs: the manager's advisor (0205)",
+	"system.advisor.web":              "not sent to APs: the manager's advisor (0205)",
+	"system.advisor.budget":           "not sent to APs: the manager's advisor (0205)",
+	"assurance.tests.every":           "not sent to APs: the manager asks the tests (0123)",
+	"test_network.network":            "",
+	"test_network.until":              "",
+	"assurance.tests.speed":           "not sent to APs: the manager asks the tests (0123)",
+	"assurance.tests.speed_remote":    "not sent to APs: the manager asks the tests (0134)",
+	"assurance.tests.wire":            "not sent to APs: the manager asks the tests (0128)",
+	"assurance.tests.over":            "not sent to APs: the manager asks the tests (0131)",
+	"assurance.tests.roam":            "not sent to APs: the manager asks the tests (0225)",
+	"assurance.tests.bands":           "not sent to APs: the manager asks the tests (0181)",
+	"assurance.tests.window":          "not sent to APs: the manager asks the tests (0181)",
+	"assurance.tests.windows":         "not sent to APs: the manager asks the tests (0188)",
+	"assurance.tests.until":           "not sent to APs: the manager asks the tests (0188)",
+	"assurance.tests.per_hour":        "not sent to APs: the manager asks the tests (0182)",
+	"assurance.tests.alert_after":     "not sent to APs: the manager asks the tests (0182)",
+	"assurance.tests.paused":          "not sent to APs: the manager asks the tests (0180)",
+	"assurance.tests.networks":        "not sent to APs: the manager asks the tests (0180)",
+	"assurance.tests.leave_out":       "not sent to APs: the manager asks the tests (0180)",
+	"assurance.tests.on":              "not sent to APs: the manager asks the tests (0180)",
+	"assurance.tests.listed":          "not sent to APs: the manager asks the tests (0180)",
+	"assurance.tests.floor":           "not sent to APs: the manager asks the tests (0180)",
+	"assurance.tests.max_clients":     "not sent to APs: the manager asks the tests (0180)",
+	"assurance.tests.max_busy":        "not sent to APs: the manager asks the tests (0180)",
+	"boards.*.ports.*.enabled":        folded,
+	"boards.*.ports.*.speed":          folded,
+	"boards.*.uplink.stp":             folded,
+	"boards.*.uplink.bond":            folded,
+	"boards.*.ports.*.uplink":         folded,
+	"boards.*.ports.*.mode":           folded,
+	"boards.*.ports.*.untagged":       folded,
+	"boards.*.ports.*.tagged":         folded,
+	"boards.*.ports.*.bond":           folded,
+	"boards.*.ports.*.vxlan.*.tunnel": folded,
+	"boards.*.ports.*.vxlan.*.vni":    folded,
+	"boards.*.ports.*.vxlan.*.probe":  folded,
+
+	"concentrators.*.mtu":            "",
+	"concentrators.*.probe_interval": "",
+	"concentrators.*.underlay_vlan":  "",
+
+	"rrm.enabled": "",
+	"rrm.moves":   "",
+	"rrm.window":  "",
+	"rrm.margin":  "",
+	"rrm.apart":   "",
+
+	"apc.enabled":      "",
+	"apc.neighbours":   "",
+	"apc.target":       "",
+	"apc.clients":      "",
+	"apc.hold":         "",
+	"apc.client_floor": "",
+}
+
+const layout = "depends on the device's port layout; checked with the agent in M5"
+
+// encryption is the UCI encryption for each security mode. A cipher suffix
+// ("psk2+ccmp") is accepted.
+var encryption = map[string]string{
+	"open":      "none",
+	"owe":       "owe",
+	"wpa2-psk":  "psk2",
+	"wpa3-sae":  "sae",
+	"wpa2-wpa3": "sae-mixed",
+	// WPA Enterprise, 802.1X against a RADIUS server (0098).
+	"wpa2-enterprise":      "wpa2",
+	"wpa3-enterprise":      "wpa3",
+	"wpa2-wpa3-enterprise": "wpa3-mixed",
+}
+
+var needsKey = map[string]bool{"wpa2-psk": true, "wpa3-sae": true, "wpa2-wpa3": true}
+
+// IfaceName is the wifi-iface Aeolus renders for a network on a radio.
+func IfaceName(network, dev string) string {
+	return "aeolus_" + strings.ReplaceAll(network, "-", "_") + "_" + dev
+}
+
+// InterfaceName is a network's interface, which its wifi-ifaces join.
+func InterfaceName(network string) string {
+	return "aeolus_" + strings.ReplaceAll(network, "-", "_")
+}
+
+// TunnelName is the interface of the VXLAN tunnel for a VNI, and so its
+// Linux device: at most 15 characters for every VNI (0054).
+func TunnelName(vni string) string {
+	return "aeolus_" + vni
+}
+
+// The clamp's firewall include, and the file the agent makes for it (0054).
+const (
+	clampInclude = "aeolus_clamp"
+	clampPath    = "/etc/aeolus/clamp.nft"
+)
+
+// StartInterface is the interface tunnels start from on a VLAN of the
+// uplink (0063). Its routes are in table StartTable plus the VLAN, and it is
+// in the firewall zone StartZone.
+func StartInterface(vlan int) string {
+	return fmt.Sprintf("aeolus_vlan%d_tunnels", vlan)
+}
+
+const (
+	StartTable = 1000
+	StartZone  = "aeolus_ul"
+)
+
+// startSection names the interfaces StartInterface makes.
+var startSection = regexp.MustCompile(`^aeolus_vlan[0-9]+_tunnels$`)
+
+// NetHash names a network's own bridge and veth pairs (0061): FNV-1a of its
+// name, as 8 hex digits, as the agent makes it.
+func NetHash(id string) string {
+	h := fnv.New32a()
+	h.Write([]byte(id))
+	return fmt.Sprintf("%08x", h.Sum32())
+}
+
+// VLANEnd is the VLAN end of a network's veth pair, which Aeolus puts in the
+// uplink's bridge (0061): av, p or f for the slot, and the network's hash.
+var VLANEnd = regexp.MustCompile(`^av[pf][0-9a-f]{8}$`)
+
+type checker struct {
+	c         *uci.Config
+	ap        string // the AP's ID, or "" to leave its segment MACs unchecked
+	problems  []string
+	noNet     bool         // "package network is missing" was said
+	starts    map[int]bool // the VLANs whose start interface was checked (0063)
+	plans     []string     // the prober's plans for networks with a fallback (0061)
+	downPlans []string     // and for networks that go off the air when lost (0201)
+}
+
+func (k *checker) add(format string, args ...any) {
+	k.problems = append(k.problems, fmt.Sprintf(format, args...))
+}
+
+// Check returns every way the rendered UCI fails to carry the composed
+// config doc (compose.AP, secrets opened). It never quotes a secret.
+func Check(doc map[string]any, c *uci.Config) []string {
+	return CheckAP(doc, c, "")
+}
+
+// CheckAP is Check for one AP, by its ID, from which it renders the MACs it
+// uses on the segments it probes (0060): those are checked too.
+func CheckAP(doc map[string]any, c *uci.Config, ap string) []string {
+	k := &checker{c: c, ap: ap}
+	radios := k.radios(doc)
+	k.radioSettings(doc, radios)
+	k.networks(doc, radios)
+	k.system(obj(doc, "system"))
+	k.hostname(obj(doc, "ap"))
+	k.agent(obj(doc, "system"))
+	k.steering()
+	k.steer(obj(doc, "network"), obj(doc, "homes"))
+	k.snmp(obj(obj(doc, "system"), "snmp"))
+	k.ports(obj(doc, "ports"), obj(doc, "concentrators"))
+	k.bridged(obj(doc, "concentrators"))
+	k.downs(doc)
+	k.probes(doc)
+	look, wide := false, ""
+	for _, r := range radios {
+		look = look || r.band == "5g" && dfsWay(doc, r) == radio.DFSLook
+		set5 := obj(obj(doc, "radio"), "5g")
+		if w, ok := set5["width"].(float64); ok && r.band == "5g" && int(w) == 160 && htWidth(r.s) < 160 && startWidth(doc, r, set5, 160) < 160 {
+			wide = "160"
+		}
+	}
+	k.rrm(obj(doc, "rrm"), obj(doc, "apc"), look, wide)
+	k.hold(obj(doc, "hold"))
+	k.stp(obj(doc, "uplink"))
+	k.bond(obj(doc, "uplink"))
+	k.guardInterval(obj(doc, "radio"), radios)
+	k.radioPower(obj(doc, "radio"), radios)
+	k.radiosOff(obj(doc, "radio"), radios)
+	k.captures(obj(doc, "system"))
+	k.ble(obj(doc, "system"))
+	k.internet(obj(doc, "system"))
+	sort.Strings(k.problems)
+	if k.problems == nil {
+		return []string{}
+	}
+	return k.problems
+}
+
+type device struct {
+	band string
+	s    *uci.Section
+}
+
+// Reserved says another service on the AP owns a radio, which Aeolus leaves
+// alone (0081), as the agent does: airscan marks the dedicated scan radio it
+// takes out of netifd's hands with option airscan '1'.
+func Reserved(d *uci.Section) bool {
+	v, _ := d.Option("airscan")
+	return v == "1"
+}
+
+// scanRadio says the AP has a radio another service owns, a scan radio that
+// serves no clients (0081).
+func (k *checker) scanRadio() bool {
+	if w := k.c.Package("wireless"); w != nil {
+		for _, d := range w.OfType("wifi-device") {
+			if Reserved(d) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// radios lists the AP's radios in name order, but those another service
+// owns (0081), and checks that the wireless package is there if anything
+// needs it.
+func (k *checker) radios(doc map[string]any) []device {
+	w := k.c.Package("wireless")
+	if w == nil {
+		if doc["radio"] != nil || doc["network"] != nil {
+			k.add("package wireless is missing")
+		}
+		return nil
+	}
+	var out []device
+	for _, d := range w.OfType("wifi-device") {
+		band, _ := d.Option("band")
+		if d.Name == "" {
+			k.add("wireless: the wifi-device at line %d has no name", d.Line)
+			continue
+		}
+		if Reserved(d) {
+			continue
+		}
+		out = append(out, device{band: band, s: d})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].s.Name < out[j].s.Name })
+	return out
+}
+
+// auto2g are the channels an automatic 2.4 GHz radio picks from where no
+// set is given: the three that do not overlap at 20 MHz (0045).
+var auto2g = []int{1, 6, 11}
+
+var htmodeRE = regexp.MustCompile(`^(NOHT|HT|VHT|HE|EHT)([0-9]*)$`)
+
+// autoChannels are the channels an automatic channel may be, as UCI lists
+// them (0075): the set's, at the radio's width, in whole blocks; unset, on
+// 2.4 GHz, 1, 6 and 11, and on 5 GHz every channel, 36–177. On 5 GHz,
+// channel compatibility, on unless turned off, leaves out the upper ones,
+// 165–177 (0232). On 6 GHz, and on 2.4 GHz, they may be kept to those that
+// do not overlap (0087, 0117).
+func autoChannels(r device, set map[string]any) []string {
+	psc := r.band == "6g" && set["psc"] == true // preferred scanning channels only (0087)
+	spread := (r.band == "6g" || r.band == "2g") && set["non_overlapping"] == true
+	chans := baseChannels(r, set)
+	if chans == nil {
+		return nil
+	}
+	var out []string
+	for _, c := range radio.Usable(r.band, chans, htWidth(r.s), false, psc, spread) {
+		out = append(out, strconv.Itoa(c))
+	}
+	return out
+}
+
+// baseChannels are the channels an automatic channel on r's band may be
+// before its width is applied: the set, or the band's own; on 5 GHz,
+// without the upper channels while compatibility is on (0232).
+func baseChannels(r device, set map[string]any) []int {
+	list, ok := set["channels"].([]any)
+	psc := r.band == "6g" && set["psc"] == true
+	spread := (r.band == "6g" || r.band == "2g") && set["non_overlapping"] == true
+	var chans []int
+	switch {
+	case ok:
+		for _, c := range list {
+			if f, ok := c.(float64); ok {
+				chans = append(chans, int(f))
+			}
+		}
+	case r.band == "2g":
+		chans = auto2g
+	case psc || spread:
+		chans = radio.Channels6
+	case r.band == "5g":
+		chans = radio.Channels5
+	default:
+		return nil
+	}
+	if r.band == "5g" && set["compatible"] != false {
+		chans = radio.Compatible5(chans)
+	}
+	return chans
+}
+
+// startWidth is the width the radio r, set to width, starts at (0329), as
+// the agent works it out: on 5 GHz, radio.StartWidth, from radio.5g.dfs,
+// whether its channel is automatic (as set, or as rendered where it is
+// not), whether radio resource management moves radios, and its set.
+func startWidth(doc map[string]any, r device, set map[string]any, width int) int {
+	if r.band != "5g" {
+		return width
+	}
+	v, _ := set["dfs"].(string)
+	auto := set["channel"] == "auto"
+	if _, ok := set["channel"]; !ok {
+		c := value(r.s, "channel")
+		auto = c == "" || c == "auto"
+	}
+	rrm := obj(doc, "rrm")
+	return radio.StartWidth(v, width, auto, rrm["enabled"] == true && rrm["moves"] != false, baseChannels(r, set))
+}
+
+// apart6 keeps, of an automatic 6 GHz radio's channels, those whose
+// block's lower edge is rrm.apart MHz (250 unless set) or more over the
+// highest its own 5 GHz radio may use, as the renderer does (0327): that
+// radio's channel's block, or its list's highest. All of them where that
+// would leave none, or where there is no 5 GHz radio or list.
+func apart6(want []string, r device, radios []device, doc map[string]any) []string {
+	apart := 250
+	if v, ok := obj(doc, "rrm")["apart"].(float64); ok {
+		apart = int(v)
+	}
+	i := slices.IndexFunc(radios, func(d device) bool { return d.band == "5g" })
+	if apart == 0 || len(want) == 0 || i < 0 {
+		return want
+	}
+	five := []string{value(radios[i].s, "channel")}
+	if five[0] == "" || five[0] == "auto" {
+		five = radios[i].s.List("channels")
+	}
+	top := 0
+	for _, c := range five {
+		if n, err := strconv.Atoi(c); err == nil {
+			if _, hi := radio.Edges("5g", n, htWidth(radios[i].s)); hi > top {
+				top = hi
+			}
+		}
+	}
+	if top == 0 {
+		return want
+	}
+	var kept []string
+	for _, c := range want {
+		if n, err := strconv.Atoi(c); err == nil {
+			if lo, _ := radio.Edges("6g", n, htWidth(r.s)); lo >= top+apart {
+				kept = append(kept, c)
+			}
+		}
+	}
+	if len(kept) == 0 {
+		return want
+	}
+	return kept
+}
+
+// htWidth is the width a radio's htmode says, 20 where it says none.
+func htWidth(s *uci.Section) int {
+	w := 20
+	if m := htmodeRE.FindStringSubmatch(value(s, "htmode")); m != nil && m[2] != "" {
+		w, _ = strconv.Atoi(m[2])
+	}
+	return w
+}
+
+func (k *checker) radioSettings(doc map[string]any, radios []device) {
+	country, hasCountry := obj(doc, "system")["country"].(string)
+	for _, r := range radios {
+		where := "wireless." + r.s.Name
+		if hasCountry {
+			k.option(where, r.s, "country", country)
+		}
+		set := obj(obj(doc, "radio"), r.band)
+		// On 5 GHz hostapd keeps the primary it is given: its overlap scan,
+		// which swaps the primary and the secondary, is off (0243). Every
+		// AP's doc sets its 5 GHz radio, where it has one.
+		if r.band == "5g" && len(set) > 0 {
+			k.option(where, r.s, "noscan", "1")
+		}
+		if v, ok := set["enabled"].(bool); ok && r.s.Flag("disabled") == v {
+			k.add("%s: radio.%s.enabled is %v, but disabled is %q", where, r.band, v, value(r.s, "disabled"))
+		}
+		if v, ok := set["channel"]; ok {
+			// A channel set is its block's primary at the width (0243).
+			ch := text(v)
+			if f, ok := v.(float64); ok {
+				ch = strconv.Itoa(radio.Primary(r.band, int(f), htWidth(r.s)))
+			}
+			k.option(where, r.s, "channel", ch)
+			var want []string
+			if v == "auto" {
+				want = autoChannels(r, set)
+				if r.band == "6g" {
+					want = apart6(want, r, radios, doc)
+				}
+			}
+			if got := r.s.List("channels"); !slices.Equal(got, want) {
+				k.add("%s: channels is %q, want %q", where, got, want)
+			}
+		}
+		if v, ok := set["width"].(float64); ok {
+			m := htmodeRE.FindStringSubmatch(value(r.s, "htmode"))
+			width := ""
+			if m != nil {
+				width = m[2]
+				if m[1] == "NOHT" {
+					width = "20"
+				}
+			}
+			// At 160 MHz with DFS allowed it may start narrower (0329),
+			// where the AP's hostapd can switch it to 160, which this
+			// check cannot see: either is right. It never asks for its
+			// 160 MHz capability (vht160): a radio at 80 MHz that says it
+			// drops some clients' uplink (openwrt#22435).
+			want := startWidth(doc, r, set, int(v))
+			if x := value(r.s, "vht160"); x != "" {
+				k.add("%s: vht160 is %q, want none: hostapd adds the capability as it switches to 160 MHz (0329)", where, x)
+			}
+			switch {
+			case width == text(v):
+			case width == strconv.Itoa(want):
+			case want != int(v):
+				k.add("%s: htmode is %q, want a %v MHz mode, or %d MHz where it starts narrower", where, value(r.s, "htmode"), v, want)
+			default:
+				k.add("%s: htmode is %q, want a %v MHz mode", where, value(r.s, "htmode"), v)
+			}
+		}
+		// A power set, or auto, is none of netifd's: the agent holds a set
+		// one with iw (0349), which k.radioPower judges.
+		switch set["power"].(type) {
+		case string: // auto
+			if p, ok := r.s.Option("txpower"); ok {
+				k.add("%s: txpower is %q, want none for auto", where, p)
+			}
+		case float64:
+			if p, ok := r.s.Option("txpower"); ok {
+				k.add("%s: txpower is %q, want none: the agent holds a set power with iw (0349)", where, p)
+			}
+		}
+		// Admission and beacons (0097).
+		switch v := set["min_signal"].(type) {
+		case string: // off
+			if got, ok := r.s.Option("rssi_reject_assoc_rssi"); ok && got != "0" {
+				k.add("%s: rssi_reject_assoc_rssi is %q, want none for radio.%s.min_signal off", where, got, r.band)
+			}
+		case float64:
+			k.option(where, r.s, "rssi_reject_assoc_rssi", text(v))
+		}
+		if v, ok := set["beacon_interval"].(float64); ok {
+			k.option(where, r.s, "beacon_int", text(v))
+		}
+		// Target wake time (0191), the radio's for all its networks.
+		// Unset, these switches are OpenWrt's default: no option (0196).
+		k.switchOption(where, r.s, "he_twt_responder", set["twt"])
+		// BSS color (0192): off, none; auto, OpenWrt's 128, a random one
+		// at each start; else that one.
+		switch v := set["bss_color"].(type) {
+		case string:
+			if v == "off" {
+				k.option(where, r.s, "he_bss_color_enabled", "0")
+			} else {
+				k.option(where, r.s, "he_bss_color_enabled", "1")
+				k.option(where, r.s, "he_bss_color", "128")
+			}
+		case float64:
+			k.option(where, r.s, "he_bss_color_enabled", "1")
+			k.option(where, r.s, "he_bss_color", text(v))
+		case nil:
+			k.absent(where, r.s, "he_bss_color_enabled")
+			k.absent(where, r.s, "he_bss_color")
+		}
+		// Beamforming (0195): each switch in every generation hostapd
+		// has it for, 802.11ac at 5 GHz only; MU-MIMO off with the
+		// beamformer.
+		gens := []string{"he_", "eht_"}
+		if r.band == "5g" {
+			gens = append([]string{""}, gens...)
+		}
+		mu := set["mu_mimo"]
+		if set["beamformer"] == false {
+			mu = false
+		}
+		for _, g := range gens {
+			k.switchOption(where, r.s, g+"su_beamformer", set["beamformer"])
+			k.switchOption(where, r.s, g+"su_beamformee", set["beamformee"])
+			k.switchOption(where, r.s, g+"mu_beamformer", mu)
+		}
+		if r.band == "5g" {
+			if msg := bonding(value(r.s, "channel"), value(r.s, "htmode")); msg != "" {
+				k.add("%s: %s", where, msg)
+			}
+		}
+		if r.band == "5g" {
+			k.dfs(where, r, set, dfsWay(doc, r))
+		}
+		if list, ok := set["modes"].([]any); ok {
+			k.modes(where, r, list)
+		}
+		if v, ok := set["short_gi"].(bool); ok {
+			for _, w := range []string{"20", "40", "80", "160"} {
+				o := "short_gi_" + w
+				got, has := r.s.Option(o)
+				if v && has && !r.s.Flag(o) || !v && (!has || r.s.Flag(o)) {
+					k.add("%s: %s is %q, want it %s for radio.%s.short_gi %v", where, o, got, onOff(v), r.band, v)
+				}
+			}
+		}
+	}
+}
+
+// modes checks a radio against the 802.11 generations its band allows
+// (0089): 802.11b as legacy_rates, the oldest as require_mode, and a mode
+// whose family serves the oldest and goes no further than the newest. A
+// list compose refuses is not checked.
+func (k *checker) modes(where string, r device, list []any) {
+	var modes []string
+	for _, m := range list {
+		if s, ok := m.(string); ok {
+			modes = append(modes, s)
+		}
+	}
+	oldest, newest, err := radio.Span(r.band, modes)
+	if err != nil {
+		return
+	}
+	if r.band == "2g" {
+		if want := oldest == "b"; r.s.Flag("legacy_rates") != want {
+			k.add("%s: legacy_rates is %q, want it %s for 802.11%s the oldest radio.2g.modes allows", where, value(r.s, "legacy_rates"), onOff(want), oldest)
+		}
+	}
+	if got, want := value(r.s, "require_mode"), radio.Required(r.band, oldest); got != want {
+		k.add("%s: require_mode is %q, want %q for 802.11%s the oldest radio.%s.modes allows", where, got, want, oldest, r.band)
+	}
+	m := htmodeRE.FindStringSubmatch(value(r.s, "htmode"))
+	fam := "HT" // OpenWrt's default with no htmode
+	if m != nil {
+		fam = m[1]
+	}
+	if radio.Rank(fam) > radio.Rank(radio.Family[newest]) || radio.Rank(fam) < radio.Rank(radio.Family[oldest]) {
+		k.add("%s: htmode is %q, want one of 802.11%s to 802.11%s, as radio.%s.modes allows", where, value(r.s, "htmode"), oldest, newest, r.band)
+	}
+}
+
+// guardInterval checks the 802.11ax guard interval the agent holds each
+// band's networks to (0089): the agent's gi section has it for each band
+// the AP serves where one is set, and nothing else; with none, there is no
+// section.
+func (k *checker) guardInterval(set map[string]any, radios []device) {
+	const where = "aeolus.aeolus_gi"
+	want := map[string]string{}
+	for _, r := range radios {
+		if ns, ok := obj(set, r.band)["he_gi"].(float64); ok && radio.GI[int(ns)] != "" {
+			want["he_gi_"+r.band] = radio.GI[int(ns)]
+		}
+	}
+	s := k.c.Package("aeolus").Named("aeolus_gi")
+	if len(want) == 0 {
+		if s != nil {
+			k.add("%s: no 802.11ax guard interval is set, but the section is there", where)
+		}
+		return
+	}
+	if s == nil || s.Type != "gi" {
+		k.add("%s: an 802.11ax guard interval is set, but the section is missing", where)
+		return
+	}
+	for _, o := range s.Names() {
+		if _, ok := want[o]; !ok {
+			k.add("%s: %s is %q, but no such guard interval is set", where, o, value(s, o))
+		}
+	}
+	for _, o := range slices.Sorted(maps.Keys(want)) {
+		k.option(where, s, o, want[o])
+	}
+}
+
+// radioPower checks the transmit power the agent holds each radio to with
+// iw (0349): the agent's power section has it for each radio the AP serves
+// with, by the radio's section's name, where its band's power is set, and
+// nothing else; with none, there is no section. auto is none.
+func (k *checker) radioPower(set map[string]any, radios []device) {
+	const where = "aeolus.aeolus_power"
+	want := map[string]string{}
+	for _, r := range radios {
+		if p, ok := obj(set, r.band)["power"].(float64); ok {
+			want[r.s.Name] = text(p)
+		}
+	}
+	s := k.c.Package("aeolus").Named("aeolus_power")
+	if len(want) == 0 {
+		if s != nil {
+			k.add("%s: no power is set, but the section is there", where)
+		}
+		return
+	}
+	if s == nil || s.Type != "power" {
+		k.add("%s: a power is set, but the section is missing", where)
+		return
+	}
+	for _, o := range s.Names() {
+		if _, ok := want[o]; !ok {
+			k.add("%s: %s is %q, but no power is set for it", where, o, value(s, o))
+		}
+	}
+	for _, o := range slices.Sorted(maps.Keys(want)) {
+		k.option(where, s, o, want[o])
+	}
+}
+
+// radiosOff checks the record of the radios Aeolus turned off (0238): each
+// radio whose band's enabled is false, and no other; none, no section.
+func (k *checker) radiosOff(set map[string]any, radios []device) {
+	const where = "aeolus.aeolus_radios_off"
+	var want []string
+	for _, r := range radios {
+		if on, ok := obj(set, r.band)["enabled"].(bool); ok && !on {
+			want = append(want, r.s.Name)
+		}
+	}
+	s := k.c.Package("aeolus").Named("aeolus_radios_off")
+	if len(want) == 0 {
+		if s != nil {
+			k.add("%s: no radio is turned off, but the section is there", where)
+		}
+		return
+	}
+	if s == nil || s.Type != "radios" {
+		k.add("%s: radios are turned off, but the section is missing", where)
+		return
+	}
+	if got := s.List("radio"); !sameSet(got, want) {
+		k.add("%s: radios turned off are %v, want %v", where, got, want)
+	}
+}
+
+// internet checks what the prober is told to ask of the internet (0142):
+// the agent's path section names the target where system.internet is set,
+// and is there only then.
+func (k *checker) internet(system map[string]any) {
+	const where = "aeolus.aeolus_path"
+	s := k.c.Package("aeolus").Named("aeolus_path")
+	target, _ := system["internet"].(string)
+	if target == "" {
+		if s != nil {
+			k.add("%s: no internet target is set, but the section is there", where)
+		}
+		return
+	}
+	if s == nil || s.Type != "path" {
+		k.add("%s: an internet target is set, but the section is missing", where)
+		return
+	}
+	for _, o := range s.Names() {
+		if o != "internet" {
+			k.add("%s: %s is %q, and nothing calls for it", where, o, value(s, o))
+		}
+	}
+	k.option(where, s, "internet", target)
+}
+
+// captures checks whether aeolus-journey keeps a capture of each attempt
+// that fails (0135): it does unless told not to, so the agent's journey
+// section is there only where system.captures is off, and says so.
+func (k *checker) captures(system map[string]any) {
+	const where = "aeolus.aeolus_journey"
+	s := k.c.Package("aeolus").Named("aeolus_journey")
+	if system["captures"] != false {
+		if s != nil {
+			k.add("%s: captures of failed attempts are not set off, but the section is there", where)
+		}
+		return
+	}
+	if s == nil || s.Type != "journey" {
+		k.add("%s: captures of failed attempts are set off, but the section is missing", where)
+		return
+	}
+	for _, o := range s.Names() {
+		if o != "captures" {
+			k.add("%s: %s is %q, and nothing calls for it", where, o, value(s, o))
+		}
+	}
+	k.option(where, s, "captures", "0")
+}
+
+// ble checks whether the AP's Bluetooth radio is lent to Home Assistant
+// (0156): the agent's ble section is there, and says it is on, only where
+// system.ble_proxy is on.
+func (k *checker) ble(system map[string]any) {
+	const where = "aeolus.aeolus_ble"
+	s := k.c.Package("aeolus").Named("aeolus_ble")
+	if system["ble_proxy"] != true {
+		if s != nil {
+			k.add("%s: the Bluetooth radio is not lent, but the section is there", where)
+		}
+		return
+	}
+	if s == nil || s.Type != "ble" {
+		k.add("%s: the Bluetooth radio is lent, but the section is missing", where)
+		return
+	}
+	for _, o := range s.Names() {
+		if o != "enabled" {
+			k.add("%s: %s is %q, and nothing calls for it", where, o, value(s, o))
+		}
+	}
+	k.option(where, s, "enabled", "1")
+}
+
+// dfsWay is how the 5 GHz radio r, as rendered, uses the DFS channels
+// (0328), as the agent works it out: by internal/radio's DFSWay, from
+// radio.5g.dfs, whether radio resource management moves radios, and the
+// radio's channel, its channels and its width.
+func dfsWay(doc map[string]any, r device) string {
+	v, _ := obj(obj(doc, "radio"), "5g")["dfs"].(string)
+	set := obj(doc, "rrm")
+	channel := value(r.s, "channel")
+	var chans []int
+	for _, c := range r.s.List("channels") {
+		if n, err := strconv.Atoi(c); err == nil {
+			chans = append(chans, n)
+		}
+	}
+	w := 20
+	if m := htmodeRE.FindStringSubmatch(value(r.s, "htmode")); m != nil && m[2] != "" {
+		w, _ = strconv.Atoi(m[2])
+	}
+	return radio.DFSWay(v, channel == "" || channel == "auto", set["enabled"] == true && set["moves"] != false, chans, w)
+}
+
+// dfsSaid is how each way of using the DFS channels is put (0328).
+var dfsSaid = map[string]string{
+	radio.DFSAvoid: "which avoids them",
+	radio.DFSLook:  "which looks first here",
+	radio.DFSPick:  "which lets hostapd pick here",
+}
+
+// dfs checks a 5 GHz radio against how it uses the DFS channels (0328):
+// avoided (0071) or looked at first (0120), an automatic channel is picked
+// outside them at the radio's start; picked, nothing holds it to that. With
+// avoid, a channel the AP keeps as its own must not be a DFS one, whoever
+// set it; otherwise a channel set is used as set.
+func (k *checker) dfs(where string, r device, set map[string]any, way string) {
+	v, _ := set["dfs"].(string)
+	channel := value(r.s, "channel")
+	auto := channel == "" || channel == "auto"
+	if want := (way == radio.DFSAvoid || way == radio.DFSLook) && auto; r.s.Flag("acs_exclude_dfs") != want {
+		k.add("%s: acs_exclude_dfs is %q, want it %s for radio.%s.dfs %s, %s (0328)", where, value(r.s, "acs_exclude_dfs"), onOff(want), r.band, cmp.Or(v, "allow"), dfsSaid[way])
+	}
+	ch, err := strconv.Atoi(channel)
+	if v != "avoid" || err != nil {
+		return
+	}
+	w := 20
+	if m := htmodeRE.FindStringSubmatch(value(r.s, "htmode")); m != nil && m[2] != "" {
+		w, _ = strconv.Atoi(m[2])
+	}
+	if radio.Radar(r.band, ch, w) {
+		k.add("%s: channel %d at %d MHz uses DFS channels, but radio.%s.dfs is avoid", where, ch, w, r.band)
+	}
+}
+
+// rrm checks radio resource management (0073): on, the agent's package has
+// the daemon's section, which names the AP it advertises and holds the
+// policy for moves, defaults written out; otherwise there is none, and the
+// daemon stays idle. On an AP with a scan radio, whose serving radios never
+// scan (0081), the section tells the daemon to listen through that radio,
+// airscan's (0116); on any other AP it must not, or the daemon would hear
+// nothing. Where a 5 GHz radio looks before it uses a DFS channel (look,
+// 0120, 0328), the section lets the daemon move it to one, unless it moves
+// no radio; nowhere else may it.
+// hold checks a test window's section (0344): where the manager sends hold,
+// aeolus_hold with when it ends, in Unix seconds, and why, if it says; none
+// where it does not. aeolus-rrm and aeolus-steer read it.
+func (k *checker) hold(want map[string]any) {
+	const where = "aeolus.aeolus_hold"
+	s := k.c.Package("aeolus").Named("aeolus_hold")
+	until, ok := want["until"].(float64)
+	if !ok {
+		if s != nil {
+			k.add("%s: no test window is on, but its section is there", where)
+		}
+		return
+	}
+	if s == nil || s.Type != "hold" {
+		k.add("%s: a test window is on, but its section is missing", where)
+		return
+	}
+	k.option(where, s, "until", strconv.FormatInt(int64(until), 10))
+	if why, _ := want["why"].(string); why != "" {
+		k.option(where, s, "why", why)
+	} else {
+		k.absent(where, s, "why")
+	}
+}
+
+func (k *checker) rrm(set, apc map[string]any, look bool, wide string) {
+	const where = "aeolus.aeolus_rrm"
+	s := k.c.Package("aeolus").Named("aeolus_rrm")
+	if set["enabled"] != true {
+		if s != nil {
+			k.add("%s: radio resource management is not on, but its section is there", where)
+		}
+		return
+	}
+	if s == nil || s.Type != "rrm" {
+		k.add("%s: radio resource management is on, but its section is missing", where)
+		return
+	}
+	k.option(where, s, "enabled", "1")
+	if k.ap != "" {
+		k.option(where, s, "ap", k.ap)
+	}
+	switch got, _ := s.Option("scan"); {
+	case k.scanRadio() && got != "airscan":
+		k.add("%s: scan is %q, want airscan: the AP has a scan radio, where the serving radios never scan (0081)", where, got)
+	case !k.scanRadio() && got != "":
+		k.add("%s: scan is %q, but the AP has no scan radio to listen through", where, got)
+	}
+	moves := "1"
+	if set["moves"] == false {
+		moves = "0"
+	}
+	k.option(where, s, "moves", moves)
+	switch got, _ := s.Option("dfs"); {
+	case look && moves == "1" && got != "1":
+		k.add("%s: dfs is %q, want 1: the 5 GHz radio looks before it uses a DFS channel, and the daemon is what moves it to one (0120, 0328)", where, got)
+	case !(look && moves == "1") && got != "":
+		k.add("%s: dfs is %q, but nothing has the daemon move a radio to a DFS channel here", where, got)
+	}
+	// The width it widens the 5 GHz radio to, where that starts narrower
+	// (0329).
+	switch got, _ := s.Option("wide"); {
+	case wide != "" && got != wide:
+		k.add("%s: wide is %q, want %s: the 5 GHz radio starts at 80 MHz, and the daemon widens it (0329)", where, got, wide)
+	case wide == "" && got != "":
+		k.add("%s: wide is %q, but no radio here starts narrower than it is set", where, got)
+	}
+	k.option(where, s, "window", cmp.Or(text(set["window"]), "02:00-05:00"))
+	k.option(where, s, "margin", cmp.Or(text(set["margin"]), "20"))
+	k.option(where, s, "apart", cmp.Or(text(set["apart"]), "250"))
+	// Power control (0077): on, its count and target, defaults written out;
+	// off, none of them.
+	if apc["enabled"] == true {
+		k.option(where, s, "apc", "1")
+		k.option(where, s, "apc_neighbours", cmp.Or(text(apc["neighbours"]), "3"))
+		k.option(where, s, "apc_target", cmp.Or(text(apc["target"]), "-70"))
+		// What it does for clients, and how long a step back holds (0206).
+		k.option(where, s, "apc_clients", cmp.Or(text(apc["clients"]), "ask"))
+		k.option(where, s, "apc_client_floor", cmp.Or(text(apc["client_floor"]), "-80"))
+		k.option(where, s, "apc_hold", cmp.Or(text(apc["hold"]), "24"))
+	} else {
+		for _, o := range []string{"apc", "apc_neighbours", "apc_target", "apc_clients", "apc_client_floor", "apc_hold"} {
+			if v, ok := s.Option(o); ok {
+				k.add("%s: power control is not on, but %s is %q", where, o, v)
+			}
+		}
+	}
+}
+
+// stp checks spanning tree on the uplink's bridge (0095): on, RSTP; off,
+// none. An uplink in no bridge cannot loop, and has none to check.
+func (k *checker) stp(up map[string]any) {
+	on, ok := up["stp"].(bool)
+	if !ok {
+		return
+	}
+	_, bridge := k.uplinkBridge()
+	if bridge == nil {
+		return
+	}
+	where := "network bridge " + value(bridge, "name")
+	if bridge.Flag("stp") != on {
+		k.add("%s: stp is %q, want it %s for uplink.stp", where, value(bridge, "stp"), onOff(on))
+	}
+	if on {
+		k.option(where, bridge, "stp_proto", "rstp")
+	}
+}
+
+// Unbond is the agent's section that keeps a bond Aeolus took apart, as it
+// was (0096).
+const Unbond = "aeolus_unbond"
+
+// bond checks the uplink's LACP bond (0096). With uplink.bond false, a bond
+// that was the uplink is taken apart: its section kept in aeolus_unbond and
+// gone from the network; each member in the uplink's bridge where it was, the
+// first the AP's uplink; every VLAN the bridge carries on one carried on all
+// alike; and spanning tree on, or two ports to one network loop. An uplink
+// that was never a bond has nothing to take apart. Otherwise none is kept: a
+// bond taken apart is put back.
+func (k *checker) bond(up map[string]any) {
+	var kept *uci.Section
+	if a := k.c.Package("aeolus"); a != nil {
+		kept = a.Named(Unbond)
+	}
+	if up["bond"] != false {
+		if kept != nil {
+			k.add("aeolus.%s: %s is still taken apart; uplink.bond wants it put back", Unbond, value(kept, "name"))
+		}
+		return
+	}
+	link, bridge := k.uplinkBridge()
+	n := k.c.Package("network")
+	if kept == nil {
+		for _, d := range n.OfType("device") {
+			if value(d, "type") == "bonding" && value(d, "name") == link {
+				k.add("uplink.bond: the uplink %s is still a bond", link)
+			}
+		}
+		return
+	}
+	name, members := value(kept, "name"), kept.List("ports")
+	if len(members) < 2 {
+		k.add("aeolus.%s: %s had %d ports; a bond taken apart has two or more", Unbond, name, len(members))
+		return
+	}
+	if link != members[0] {
+		k.add("aeolus.agent: the uplink is %q, want %s, the first of %s's ports, for uplink.bond", link, members[0], name)
+	}
+	for _, d := range n.OfType("device") {
+		if value(d, "name") == name {
+			k.add("network.%s: %s is still there, though uplink.bond takes it apart", d.Name, name)
+		}
+	}
+	if bridge == nil {
+		k.add("uplink.bond: %s's ports are in no bridge", name)
+		return
+	}
+	where := "network bridge " + value(bridge, "name")
+	for _, m := range members {
+		if !slices.Contains(bridge.List("ports"), m) {
+			k.add("%s: %s is not among its ports, for uplink.bond", where, m)
+		}
+	}
+	if slices.Contains(bridge.List("ports"), name) {
+		k.add("%s: %s is still among its ports, for uplink.bond", where, name)
+	}
+	if !bridge.Flag("stp") {
+		k.add("%s: spanning tree is off; %s's ports apart in it loop without it", where, name)
+	}
+	for _, v := range n.OfType("bridge-vlan") {
+		if value(v, "device") != value(bridge, "name") {
+			continue
+		}
+		flags := map[string]string{}
+		for _, e := range v.List("ports") {
+			p, f, _ := strings.Cut(e, ":")
+			if p == name {
+				k.add("network.%s: VLAN %s is still on %s", v.Name, value(v, "vlan"), name)
+			}
+			if slices.Contains(members, p) {
+				flags[p] = f
+			}
+		}
+		if len(flags) == 0 {
+			continue
+		}
+		for _, m := range members {
+			if f, ok := flags[m]; !ok || f != flags[members[0]] {
+				k.add("network.%s: VLAN %s is not on %s as on %s, so it would be lost when %s is the path out", v.Name, value(v, "vlan"), m, members[0], m)
+			}
+		}
+	}
+}
+
+// bonding checks that a 5 GHz radio's channel can carry its width, whoever
+// set the channel: a width the channel cannot carry would leave the radio
+// off the air while the AP still reaches the manager, so no revert would
+// catch it.
+func bonding(channel, htmode string) string {
+	ch, err := strconv.Atoi(channel)
+	if err != nil {
+		return "" // auto, or not set: the radio picks a channel that fits
+	}
+	m := htmodeRE.FindStringSubmatch(htmode)
+	if m == nil || m[1] == "NOHT" {
+		return ""
+	}
+	w, _ := strconv.Atoi(m[2])
+	if ok, why := radio.Fits("5g", ch, w); !ok {
+		return why
+	}
+	return ""
+}
+
+func (k *checker) networks(doc map[string]any, radios []device) {
+	w := k.c.Package("wireless")
+	nets := obj(doc, "network")
+	expected := map[string]bool{}
+	vlanSections := map[string]bool{}
+	for _, id := range keys(nets) {
+		n := obj(nets, id)
+		if on, ok := n["enabled"].(bool); ok && !on {
+			continue
+		}
+		bands := map[string]bool{}
+		for _, b := range list(n["bands"]) {
+			bands[b] = true
+		}
+		security, _ := n["security"].(string)
+		var ifaces []string
+		for _, r := range radios {
+			if len(bands) > 0 && !bands[r.band] {
+				continue
+			}
+			// WPA2 and open networks are not on 6 GHz (0086).
+			if _, ok := radio.SixGHzEncryption(security); r.band == "6g" && !ok {
+				continue
+			}
+			name := IfaceName(id, r.s.Name)
+			expected[name] = true
+			s := w.Named(name)
+			if s == nil || s.Type != "wifi-iface" {
+				k.add("network.%s: no wifi-iface %s on %s", id, name, r.s.Name)
+				continue
+			}
+			k.iface(id, n, r, s)
+			// A test network's SSIDs carry when they go off, for the agent
+			// to turn them off then, the manager reached or not (0179).
+			if test, _ := n["test"].(bool); test {
+				until, _ := obj(doc, "test_network")["until"].(float64)
+				k.option("wireless."+name, s, "aeolus_until", strconv.FormatInt(int64(until), 10))
+			}
+			ifaces = append(ifaces, name)
+		}
+		k.transports(id, n, obj(doc, "concentrators"))
+		for _, name := range k.offeredVLANs(id, n, ifaces) {
+			vlanSections[name] = true
+		}
+	}
+	for _, s := range w.OfType("wifi-iface") {
+		if strings.HasPrefix(s.Name, "aeolus_") && !expected[s.Name] {
+			k.add("wireless.%s: no network calls for it", s.Name)
+		}
+	}
+	for _, s := range w.OfType("wifi-vlan") {
+		if strings.HasPrefix(s.Name, "aeolus_") && !vlanSections[s.Name] {
+			k.add("wireless.%s: no network offers its VLAN", s.Name)
+		}
+	}
+}
+
+// offeredVLANs checks the VLANs a network offers its clients: its per-user
+// keys' where it is not WPA Enterprise (0070), named k, and the RADIUS
+// server's on WPA Enterprise (0111) or with MAC authentication (0112),
+// named r. It returns the wifi-vlan sections it expects.
+func (k *checker) offeredVLANs(id string, n map[string]any, ifaces []string) []string {
+	security, _ := n["security"].(string)
+	enterprise := strings.HasSuffix(security, "-enterprise")
+	var out []string
+	if !enterprise {
+		out = append(out, k.vlansOf(id, "keys.vlans", "k", list(obj(n, "keys")["vlans"]), ifaces)...)
+	}
+	if r := obj(n, "radius"); enterprise || r["mac_auth"] == true {
+		out = append(out, k.vlansOf(id, "radius.vlans", "r", list(r["vlans"]), ifaces)...)
+	}
+	return out
+}
+
+// vlansOf checks one set of offered VLANs: for each, a bridge-vlan carrying
+// it on the uplink, an interface on it, and a wifi-vlan on the network's
+// wifi-ifaces that puts a client there.
+func (k *checker) vlansOf(id, field, letter string, vlans, ifaces []string) []string {
+	if len(vlans) == 0 {
+		return nil
+	}
+	w, net := k.c.Package("wireless"), k.c.Package("network")
+	if net == nil {
+		if !k.noNet {
+			k.add("package network is missing")
+			k.noNet = true
+		}
+		return nil
+	}
+	var out []string
+	for _, v := range vlans {
+		where := fmt.Sprintf("network.%s.%s: VLAN %s", id, field, v)
+		iface, section := InterfaceName(id)+"_"+letter+v, InterfaceName(id)+"_"+letter+"v"+v
+		out = append(out, section)
+		carried := false
+		for _, bv := range net.OfType("bridge-vlan") {
+			if value(bv, "vlan") == v {
+				carried = true
+			}
+		}
+		if !carried {
+			k.add("%s: no bridge-vlan carries it", where)
+		}
+		if i := net.Named(iface); i == nil || i.Type != "interface" || !strings.HasSuffix(value(i, "device"), "."+v) {
+			k.add("%s: no interface %s on it", where, iface)
+		}
+		x := w.Named(section)
+		if x == nil || x.Type != "wifi-vlan" {
+			k.add("%s: no wifi-vlan %s", where, section)
+			continue
+		}
+		k.option("wireless."+section, x, "vid", v)
+		k.option("wireless."+section, x, "name", letter+v)
+		if got := x.List("network"); !sameSet(got, []string{iface}) {
+			k.add("wireless.%s: network is %v, want %s", section, got, iface)
+		}
+		if got := x.List("iface"); !sameSet(got, ifaces) {
+			k.add("wireless.%s: iface is %v, want %v", section, got, ifaces)
+		}
+	}
+	return out
+}
+
+func (k *checker) iface(id string, n map[string]any, r device, s *uci.Section) {
+	where := "wireless." + s.Name
+	k.option(where, s, "device", r.s.Name)
+	k.option(where, s, "mode", "ap")
+	k.option(where, s, "rnr", "1") // a Reduced Neighbor Report everywhere (0087)
+	if ssid, _ := n["ssid"].(string); ssid != "" {
+		k.option(where, s, "ssid", ssid)
+	}
+	security, _ := n["security"].(string)
+	want, ok := encryption[security]
+	if six, allowed := radio.SixGHzEncryption(security); r.band == "6g" && allowed {
+		want, ok = six, true // WPA3 alone on 6 GHz (0086)
+	}
+	if ok {
+		got, _ := s.Option("encryption")
+		if base, _, _ := strings.Cut(got, "+"); base != want {
+			k.add("%s: encryption is %q, want %q for %s", where, got, want, security)
+		}
+	}
+	// Passphrases from the RADIUS server (0115): OpenWrt's ppsk, and no key
+	// of the network's own, which hostapd would not use. Anywhere else, no
+	// ppsk: it would refuse every device the server gives no passphrase.
+	rad := obj(n, "radius")
+	ppsk := security == "wpa2-psk" && rad["mac_auth"] == true && rad["passphrases"] == true
+	got, _ := s.Option("ppsk")
+	switch {
+	case ppsk && got != "1":
+		k.add("%s: ppsk is %q, want 1: each device's passphrase is the RADIUS server's", where, got)
+	case !ppsk && got != "" && got != "0":
+		k.add("%s: ppsk is %q, but the network takes no passphrases from a RADIUS server", where, got)
+	}
+	if ppsk {
+		if _, ok := s.Option("key"); ok {
+			k.add("%s: a key is set, but each device's passphrase is the RADIUS server's", where)
+		}
+	} else if needsKey[security] {
+		pass, _ := n["passphrase"].(string)
+		if key, _ := s.Option("key"); key != pass {
+			k.add("%s: key does not match the passphrase", where)
+		}
+	}
+	roaming := obj(n, "roaming")
+	ft, _ := roaming["ft"].(bool)
+	k.radius(where, security, obj(n, "radius"), s, ft)
+	k.ft(where, id, security, n, r.s.Name, s, ft)
+	rrm, _ := roaming["rrm"].(bool)
+	btm, _ := roaming["btm"].(bool)
+	asks := steeredOf(n).asks()
+	for opt, v := range map[string]any{
+		"hidden":         n["hidden"],
+		"isolate":        n["isolation"],
+		"ieee80211r":     roaming["ft"],
+		"ieee80211k":     rrm || asks, // steering asks through 11k and 11v (0050, 0138)
+		"bss_transition": btm || asks,
+	} {
+		want, _ := v.(bool)
+		if s.Flag(opt) != want {
+			k.add("%s: %s is %q, want %s", where, opt, value(s, opt), onOff(want))
+		}
+	}
+	// The clients it refuses, by MAC (0100): none, no MAC filter.
+	var blocked []string
+	for _, m := range list(n["blocked"]) {
+		blocked = append(blocked, strings.ToLower(m))
+	}
+	sort.Strings(blocked)
+	if len(blocked) > 0 {
+		k.option(where, s, "macfilter", "deny")
+	} else if got, ok := s.Option("macfilter"); ok {
+		k.add("%s: macfilter is %q, but no client is blocked", where, got)
+	}
+	if got := s.List("maclist"); !slices.Equal(got, blocked) && (len(got) > 0 || len(blocked) > 0) {
+		k.add("%s: maclist is %q, want %q", where, got, blocked)
+	}
+	// The most clients, and the DTIM period (0097): unset, left out, so
+	// OpenWrt's own hold.
+	for opt, field := range map[string]string{"maxassoc": "max_clients", "dtim_period": "dtim"} {
+		if v, ok := n[field].(float64); ok {
+			k.option(where, s, opt, text(v))
+		} else if got, ok := s.Option(opt); ok {
+			k.add("%s: %s is %q, want none for network.%s.%s unset", where, opt, got, id, field)
+		}
+	}
+	// Unset, it is left out, so OpenWrt's default holds (0049).
+	if v, ok := n["multicast_to_unicast"].(bool); ok {
+		k.option(where, s, "multicast_to_unicast", map[bool]string{true: "1", false: "0"}[v])
+	} else if got, ok := s.Option("multicast_to_unicast"); ok {
+		k.add("%s: multicast_to_unicast is %q, want none, for OpenWrt's default", where, got)
+	}
+	// So too whether a client the radio says stopped acknowledging is sent
+	// off at once (0257).
+	if v, ok := n["disassoc_low_ack"].(bool); ok {
+		k.option(where, s, "disassoc_low_ack", map[bool]string{true: "1", false: "0"}[v])
+	} else if got, ok := s.Option("disassoc_low_ack"); ok {
+		k.add("%s: disassoc_low_ack is %q, want none, for OpenWrt's default", where, got)
+	}
+	// hostapd's own options, which OpenWrt 25.12 has no option for: with
+	// 802.11r, the BSS pushes its keys to the network's other key holders,
+	// whom it reads from the agent's file (0224); with transition_disable,
+	// Transition Disable for the newer way the network has (0297).
+	var bss []string
+	if ft {
+		bss = append(bss, "pmk_r1_push=1", "rxkh_file="+FTDir+"/"+s.Name)
+	}
+	if td := radio.TransitionDisable(security); td != "" && n["transition_disable"] == true {
+		bss = append(bss, "transition_disable="+td)
+	}
+	if got := s.List("hostapd_bss_options"); !slices.Equal(got, bss) {
+		k.add("%s: hostapd_bss_options is %q, want %q", where, got, bss)
+	}
+	// Protected management frames where the network says, but on 6 GHz,
+	// where OpenWrt requires them; unset, OpenWrt's default (0227).
+	choice, _ := n["pmf"].(string)
+	pmf := map[string]string{"optional": "1", "required": "2"}[choice]
+	if r.band == "6g" || !radio.PMFChoice(security) {
+		pmf = ""
+	}
+	if pmf != "" {
+		k.option(where, s, "ieee80211w", pmf)
+	} else if got, ok := s.Option("ieee80211w"); ok {
+		k.add("%s: ieee80211w is %q, want none, for OpenWrt's default", where, got)
+	}
+	if s.Flag("disabled") {
+		k.add("%s: disabled", where)
+	}
+	var ifaces []string
+	for _, v := range s.List("network") {
+		ifaces = append(ifaces, strings.Fields(v)...)
+	}
+	if len(ifaces) == 0 {
+		k.add("%s: no network interface", where)
+	}
+	for _, name := range ifaces {
+		if i := k.c.Package("network").Named(name); i == nil || i.Type != "interface" {
+			k.add("%s: network interface %s does not exist", where, name)
+		}
+	}
+}
+
+// FTDir is where the agent keeps each BSS's 802.11r key holders, a file
+// named for its section, which hostapd reads (0224).
+const FTDir = "/etc/aeolus-ft"
+
+// FTNASID is the NAS-Identifier of a BSS of a network with 802.11r, as the
+// agent makes it (0224): its AP, its radio and its network's hash. Each BSS
+// is a key holder of its own by it.
+func FTNASID(ap, radio, network string) string {
+	return ap + "/" + radio + "/" + NetHash(network)
+}
+
+// ft checks 802.11r's key holders and key caching on a network's Wi-Fi
+// interface (0224). WPA Enterprise keeps its clients' keys, and takes
+// sign-ins ahead of a roam. With 802.11r, keys made of a passphrase are made
+// on each AP; the rest are pushed and asked for over the wire, by the BSS's
+// own NAS-Identifier, with hostapd reading the others' from the file the
+// agent keeps; and the RADIUS server is told the NAS-Identifier set on the
+// network.
+func (k *checker) ft(where, id, security string, n map[string]any, radio string, s *uci.Section, on bool) {
+	enterprise := strings.HasSuffix(security, "-enterprise")
+	for _, opt := range []string{"okc", "rsn_preauth"} {
+		if s.Flag(opt) != enterprise {
+			k.add("%s: %s is %q, want %s for %s", where, opt, value(s, opt), onOff(enterprise), security)
+		}
+	}
+	// WPA Enterprise with 802.11r says it has no SAE password element (0279):
+	// OpenWrt 25.12 sets sae_pwe=2 on it, and hostapd's 802.11r answer then
+	// claims an RSNXE it never sends (B128).
+	if on && enterprise {
+		k.option(where, s, "sae_pwe", "0")
+	} else if _, ok := s.Option("sae_pwe"); ok {
+		k.add("%s: sae_pwe is %q, but only WPA Enterprise with 802.11r sets it", where, value(s, "sae_pwe"))
+	}
+	extra := []string{"aeolus_ft", "radius_auth_req_attr", "radius_acct_req_attr"}
+	if !on {
+		for _, opt := range extra {
+			if _, ok := s.Option(opt); ok || len(s.List(opt)) > 0 {
+				k.add("%s: %s is set, but the network has no 802.11r", where, opt)
+			}
+		}
+		return
+	}
+	k.option(where, s, "ft_over_ds", "0")
+	k.option(where, s, "ft_psk_generate_local", "1")
+	k.option(where, s, "aeolus_ft", id)
+	if k.ap != "" {
+		k.option(where, s, "nasid", FTNASID(k.ap, radio, id))
+	} else if got := value(s, "nasid"); got == "" || len(got) > 48 {
+		k.add("%s: nasid is %q, want a NAS-Identifier of the BSS's own, of 1 to 48 characters", where, got)
+	}
+	r := obj(n, "radius")
+	var attr []string
+	if nas, _ := r["nas_id"].(string); nas != "" && (enterprise || r["mac_auth"] == true) {
+		attr = []string{"32:s:" + nas}
+	}
+	for _, opt := range []string{"radius_auth_req_attr", "radius_acct_req_attr"} {
+		if got := s.List(opt); !slices.Equal(got, attr) {
+			k.add("%s: %s is %q, want %q", where, opt, got, attr)
+		}
+	}
+}
+
+// radius checks a WPA Enterprise network's RADIUS servers on its Wi-Fi
+// interface (0098): the one clients sign in against, at its port, 1812
+// unless set, with its secret; accounting, where set, at 1813 unless set,
+// with its own secret or the sign-in one; and the NAS-Identifier. Where the
+// network offers VLANs, the server's VLAN for a client is taken, and
+// required with vlan_required; where a server may disconnect clients, it,
+// its secret or the sign-in one, and its port, 3799 unless set (0111). A
+// network with MAC authentication has the servers too, and the VLANs, but
+// no disconnects (0112). Another network has none of them.
+//
+// With 802.11r, the NAS-Identifier is the BSS's own, which ft checks.
+func (k *checker) radius(where, security string, r map[string]any, s *uci.Section, ft bool) {
+	opts := []string{"auth_server", "auth_port", "auth_secret", "acct_server", "acct_port", "acct_secret", "nasid",
+		"dynamic_vlan", "radius_das_client", "radius_das_secret", "radius_das_port"}
+	if ft {
+		opts = slices.DeleteFunc(opts, func(o string) bool { return o == "nasid" })
+	}
+	enterprise := strings.HasSuffix(security, "-enterprise")
+	if !enterprise && r["mac_auth"] != true {
+		for _, o := range opts {
+			if got, ok := s.Option(o); ok {
+				k.add("%s: %s is %q, but %s is no WPA Enterprise, and has no MAC authentication", where, o, got, security)
+			}
+		}
+		return
+	}
+	str := func(key string) string { v, _ := r[key].(string); return v }
+	port := func(key string, def int) string {
+		if v, ok := r[key].(float64); ok {
+			return text(v)
+		}
+		return strconv.Itoa(def)
+	}
+	want := map[string]string{"auth_server": str("auth_server"), "auth_port": port("auth_port", 1812), "auth_secret": str("auth_secret"), "nasid": str("nas_id")}
+	if str("acct_server") != "" {
+		want["acct_server"], want["acct_port"] = str("acct_server"), port("acct_port", 1813)
+		want["acct_secret"] = cmp.Or(str("acct_secret"), str("auth_secret"))
+	}
+	if len(list(r["vlans"])) > 0 {
+		want["dynamic_vlan"] = "1"
+		if r["vlan_required"] == true {
+			want["dynamic_vlan"] = "2"
+		}
+	}
+	if das := obj(r, "das"); enterprise && das["client"] != nil {
+		dstr := func(key string) string { v, _ := das[key].(string); return v }
+		want["radius_das_client"] = dstr("client")
+		want["radius_das_secret"] = cmp.Or(dstr("secret"), str("auth_secret"))
+		want["radius_das_port"] = "3799"
+		if v, ok := das["port"].(float64); ok {
+			want["radius_das_port"] = text(v)
+		}
+	}
+	for _, o := range opts {
+		got, _ := s.Option(o)
+		if got != want[o] {
+			if strings.HasSuffix(o, "_secret") {
+				k.add("%s: %s does not match the RADIUS secret", where, o)
+			} else {
+				k.add("%s: %s is %q, want %q", where, o, got, want[o])
+			}
+		}
+	}
+}
+
+// steered is how a network's clients are steered (0138), each way a switch
+// of its own: suggest, of which band_steering is the older name (0050),
+// hold back, and sticky, with the signal under which a client is weak; and
+// sticky's settings for a client another AP hears better (0289), each as
+// unset where it is not set.
+type steered struct {
+	suggest, hold, sticky, community, keep, scan bool
+	weak                                         int
+	with                                         map[string]int
+}
+
+// stickySettings is sticky's settings beside weak (0289), by their names
+// in the daemon's section and in the intent, and each one's value unset.
+var stickySettings = []struct {
+	name, field string
+	unset       int
+}{
+	{"margin", "sticky_margin", 5},
+	{"floor", "sticky_floor", -65},
+	{"hold_down", "sticky_hold_down", 10},
+}
+
+func steeredOf(n map[string]any) steered {
+	s := obj(n, "steering")
+	out := steered{weak: -80, with: map[string]int{}}
+	if v, set := s["suggest"].(bool); set {
+		out.suggest = v
+	} else {
+		out.suggest, _ = n["band_steering"].(bool)
+	}
+	out.hold, _ = s["hold_back"].(bool)
+	out.community, _ = s["community"].(bool)
+	out.keep, _ = s["keep_6g"].(bool)
+	out.sticky, _ = s["sticky"].(bool)
+	out.scan, _ = s["sticky_scan"].(bool)
+	if v, set := s["sticky_signal"].(float64); set {
+		out.weak = int(v)
+	}
+	for _, f := range stickySettings {
+		out.with[f.name] = f.unset
+		if v, set := s[f.field].(float64); set {
+			out.with[f.name] = int(v)
+		}
+	}
+	return out
+}
+
+// stickyWith is the daemon's entry of sticky's settings for a network
+// (0289): its ID, then name=value for each.
+func (s steered) stickyWith(id string) string {
+	parts := []string{id}
+	for _, f := range stickySettings {
+		parts = append(parts, fmt.Sprintf("%s=%d", f.name, s.with[f.name]))
+	}
+	return strings.Join(parts, " ")
+}
+
+// asks says the network's clients are asked to move: by 802.11v, to a
+// place its neighbour report names, which is 802.11k's.
+func (s steered) asks() bool { return s.suggest || s.sticky }
+
+// neighbourReports is the most BSSes a network's 802.11k neighbour list
+// names (0228), as usteer is told: every one of a site of eight APs on
+// three bands, where usteer's own is 8.
+const neighbourReports = "24"
+
+// steering checks that usteer steers nothing (0138): Aeolus's own daemon
+// steers, a network at a time, and two that ask a client at once would ask
+// it for different things. Its neighbour lists name every BSS of a network
+// it knows, not 8 (0228). An AP without usteer is none the worse.
+func (k *checker) steering() {
+	p := k.c.Package("usteer")
+	if p == nil {
+		return
+	}
+	all := p.OfType("usteer")
+	if len(all) == 0 {
+		return
+	}
+	k.option("usteer", all[0], "band_steering_interval", "0")
+	k.option("usteer", all[0], "max_neighbor_reports", neighbourReports)
+	if got := all[0].List("ssid_list"); len(got) > 0 {
+		k.add("usteer: ssid_list is %q, and usteer is to steer nothing: Aeolus's own daemon does", got)
+	}
+}
+
+// steer checks the steering daemon's section (0138): each way lists
+// exactly the networks it is on for, sticky with the signal under which a
+// client is weak, sticky_with with the rest of sticky's settings (0289),
+// community with the networks whose APs share what their clients can use
+// (0299), and with none on there is no section. Where there is one, home
+// says where each client belongs (0319), as homeEntries has it.
+func (k *checker) steer(nets, homes map[string]any) {
+	const where = "aeolus.aeolus_steer"
+	want := map[string][]string{}
+	ids := keys(nets)
+	sort.Strings(ids)
+	for _, id := range ids {
+		n := obj(nets, id)
+		if n["enabled"] == false {
+			continue
+		}
+		st := steeredOf(n)
+		if st.suggest {
+			want["suggest"] = append(want["suggest"], id)
+		}
+		if st.hold {
+			want["hold_back"] = append(want["hold_back"], id)
+		}
+		if st.community {
+			want["community"] = append(want["community"], id)
+		}
+		if st.keep {
+			want["keep_6g"] = append(want["keep_6g"], id)
+		}
+		if st.sticky {
+			want["sticky"] = append(want["sticky"], fmt.Sprintf("%s=%d", id, st.weak))
+			want["sticky_with"] = append(want["sticky_with"], st.stickyWith(id))
+			// On the scan radios' readings too (0324).
+			if st.scan {
+				want["sticky_scan"] = append(want["sticky_scan"], id)
+			}
+		}
+	}
+	s := k.c.Package("aeolus").Named("aeolus_steer")
+	if len(want) == 0 {
+		if s != nil {
+			k.add("%s: no network has its clients steered, but the section is there", where)
+		}
+		return
+	}
+	if s == nil || s.Type != "steer" {
+		k.add("%s: a network has its clients steered, but the section is missing", where)
+		return
+	}
+	want["home"] = homeEntries(homes)
+	for _, o := range s.Names() {
+		if _, known := map[string]bool{"suggest": true, "hold_back": true, "sticky": true, "sticky_with": true, "sticky_scan": true, "community": true, "keep_6g": true, "home": true}[o]; !known {
+			k.add("%s: %s is %q, and nothing calls for it", where, o, value(s, o))
+		}
+	}
+	for _, o := range []string{"suggest", "hold_back", "sticky", "sticky_with", "sticky_scan", "community", "keep_6g", "home"} {
+		if got := s.List(o); !slices.Equal(got, want[o]) {
+			k.add("%s: %s is %q, want %q", where, o, got, want[o])
+		}
+	}
+}
+
+// homeMAC is a client's MAC as a rule names it (0319).
+var homeMAC = regexp.MustCompile(`^[0-9a-f]{2}(:[0-9a-f]{2}){5}$`)
+
+// homeHold is how long a client is kept off an AP it does not belong on
+// once put off, where its rule does not say (0319).
+const homeHold = 30
+
+// homeEntries is the steering daemon's entry for each client with a home
+// (0319), by MAC: here where the manager marked this AP one it belongs on,
+// the APs, the bands where some are named, and the hold.
+func homeEntries(homes map[string]any) []string {
+	var out []string
+	for _, mac := range keys(homes) {
+		h := obj(homes, mac)
+		aps := list(h["aps"])
+		if !homeMAC.MatchString(mac) || (len(aps) == 0 && h["nearest"] != true) {
+			continue
+		}
+		e := []string{mac}
+		if h["here"] == true {
+			e = append(e, "here")
+		}
+		// Wherever it is heard best (0321).
+		if h["nearest"] == true {
+			e = append(e, "nearest")
+		}
+		if len(aps) > 0 {
+			e = append(e, "aps="+strings.Join(aps, ","))
+		}
+		if bands := list(h["bands"]); len(bands) > 0 {
+			e = append(e, "bands="+strings.Join(bands, ","))
+		}
+		hold := homeHold
+		if v, ok := h["hold"].(float64); ok {
+			hold = int(v)
+		}
+		e = append(e, fmt.Sprintf("hold=%d", hold))
+		out = append(out, strings.Join(e, " "))
+	}
+	sort.Strings(out)
+	return out
+}
+
+// snmp checks that snmpd answers exactly what the intent asks, read-only,
+// and nothing at all while SNMP is off (0052). Aeolus owns snmpd's whole
+// config, so OpenWrt's default communities must be gone. A secret is never
+// quoted.
+func (k *checker) snmp(want map[string]any) {
+	on, _ := want["enabled"].(bool)
+	p := k.c.Package("snmpd")
+	// No package, or an empty one, as the agent exports on an AP without
+	// snmpd (a C-360's image, say, 0081): snmpd isn't installed.
+	if p == nil || len(p.Sections) == 0 {
+		if on {
+			k.add("snmpd: SNMP needs snmpd, which this AP does not have; install it (apk add snmpd-ssl)")
+		}
+		return
+	}
+	general := p.Named("general")
+	if general == nil {
+		k.add("snmpd: there is no general section")
+		return
+	}
+	k.option("snmpd.general", general, "enabled", map[bool]string{true: "1", false: "0"}[on])
+	community, _ := want["community"].(string)
+	v3 := obj(want, "v3")
+	user, _ := v3["user"].(string)
+
+	var communities []string
+	for _, typ := range []string{"com2sec", "com2sec6"} {
+		for _, s := range p.OfType(typ) {
+			c, _ := s.Option("community")
+			communities = append(communities, c)
+		}
+	}
+	if !on || community == "" {
+		if len(communities) > 0 {
+			k.add("snmpd: %d communities are set, want none", len(communities))
+		}
+	} else if len(communities) != 2 || communities[0] != community || communities[1] != community {
+		k.add("snmpd: the communities do not match the intent's community, for IPv4 and IPv6")
+	}
+	for _, s := range p.OfType("access") {
+		if w, _ := s.Option("write"); w != "none" {
+			k.add("snmpd.%s: write is %q, want none: SNMP is read-only", s.Name, w)
+		}
+	}
+
+	users := p.OfType("v3")
+	switch {
+	case !on || user == "":
+		if len(users) > 0 {
+			k.add("snmpd: %d v3 users are set, want none", len(users))
+		}
+	case len(users) != 1:
+		k.add("snmpd: %d v3 users are set, want 1", len(users))
+	default:
+		u := users[0]
+		where := "snmpd." + u.Name
+		k.option(where, u, "username", user)
+		k.option(where, u, "auth_type", "SHA")
+		k.option(where, u, "privacy_type", "AES")
+		auth, _ := v3["auth"].(string)
+		privacy, _ := v3["privacy"].(string)
+		if got, _ := u.Option("auth_pass"); got != auth {
+			k.add("%s: auth_pass does not match the intent", where)
+		}
+		if got, _ := u.Option("privacy_pass"); got != privacy {
+			k.add("%s: privacy_pass does not match the intent", where)
+		}
+		if u.Flag("allow_write") {
+			k.add("%s: allow_write is on, want off: SNMP is read-only", where)
+		}
+		if v, _ := general.Option("snmp_version"); !strings.Contains(v, "v3") {
+			k.add("snmpd.general: snmp_version is %q, want one with v3", v)
+		}
+	}
+	if !on {
+		return
+	}
+	systems := p.OfType("system")
+	for name, opt := range map[string]string{"location": "sysLocation", "contact": "sysContact"} {
+		v, set := want[name].(string)
+		if !set {
+			continue
+		}
+		if len(systems) != 1 {
+			k.add("snmpd: %d system sections, want 1 for %s", len(systems), opt)
+			continue
+		}
+		k.option("snmpd."+systems[0].Name, systems[0], opt, v)
+	}
+}
+
+// ports checks the Ethernet ports the config sets (0053). Only ports in the
+// VLAN-filtering bridge the uplink is in count; one the AP does not have is
+// not judged. For each: whether it is on, its entries in the bridge's
+// bridge-vlan sections, exactly, and that the uplink carries each of its
+// VLANs tagged. The uplink itself is the AP's management, and is refused.
+func (k *checker) ports(want, concentrators map[string]any) {
+	if len(want) == 0 {
+		return
+	}
+	net := k.c.Package("network")
+	if net == nil {
+		if !k.noNet {
+			k.add("package network is missing")
+			k.noNet = true
+		}
+		return
+	}
+	uplink, bridge := k.uplinkBridge()
+	if bridge == nil {
+		k.add("ports: the uplink %q is in no bridge", uplink)
+		return
+	}
+	var vlans []*uci.Section
+	for _, bv := range net.OfType("bridge-vlan") {
+		if value(bv, "device") == value(bridge, "name") {
+			vlans = append(vlans, bv)
+		}
+	}
+	// A port is on the AP if it is in a bridge, the uplink's or a tunnel's,
+	// or carries an 802.1Q device (0058).
+	onAP := func(p string) bool {
+		for _, d := range net.OfType("device") {
+			if value(d, "type") == "bridge" && slices.Contains(d.List("ports"), p) ||
+				value(d, "type") == "8021q" && value(d, "ifname") == p {
+				return true
+			}
+		}
+		return false
+	}
+	for _, p := range keys(want) {
+		set := obj(want, p)
+		where := "ports." + p
+		if !onAP(p) {
+			continue
+		}
+		if p == uplink {
+			k.add("%s: the uplink carries the AP's management; Aeolus leaves it alone", where)
+			continue
+		}
+		if on, ok := set["enabled"].(bool); ok {
+			got := true
+			for _, d := range net.OfType("device") {
+				if value(d, "name") == p && value(d, "type") == "" {
+					if v, set := d.Option("enabled"); set {
+						got = !slices.Contains([]string{"0", "no", "off", "false", "disabled"}, v)
+					}
+				}
+			}
+			if got != on {
+				k.add("%s: the port is %s, want %s", where, onOff(got), onOff(on))
+			}
+		}
+		// Its speed (0094) is on its device section: that speed, full
+		// duplex; auto, none.
+		if v, ok := set["speed"]; ok {
+			want := text(v)
+			var got []string
+			for _, d := range net.OfType("device") {
+				if value(d, "name") == p && value(d, "type") == "" {
+					if sp, has := d.Option("speed"); has {
+						got = append(got, sp)
+						if want != "auto" && !d.Flag("duplex") {
+							k.add("%s: speed %s is set without full duplex", where, sp)
+						}
+					}
+				}
+			}
+			switch {
+			case want == "auto" && len(got) > 0:
+				k.add("%s: the speed is %v, want auto", where, got)
+			case want != "auto" && (len(got) != 1 || got[0] != want):
+				k.add("%s: the speed is %v, want %s", where, got, want)
+			}
+		}
+		mode, _ := set["mode"].(string)
+		if mode == "tunnel" {
+			k.tunnelPort(where, p, obj(set, "vxlan"), bridge, vlans, concentrators)
+			continue
+		}
+		if mode == "native" {
+			// On the uplink's untagged network (0335): in its bridge, and
+			// untagged in the VLAN the uplink carries untagged, in no other.
+			if !slices.Contains(bridge.List("ports"), p) {
+				k.add("%s: the port is not in the uplink's bridge %s", where, value(bridge, "name"))
+			}
+			want := untaggedVLAN(uplink, vlans)
+			for _, bv := range vlans {
+				for _, e := range bv.List("ports") {
+					if port, flags, _ := strings.Cut(e, ":"); port == p && (value(bv, "vlan") != want || flags != "u*") {
+						k.add("%s: VLAN %s is %s, want the port only on the uplink's untagged VLAN %s, untagged", where, value(bv, "vlan"), portEntry(flags), want)
+					}
+				}
+			}
+			if want != "" {
+				in := false
+				for _, bv := range vlans {
+					if value(bv, "vlan") == want && slices.Contains(bv.List("ports"), p+":u*") {
+						in = true
+					}
+				}
+				if !in {
+					k.add("%s: the port is not untagged in VLAN %s, which the uplink carries untagged", where, want)
+				}
+			}
+			continue
+		}
+		if mode != "access" && mode != "trunk" {
+			continue
+		}
+		if !slices.Contains(bridge.List("ports"), p) {
+			k.add("%s: the port is not in the uplink's bridge %s", where, value(bridge, "name"))
+		}
+		entries := map[string]string{} // VLAN -> u* or t
+		if u := text(set["untagged"]); u != "" && u != "0" {
+			entries[u] = "u*"
+		}
+		if mode == "trunk" {
+			for _, v := range list(set["tagged"]) {
+				entries[v] = "t"
+			}
+		}
+		got := map[string]string{}
+		for _, bv := range vlans {
+			for _, e := range bv.List("ports") {
+				if port, flags, _ := strings.Cut(e, ":"); port == p {
+					got[value(bv, "vlan")] = flags
+				}
+			}
+		}
+		for _, vlan := range slices.Sorted(maps.Keys(entries)) {
+			if got[vlan] != entries[vlan] {
+				k.add("%s: VLAN %s is %s, want %s", where, vlan, portEntry(got[vlan]), portEntry(entries[vlan]))
+			}
+			carried := false
+			for _, bv := range vlans {
+				if value(bv, "vlan") == vlan && slices.Contains(bv.List("ports"), uplink+":t") {
+					carried = true
+				}
+			}
+			if !carried {
+				k.add("%s: the uplink %s does not carry VLAN %s tagged", where, uplink, vlan)
+			}
+		}
+		for _, vlan := range slices.Sorted(maps.Keys(got)) {
+			if _, ok := entries[vlan]; !ok {
+				k.add("%s: VLAN %s is %s, want not on the port", where, vlan, portEntry(got[vlan]))
+			}
+		}
+	}
+}
+
+// start checks, once for each VLAN, the interface tunnels start from there
+// (0063): on the uplink's bridge at that VLAN, its address by DHCP, its
+// routes in a table of their own and its DNS servers unused, in a zone that
+// rejects what comes in and what it would forward.
+// uplinkBridge is the uplink the agent's package names, and the bridge it is
+// in, if any.
+func (k *checker) uplinkBridge() (string, *uci.Section) {
+	uplink := ""
+	if s := k.c.Package("aeolus").Named("agent"); s != nil {
+		uplink = value(s, "uplink")
+	}
+	for _, d := range k.c.Package("network").OfType("device") {
+		if value(d, "type") == "bridge" && slices.Contains(d.List("ports"), uplink) {
+			return uplink, d
+		}
+	}
+	return uplink, nil
+}
+
+// managedOn says whether link is the AP's own interface on VLAN vlan of the
+// uplink's bridge, where it is managed, and not one Aeolus made to start
+// tunnels from (0084).
+func (k *checker) managedOn(link string, vlan int) bool {
+	l := k.c.Package("network").Named(link)
+	if l == nil || l.Type != "interface" || startSection.MatchString(link) {
+		return false
+	}
+	_, bridge := k.uplinkBridge()
+	return bridge != nil && value(l, "device") == value(bridge, "name")+"."+strconv.Itoa(vlan)
+}
+
+func (k *checker) start(vlan int) {
+	if k.starts[vlan] {
+		return
+	}
+	if k.starts == nil {
+		k.starts = map[int]bool{}
+	}
+	k.starts[vlan] = true
+	name := StartInterface(vlan)
+	at := "network." + name
+	s := k.c.Package("network").Named(name)
+	if s == nil || s.Type != "interface" {
+		k.add("%s: no interface for the tunnels that start from VLAN %d (0063)", at, vlan)
+		return
+	}
+	k.option(at, s, "proto", "dhcp")
+	if dev := value(s, "device"); !strings.HasSuffix(dev, "."+strconv.Itoa(vlan)) || strings.HasPrefix(dev, "aeolus_") {
+		k.add("%s: device is %q, want VLAN %d on the uplink's bridge", at, dev, vlan)
+	}
+	carried := false
+	for _, bv := range k.c.Package("network").OfType("bridge-vlan") {
+		if value(bv, "vlan") == strconv.Itoa(vlan) {
+			carried = true
+		}
+	}
+	if !carried {
+		k.add("%s: VLAN %d is not in the network config, so the uplink does not carry it", at, vlan)
+	}
+	k.option(at, s, "ip4table", strconv.Itoa(StartTable+vlan))
+	k.option(at, s, "peerdns", "0")
+	fw := k.c.Package("firewall")
+	var zone *uci.Section
+	if fw != nil {
+		for _, z := range fw.OfType("zone") {
+			if value(z, "name") == StartZone {
+				zone = z
+			}
+		}
+	}
+	if zone == nil || !slices.Contains(zone.List("network"), name) {
+		k.add("firewall: want %s in the zone %s, which keeps what comes in on VLAN %d out of the AP (0063)", name, StartZone, vlan)
+		return
+	}
+	for _, opt := range []string{"input", "forward"} {
+		k.option("firewall."+zone.Name, zone, opt, "REJECT")
+	}
+}
+
+// underlayMTU is the MTU of the interface a tunnel runs over, as the AP's
+// config sets it (0056): the interface's own mtu, or else its device's, or
+// else, for a VLAN on a device (br-lan.1), that device's. Where nothing
+// sets one, it is Linux's 1500. It returns the device too, to name it.
+func underlayMTU(net *uci.Package, iface *uci.Section) (int, string) {
+	dev := value(iface, "device")
+	set := func(v string) (int, bool) {
+		n, err := strconv.Atoi(v)
+		return n, err == nil && n > 0
+	}
+	if n, ok := set(value(iface, "mtu")); ok {
+		return n, dev
+	}
+	of := func(name string) string {
+		for _, d := range net.OfType("device") {
+			if value(d, "name") == name {
+				return value(d, "mtu")
+			}
+		}
+		return ""
+	}
+	if n, ok := set(of(dev)); ok {
+		return n, dev
+	}
+	if i := strings.LastIndex(dev, "."); i > 0 {
+		if n, ok := set(of(dev[:i])); ok {
+			return n, dev
+		}
+	}
+	return 1500, dev
+}
+
+// sectionSafe is a port's name as it can stand in a section's name.
+var sectionSafe = regexp.MustCompile(`[^a-z0-9_]`)
+
+// tunnelPort checks a port in tunnel mode (0058): it is out of the uplink's
+// bridge and its VLANs, and each VNI it carries is on its tunnel's bridge,
+// the port itself for the untagged one, and an 802.1Q device of the port,
+// <port>.<vlan>, for each tagged one. Each tunnel is checked as a network's
+// is, and must be started.
+func (k *checker) tunnelPort(where, p string, maps map[string]any, bridge *uci.Section, vlans []*uci.Section, concentrators map[string]any) {
+	net := k.c.Package("network")
+	if slices.Contains(bridge.List("ports"), p) {
+		k.add("%s: the port is still in the uplink's bridge %s", where, value(bridge, "name"))
+	}
+	for _, bv := range vlans {
+		for _, e := range bv.List("ports") {
+			if port, _, _ := strings.Cut(e, ":"); port == p {
+				k.add("%s: VLAN %s of the uplink's bridge still has the port", where, value(bv, "vlan"))
+			}
+		}
+	}
+	for _, vlan := range keys(maps) {
+		m := obj(maps, vlan)
+		at := where + ".vxlan." + vlan
+		vni := text(m["vni"])
+		cid, _ := m["tunnel"].(string)
+		if k.tunnel(at, false, m, obj(concentrators, cid), true) == "" {
+			continue
+		}
+		member := p
+		if vlan != "untagged" {
+			member = p + "." + vlan
+			name := "aeolus_port_" + sectionSafe.ReplaceAllString(p, "_") + "_" + vlan
+			if d := net.Named(name); d == nil || d.Type != "device" || value(d, "type") != "8021q" ||
+				value(d, "ifname") != p || value(d, "vid") != vlan || value(d, "name") != member {
+				k.add("network.%s: want an 802.1Q device %s, VLAN %s on %s", name, member, vlan, p)
+			}
+		}
+		if b := net.Named(TunnelName(vni) + "_br"); b == nil || !slices.Contains(b.List("ports"), member) {
+			k.add("%s: %s is not in the tunnel's bridge br-vx%s", at, member, vni)
+		}
+		if !k.held("br-vx" + vni) {
+			k.add("%s: no interface is on the tunnel's bridge br-vx%s, so netifd never makes it and %s is on nothing; want network.%s_ports, proto none, on it", at, vni, member, TunnelName(vni))
+		}
+	}
+}
+
+// held says whether an interface that takes no address is on a bridge.
+// netifd makes a bridge only for an interface on it: a network's, or for a
+// VNI that only ports carry, one of its own (0058).
+func (k *checker) held(bridge string) bool {
+	for _, s := range k.c.Package("network").OfType("interface") {
+		if value(s, "device") == bridge && value(s, "proto") == "none" {
+			return true
+		}
+	}
+	return false
+}
+
+// portEntry says what a bridge-vlan entry's flags make of the VLAN.
+func portEntry(flags string) string {
+	switch {
+	case flags == "u*":
+		return "untagged"
+	case flags == "t":
+		return "tagged"
+	case flags == "":
+		return "not on the port"
+	}
+	return fmt.Sprintf("%q", flags)
+}
+
+// transports checks that every transport a network keeps has its path in
+// the network config, and the network's interface is on the primary's path.
+// A network with a fallback is switching's to check (0061).
+func (k *checker) transports(id string, n map[string]any, concentrators map[string]any) {
+	net := k.c.Package("network")
+	if net == nil {
+		if len(obj(n, "transport")) > 0 && !k.noNet {
+			k.add("package network is missing")
+			k.noNet = true
+		}
+		return
+	}
+	if obj(obj(n, "transport"), "fallback")["type"] != nil {
+		k.switching(id, n, concentrators)
+		return
+	}
+	for _, slot := range []string{"primary", "fallback"} {
+		t := obj(obj(n, "transport"), slot)
+		where := "network." + id + ".transport." + slot
+		path := "" // the device the network's interface is on, for this transport
+		switch t["type"] {
+		case "vlan":
+			vlan := text(t["vlan"])
+			found := false
+			for _, d := range net.OfType("device") {
+				if value(d, "type") == "8021q" && value(d, "vid") == vlan {
+					found = true
+				}
+			}
+			for _, bv := range net.OfType("bridge-vlan") {
+				if value(bv, "vlan") == vlan {
+					found = true
+				}
+			}
+			if !found {
+				k.add("%s: VLAN %s is not in the network config", where, vlan)
+			}
+			path = "." + vlan
+		case "vxlan":
+			path = k.tunnel(where, slot != "primary", t, obj(concentrators, text(t["concentrator"])), true)
+		}
+		if slot != "primary" || path == "" {
+			continue
+		}
+		iface := net.Named(InterfaceName(id))
+		if iface == nil || iface.Type != "interface" {
+			k.add("network.%s: no interface %s", id, InterfaceName(id))
+		} else if dev := value(iface, "device"); path[0] == '.' && !strings.HasSuffix(dev, path) {
+			k.add("network.%s: interface %s is on %q, want the primary's VLAN %s", id, iface.Name, dev, path[1:])
+		} else if path[0] != '.' && dev != path {
+			k.add("network.%s: interface %s is on %q, want the primary's tunnel bridge %s", id, iface.Name, dev, path)
+		}
+	}
+}
+
+// switching checks a network with a fallback (0061): a bridge of its own,
+// br-n and its hash, which its interface is on and in which neither
+// transport is configured, as the prober attaches the one that carries the
+// network; for a VLAN transport, a veth pair whose VLAN end is in the
+// uplink's bridge, untagged in the VLAN; for a VXLAN transport, its tunnel,
+// with no bridge of its own, and a fallback's started only in HA mode; and
+// the prober's plan, which names them all and says how the network
+// switches: report, or automatic with HA mode, failback and hold-down.
+func (k *checker) switching(id string, n map[string]any, concentrators map[string]any) {
+	net := k.c.Package("network")
+	h := NetHash(id)
+	sect, br := "aeolus_n"+h, "br-n"+h
+	k.plans = append(k.plans, sect)
+	b := net.Named(sect)
+	if b == nil || b.Type != "device" || value(b, "type") != "bridge" || value(b, "name") != br {
+		k.add("network.%s: want a bridge %s of the network's own, as it has a fallback (0061)", sect, br)
+		b = nil
+	} else if p := b.List("ports"); len(p) > 0 {
+		k.add("network.%s: the bridge has %v configured, but the prober attaches the transport that carries the network, so neither may be (0061)", sect, p)
+	}
+	if iface := net.Named(InterfaceName(id)); iface == nil || iface.Type != "interface" {
+		k.add("network.%s: no interface %s", id, InterfaceName(id))
+	} else if dev := value(iface, "device"); dev != br {
+		k.add("network.%s: interface %s is on %q, want the network's own bridge %s (0061)", id, iface.Name, dev, br)
+	}
+	uplink := ""
+	if a := k.c.Package("aeolus").Named("agent"); a != nil {
+		uplink = value(a, "uplink")
+	}
+	var up *uci.Section
+	for _, d := range net.OfType("device") {
+		if value(d, "type") == "bridge" && slices.Contains(d.List("ports"), uplink) {
+			up = d
+		}
+	}
+	at := "aeolus." + sect
+	tr := obj(n, "transport")
+	auto := tr["switching"] == "automatic"
+	ha, _ := tr["ha"].(bool)
+	plan := k.c.Package("aeolus").Named(sect)
+	if plan == nil || plan.Type != "switch" {
+		k.add("%s: no plan for the prober, which attaches the transport that carries network %s (0061)", at, id)
+		plan = nil
+	} else {
+		k.option(at, plan, "network", id)
+		k.option(at, plan, "bridge", br)
+		if auto {
+			k.option(at, plan, "mode", "automatic")
+			k.option(at, plan, "ha", map[bool]string{false: "0", true: "1"}[ha])
+			k.option(at, plan, "failback", cmp.Or(text(tr["failback"]), "revertive"))
+			k.option(at, plan, "holddown", cmp.Or(text(tr["holddown"]), "300"))
+		} else {
+			k.option(at, plan, "mode", "report")
+			for _, o := range []string{"ha", "failback", "holddown"} {
+				if v := value(plan, o); v != "" {
+					k.add("%s: %s is %q, but the network does not switch (report mode)", at, o, v)
+				}
+			}
+		}
+	}
+	mac := ""
+	for _, slot := range []string{"primary", "fallback"} {
+		t := obj(obj(n, "transport"), slot)
+		where := "network." + id + ".transport." + slot
+		s := slot[:1]
+		switch t["type"] {
+		case "vlan":
+			vlan := text(t["vlan"])
+			end, peer := "av"+s+h, "an"+s+h
+			if v := net.Named(sect + "_" + s); v == nil || v.Type != "device" || value(v, "type") != "veth" || value(v, "name") != end || value(v, "peer_name") != peer {
+				k.add("network.%s_%s: want a veth pair, %s and %s, for VLAN %s (0061)", sect, s, end, peer, vlan)
+			}
+			if up == nil || !slices.Contains(up.List("ports"), end) {
+				k.add("%s: the veth's VLAN end %s is not in the uplink's bridge", where, end)
+			}
+			untagged := false
+			for _, bv := range net.OfType("bridge-vlan") {
+				if value(bv, "vlan") == vlan && slices.Contains(bv.List("ports"), end+":u*") {
+					untagged = true
+				}
+			}
+			if !untagged {
+				k.add("%s: the veth's VLAN end %s is not untagged in VLAN %s", where, end, vlan)
+			}
+			if plan != nil {
+				k.option(at, plan, slot, peer)
+				k.option(at, plan, slot+"_vlan", vlan)
+			}
+			if mac == "" {
+				v, _ := strconv.Atoi(vlan)
+				mac = SegmentMAC(k.ap, "vlan", v)
+			}
+		case "vxlan":
+			vni := text(t["vni"])
+			k.tunnel(where, slot == "fallback" && !(auto && ha), t, obj(concentrators, text(t["concentrator"])), false)
+			if plan != nil {
+				k.option(at, plan, slot, TunnelName(vni))
+				k.option(at, plan, slot+"_vni", vni)
+			}
+			if mac == "" {
+				v, _ := strconv.Atoi(vni)
+				mac = SegmentMAC(k.ap, "vni", v)
+			}
+		}
+	}
+	if b != nil && mac != "" {
+		k.option("network."+sect, b, "macaddr", mac)
+	}
+}
+
+// tunnel checks a VXLAN transport's tunnel (0054): the interface named for
+// its VNI, to the concentrator, started unless it stands by; its bridge; the
+// firewall rule that lets it in; and the MSS clamp below 1500. A fallback
+// stands by, but in HA mode (0061). It returns the bridge the network's
+// interface goes on.
+func (k *checker) tunnel(where string, standby bool, t, conc map[string]any, bridged bool) string {
+	net := k.c.Package("network")
+	vni := text(t["vni"])
+	address := strings.Trim(text(conc["address"]), "[]")
+	port := text(conc["port"])
+	name := TunnelName(vni)
+	at := "network." + name
+	s := net.Named(name)
+	if s == nil || s.Type != "interface" {
+		k.add("%s: no tunnel %s to %s with VNI %s (is the vxlan package installed?)", where, name, address, vni)
+		return ""
+	}
+	proto, peer := "vxlan", "peeraddr"
+	if strings.Contains(address, ":") {
+		proto, peer = "vxlan6", "peer6addr"
+	}
+	k.option(at, s, "proto", proto)
+	k.option(at, s, peer, address)
+	k.option(at, s, "vid", vni)
+	got := value(s, "port")
+	if got == "" {
+		got = "4789" // the vxlan protocol's default
+	}
+	if got != port {
+		k.add("%s: port is %q, want %q", at, got, port)
+	}
+	k.option(at, s, "mtu", text(conc["mtu"]))
+	if link := value(s, "tunlink"); link == "" {
+		k.add("%s: tunlink is missing, want the management interface", at)
+	} else if l := net.Named(link); l == nil || l.Type != "interface" {
+		k.add("%s: tunlink %q names no interface", at, link)
+	} else {
+		// The tunnel's packets are its MTU plus VXLAN's headers, and the
+		// AP's uplink must carry them whole: VXLAN endpoints seldom put
+		// fragments back together (0056).
+		overhead := 50
+		if strings.Contains(address, ":") {
+			overhead = 70
+		}
+		mtu, _ := conc["mtu"].(float64)
+		if under, dev := underlayMTU(net, l); int(mtu)+overhead > under {
+			if dev != "" {
+				link += " (" + dev + ")"
+			}
+			k.add("%s: an MTU of %d needs %d on the AP's uplink, %s, which carries %d; raise the uplink's MTU, or leave the tunnel's MTU at its default (0056)",
+				where, int(mtu), int(mtu)+overhead, link, under)
+		}
+	}
+	// Where it starts (0063): the management interface, or the interface of
+	// Aeolus's own on the VLAN the tunnel names. On the VLAN the AP is
+	// managed on, that is the management interface (0084).
+	start := 0
+	if v, ok := conc["underlay_vlan"].(float64); ok {
+		start = int(v)
+	}
+	if start > 0 && k.managedOn(value(s, "tunlink"), start) {
+		start = 0
+	}
+	if link := value(s, "tunlink"); start > 0 && link != StartInterface(start) {
+		k.add("%s: tunlink is %q, want %s, as the tunnel starts from VLAN %d (0063)", at, link, StartInterface(start), start)
+	} else if start > 0 {
+		k.start(start)
+	} else if startSection.MatchString(link) {
+		k.add("%s: the tunnel starts from %s, want the management interface (0063)", at, link)
+	}
+	auto := value(s, "auto") != "0"
+	if !standby && !auto {
+		k.add("%s: the tunnel is not started", at)
+	}
+	if standby && auto {
+		k.add("%s: the fallback's tunnel is started; without HA mode, it waits until the AP needs it (0054, 0061)", at)
+	}
+
+	// A tunnel of a network with a fallback has no bridge of its own: the
+	// prober attaches it to the network's (0061).
+	bridge := name
+	if bridged {
+		bridge = "br-vx" + vni
+		if b := net.Named(name + "_br"); b == nil || b.Type != "device" || value(b, "type") != "bridge" || value(b, "name") != bridge {
+			k.add("network.%s_br: want a bridge %s for the tunnel", name, bridge)
+		} else if !slices.Contains(b.List("ports"), name) {
+			k.add("network.%s_br: the bridge does not carry the tunnel %s", name, name)
+		}
+	}
+
+	fw := k.c.Package("firewall")
+	if fw == nil {
+		k.add("%s: package firewall is missing, for the tunnel's rule", where)
+		return bridge
+	}
+	rule := "aeolus_vxlan_" + vni
+	if r := fw.Named(rule); r == nil || r.Type != "rule" {
+		k.add("firewall.%s: no rule letting the tunnel in from %s", rule, address)
+	} else {
+		for opt, want := range map[string]string{"proto": "udp", "src_ip": address, "dest_port": port, "target": "ACCEPT"} {
+			k.option("firewall."+rule, r, opt, want)
+		}
+		if start > 0 {
+			k.option("firewall."+rule, r, "src", StartZone)
+		} else if value(r, "src") == "" {
+			k.add("firewall.%s: src is missing, want the management interface's zone", rule)
+		}
+	}
+	if mtu, _ := conc["mtu"].(float64); mtu < 1500 {
+		if inc := fw.Named(clampInclude); inc == nil || inc.Type != "include" {
+			k.add("%s: MTU %s needs the MSS clamp, firewall.%s (is kmod-nft-bridge installed?)", where, text(conc["mtu"]), clampInclude)
+		} else {
+			k.option("firewall."+clampInclude, inc, "type", "nftables")
+			k.option("firewall."+clampInclude, inc, "path", clampPath)
+		}
+	}
+	return bridge
+}
+
+// BridgedName is the interface and device of a VNI a tunnel carries into
+// the AP's own bridge (0335), and BridgedPort matches one as a bridge's
+// port.
+func BridgedName(vni string) string { return "aeolus_b" + vni }
+
+var BridgedPort = regexp.MustCompile(`^aeolus_b[0-9]+$`)
+
+// untaggedVLAN is the VLAN of the uplink's bridge the uplink carries
+// untagged, or "" where it carries none, or the bridge filters no VLANs.
+func untaggedVLAN(uplink string, vlans []*uci.Section) string {
+	for _, bv := range vlans {
+		for _, e := range bv.List("ports") {
+			if port, flags, _ := strings.Cut(e, ":"); port == uplink && strings.HasPrefix(flags, "u") {
+				return value(bv, "vlan")
+			}
+		}
+	}
+	return ""
+}
+
+// bridged checks each VNI a tunnel carries into the AP's own bridge (0335):
+// a VXLAN interface aeolus_b<vni> to the tunnel's far end with its VNI and
+// port, bound to no interface and with no MTU of its own, so it takes the
+// bridge's (netifd drops a port that cannot); a port of the
+// uplink's bridge, untagged in the VLAN its place names, the untagged
+// network being the one the uplink carries untagged; and a firewall rule
+// letting it in.
+func (k *checker) bridged(concs map[string]any) {
+	net := k.c.Package("network")
+	if net == nil {
+		return
+	}
+	uplink, bridge := k.uplinkBridge()
+	var vlans []*uci.Section
+	if bridge != nil {
+		for _, bv := range net.OfType("bridge-vlan") {
+			if value(bv, "device") == value(bridge, "name") {
+				vlans = append(vlans, bv)
+			}
+		}
+	}
+	for _, id := range keys(concs) {
+		conc := obj(concs, id)
+		for _, w := range keys(obj(conc, "bridged")) {
+			where := "concentrators." + id + ".bridged." + w
+			vni := text(obj(obj(conc, "bridged"), w)["vni"])
+			address := strings.Trim(text(conc["address"]), "[]")
+			port := text(conc["port"])
+			name := BridgedName(vni)
+			at := "network." + name
+			s := net.Named(name)
+			if s == nil || s.Type != "interface" {
+				k.add("%s: no tunnel %s to %s with VNI %s carried into the AP's bridge (is the vxlan package installed?)", where, name, address, vni)
+				continue
+			}
+			proto, peer := "vxlan", "peeraddr"
+			if strings.Contains(address, ":") {
+				proto, peer = "vxlan6", "peer6addr"
+			}
+			k.option(at, s, "proto", proto)
+			k.option(at, s, peer, address)
+			k.option(at, s, "vid", vni)
+			if got := value(s, "port"); (got == "" && port != "4789") || (got != "" && got != port) {
+				k.add("%s: port is %q, want %q", at, got, port)
+			}
+			for _, opt := range []string{"tunlink", "mtu"} {
+				if v := value(s, opt); v != "" {
+					k.add("%s: %s is %q, want none: a port of the bridge takes the bridge's MTU, which a VXLAN bound to an interface may not reach (0335)", at, opt, v)
+				}
+			}
+			if bridge == nil {
+				k.add("%s: the uplink %s is in no bridge to carry it", where, uplink)
+				continue
+			}
+			if !slices.Contains(bridge.List("ports"), name) {
+				k.add("%s: %s is not a port of the uplink's bridge %s", where, name, value(bridge, "name"))
+			}
+			if len(vlans) > 0 {
+				vlan := w
+				if w == "untagged" {
+					vlan = untaggedVLAN(uplink, vlans)
+				}
+				in := false
+				for _, bv := range vlans {
+					if value(bv, "vlan") == vlan && slices.Contains(bv.List("ports"), name+":u*") {
+						in = true
+					}
+				}
+				if !in {
+					k.add("%s: VLAN %q of %s does not carry %s untagged (%s:u*)", where, vlan, value(bridge, "name"), name, name)
+				}
+			} else if w != "untagged" {
+				k.add("%s: the bridge %s has no VLANs, so VLAN %s cannot carry it", where, value(bridge, "name"), w)
+			}
+			fw := k.c.Package("firewall")
+			rule := "aeolus_bridged_" + vni
+			if fw == nil {
+				k.add("%s: package firewall is missing, for the tunnel's rule", where)
+			} else if r := fw.Named(rule); r == nil || r.Type != "rule" {
+				k.add("firewall.%s: no rule letting the tunnel in from %s", rule, address)
+			} else {
+				for opt, want := range map[string]string{"proto": "udp", "src_ip": address, "dest_port": port, "target": "ACCEPT"} {
+					k.option("firewall."+rule, r, opt, want)
+				}
+				if value(r, "src") == "" {
+					k.add("firewall.%s: src is missing, want the management interface's zone", rule)
+				}
+			}
+		}
+	}
+}
+
+// digitsOnly says whether s is a run of decimal digits.
+func digitsOnly(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+var apHex = regexp.MustCompile(`^ap-([0-9a-f]{12})$`)
+
+// SegmentMAC is the MAC an AP uses on one segment it probes (0060), made
+// from its ID ("ap-a0046082275e"): 02 for a VNI, its number in decimal
+// digits; 06 for a VLAN, the same; 0a for a VNI above 9999, its last 16
+// bits in hex. Between them, the last three bytes of the AP's own MAC. ""
+// for an ID that is not an AP's.
+func SegmentMAC(ap, kind string, n int) string {
+	m := apHex.FindStringSubmatch(ap)
+	if m == nil || n < 0 {
+		return ""
+	}
+	first, tail := "02", fmt.Sprintf("%04d", n)
+	switch {
+	case kind == "vlan":
+		first = "06"
+	case n > 9999:
+		first, tail = "0a", fmt.Sprintf("%04x", n&0xffff)
+	}
+	h := m[1]
+	return fmt.Sprintf("%s:%s:%s:%s:%s:%s", first, h[6:8], h[8:10], h[10:12], tail[:2], tail[2:])
+}
+
+// The tunnels Aeolus makes and their bridges, by name (0054).
+var (
+	tunnelSection = regexp.MustCompile(`^aeolus_([0-9]+)$`)
+	bridgeSection = regexp.MustCompile(`^aeolus_[0-9]+_br$`)
+)
+
+// probes checks the prober's plan (0059), in the agent's own package: for
+// each tunnel Aeolus made, a probe section named for it, with its tunnel's
+// probe interval and every probe address set for its VNI, by a network or a
+// tunnel port; and for each port on a tunnel, a guard section naming the
+// port, and the devices the loop guard sends on: the port itself, and its
+// 802.1Q devices on tunnels. Like the renderer, it takes the tunnels and the
+// ports on them from the network config as rendered, which the other checks
+// hold to the intent.
+func (k *checker) probes(doc map[string]any) {
+	net := k.c.Package("network")
+	if net == nil {
+		return
+	}
+	type use struct {
+		interval string
+		address  []string
+	}
+	uses := map[string]*use{}
+	concs := obj(doc, "concentrators")
+	add := func(vni, tunnel string, probe any) {
+		u := uses[vni]
+		if u == nil {
+			u = &use{}
+			uses[vni] = u
+		}
+		if iv, ok := obj(concs, tunnel)["probe_interval"]; ok && u.interval == "" {
+			u.interval = text(iv)
+		}
+		if a, ok := probe.(string); ok && !slices.Contains(u.address, a) {
+			u.address = append(u.address, a)
+		}
+	}
+	for _, id := range keys(obj(doc, "network")) {
+		n := obj(obj(doc, "network"), id)
+		if n["enabled"] == false {
+			continue
+		}
+		for _, slot := range []string{"primary", "fallback"} {
+			if t := obj(obj(n, "transport"), slot); t["type"] == "vxlan" {
+				add(text(t["vni"]), text(t["concentrator"]), t["probe"])
+			}
+		}
+	}
+	for _, p := range keys(obj(doc, "ports")) {
+		set := obj(obj(doc, "ports"), p)
+		if set["mode"] != "tunnel" {
+			continue
+		}
+		for _, vlan := range keys(obj(set, "vxlan")) {
+			m := obj(obj(set, "vxlan"), vlan)
+			add(text(m["vni"]), text(m["tunnel"]), m["probe"])
+		}
+	}
+
+	a := k.c.Package("aeolus")
+	expected := map[string]bool{}
+	for _, s := range net.OfType("interface") {
+		m := tunnelSection.FindStringSubmatch(s.Name)
+		if p := value(s, "proto"); m == nil || p != "vxlan" && p != "vxlan6" {
+			continue
+		}
+		expected[s.Name] = true
+		interval, address := "30", []string(nil)
+		if u := uses[m[1]]; u != nil {
+			if u.interval != "" {
+				interval = u.interval
+			}
+			address = u.address
+		}
+		where := "aeolus." + s.Name
+		p := a.Named(s.Name)
+		if p == nil || p.Type != "probe" {
+			k.add("%s: no probe section for the tunnel, which the prober needs (0059)", where)
+			continue
+		}
+		k.option(where, p, "vni", m[1])
+		k.option(where, p, "interval", interval)
+		if got := p.List("address"); !sameSet(got, address) {
+			k.add("%s: probe addresses are %v, want %v", where, got, address)
+		}
+		// The AP's MAC on the segment: the probe's, for its lease, and the
+		// bridge's, so what answers it stays at the AP (0060).
+		if k.ap != "" {
+			n, _ := strconv.Atoi(m[1])
+			want := SegmentMAC(k.ap, "vni", n)
+			k.option(where, p, "mac", want)
+			if b := net.Named(s.Name + "_br"); b != nil {
+				k.option("network."+b.Name, b, "macaddr", want)
+			}
+		}
+	}
+
+	ports := map[string]string{} // an 802.1Q device Aeolus made -> the port under it
+	for _, d := range net.OfType("device") {
+		if strings.HasPrefix(d.Name, "aeolus_") && value(d, "type") == "8021q" && value(d, "name") != "" {
+			ports[value(d, "name")] = value(d, "ifname")
+		}
+	}
+	guards := map[string][]string{}
+	for _, b := range net.OfType("device") {
+		if !bridgeSection.MatchString(b.Name) {
+			continue
+		}
+		for _, e := range b.List("ports") {
+			if strings.HasPrefix(e, "aeolus_") {
+				continue // the tunnel itself
+			}
+			p := e
+			if q, ok := ports[e]; ok {
+				p = q
+			}
+			if !slices.Contains(guards[p], e) {
+				guards[p] = append(guards[p], e)
+			}
+		}
+	}
+	for _, p := range slices.Sorted(maps.Keys(guards)) {
+		name := "aeolus_guard_" + sectionSafe.ReplaceAllString(p, "_")
+		expected[name] = true
+		where := "aeolus." + name
+		g := a.Named(name)
+		if g == nil || g.Type != "guard" {
+			k.add("%s: no loop guard for %s, which is on a tunnel (0059)", where, p)
+			continue
+		}
+		k.option(where, g, "port", p)
+		if got := g.List("device"); !sameSet(got, guards[p]) {
+			k.add("%s: guards %v, want %v", where, got, guards[p])
+		}
+	}
+	// The VLAN transports of networks with a fallback (0061), and of those
+	// that go off the air when lost (0201), each probed on the uplink from
+	// the VLAN's own MAC, tagged as the uplink carries it.
+	onVLAN := map[string][]string{}
+	for _, id := range keys(obj(doc, "network")) {
+		n := obj(obj(doc, "network"), id)
+		down, _ := obj(n, "transport")["down_when_lost"].(bool)
+		if n["enabled"] == false || (obj(obj(n, "transport"), "fallback")["type"] == nil && !down) {
+			continue
+		}
+		for _, slot := range []string{"primary", "fallback"} {
+			t := obj(obj(n, "transport"), slot)
+			if t["type"] != "vlan" {
+				continue
+			}
+			vlan := text(t["vlan"])
+			if _, ok := onVLAN[vlan]; !ok {
+				onVLAN[vlan] = []string{}
+			}
+			if a, ok := t["probe"].(string); ok && !slices.Contains(onVLAN[vlan], a) {
+				onVLAN[vlan] = append(onVLAN[vlan], a)
+			}
+		}
+	}
+	uplink := ""
+	if s := a.Named("agent"); a != nil && s != nil {
+		uplink = value(s, "uplink")
+	}
+	for _, vlan := range slices.Sorted(maps.Keys(onVLAN)) {
+		name := "aeolus_vlan" + vlan
+		expected[name] = true
+		where := "aeolus." + name
+		pr := a.Named(name)
+		if pr == nil || pr.Type != "probe" {
+			k.add("%s: no probe for VLAN %s, which a network with a fallback, or one that goes off the air when lost, uses (0061, 0201)", where, vlan)
+			continue
+		}
+		k.option(where, pr, "vlan", vlan)
+		k.option(where, pr, "device", uplink)
+		tagged := "0"
+		for _, bv := range net.OfType("bridge-vlan") {
+			if value(bv, "vlan") == vlan && slices.Contains(bv.List("ports"), uplink+":t") {
+				tagged = "1"
+			}
+		}
+		k.option(where, pr, "tagged", tagged)
+		k.option(where, pr, "interval", "30")
+		if got := pr.List("address"); !sameSet(got, onVLAN[vlan]) {
+			k.add("%s: probe addresses are %v, want %v", where, got, onVLAN[vlan])
+		}
+		if k.ap != "" {
+			v, _ := strconv.Atoi(vlan)
+			k.option(where, pr, "mac", SegmentMAC(k.ap, "vlan", v))
+		}
+	}
+	for _, name := range k.downPlans {
+		expected[name] = true
+	}
+	for _, name := range k.plans {
+		expected[name] = true
+	}
+	for _, name := range k.watches(doc, uplink) {
+		expected[name] = true
+	}
+	expected["aeolus_rrm"] = true        // radio resource management's, which k.rrm judges (0073)
+	expected["aeolus_gi"] = true         // the 802.11ax guard interval's, which k.guardInterval judges (0089)
+	expected["aeolus_power"] = true      // the transmit power held with iw, which k.radioPower judges (0349)
+	expected["aeolus_radios_off"] = true // the radios Aeolus turned off, which k.radiosOff judges (0238)
+	expected["aeolus_journey"] = true    // captures of failed attempts set off, which k.captures judges (0135)
+	expected["aeolus_path"] = true       // the internet target, which k.internet judges (0142)
+	expected["aeolus_ble"] = true        // the Bluetooth radio lent to Home Assistant, which k.ble judges (0156)
+	expected["aeolus_steer"] = true      // the networks whose clients are steered, which k.steer judges (0138)
+	expected["aeolus_hold"] = true       // a test window, which k.hold judges (0344)
+	expected[Unbond] = true              // a bond taken apart, which k.bond judges (0096)
+	if a != nil {
+		for _, s := range a.Sections {
+			if strings.HasPrefix(s.Name, "aeolus_") && !expected[s.Name] {
+				k.add("aeolus.%s: no tunnel, tunnel port, network with a fallback or VLAN on the uplink calls for it", s.Name)
+			}
+		}
+	}
+}
+
+// watches checks the VLANs the prober watches on the uplink (0064): a watch
+// section for each VLAN the intent needs there, for a network's VLAN
+// transport, a port's VLANs on this AP, or a tunnel's start (0063), as the
+// uplink carries it, tagged or not, with the AP's MAC on the VLAN. A VLAN the
+// uplink doesn't carry is the other checks' to report. It returns the
+// sections it expects.
+func (k *checker) watches(doc map[string]any, uplink string) []string {
+	net := k.c.Package("network")
+	var up *uci.Section
+	for _, d := range net.OfType("device") {
+		if uplink != "" && value(d, "type") == "bridge" && slices.Contains(d.List("ports"), uplink) {
+			up = d
+		}
+	}
+	if up == nil {
+		return nil
+	}
+	need := map[int]bool{}
+	for _, id := range keys(obj(doc, "network")) {
+		n := obj(obj(doc, "network"), id)
+		if n["enabled"] == false {
+			continue
+		}
+		for _, slot := range []string{"primary", "fallback"} {
+			if t := obj(obj(n, "transport"), slot); t["type"] == "vlan" {
+				if v, ok := t["vlan"].(float64); ok {
+					need[int(v)] = true
+				}
+			}
+		}
+	}
+	for _, p := range keys(obj(doc, "ports")) {
+		set := obj(obj(doc, "ports"), p)
+		if mode := set["mode"]; mode != "access" && mode != "trunk" || p == uplink || !slices.Contains(up.List("ports"), p) {
+			continue
+		}
+		if v, ok := set["untagged"].(float64); ok && v > 0 {
+			need[int(v)] = true
+		}
+		if set["mode"] == "trunk" {
+			for _, v := range asSlice(set["tagged"]) {
+				if v, ok := v.(float64); ok {
+					need[int(v)] = true
+				}
+			}
+		}
+	}
+	for _, s := range net.OfType("interface") {
+		if startSection.MatchString(s.Name) {
+			v, _ := strconv.Atoi(strings.TrimSuffix(strings.TrimPrefix(s.Name, "aeolus_vlan"), "_tunnels"))
+			need[v] = true
+		}
+	}
+	a := k.c.Package("aeolus")
+	var names []string
+	for _, v := range slices.Sorted(maps.Keys(need)) {
+		vlan := strconv.Itoa(v)
+		entry, carried := "", false
+		for _, bv := range net.OfType("bridge-vlan") {
+			if value(bv, "device") != value(up, "name") || value(bv, "vlan") != vlan {
+				continue
+			}
+			for _, e := range bv.List("ports") {
+				if port, flags, _ := strings.Cut(e, ":"); port == uplink {
+					entry, carried = flags, true
+				}
+			}
+		}
+		if !carried {
+			continue
+		}
+		name := "aeolus_watch" + vlan
+		names = append(names, name)
+		where := "aeolus." + name
+		w := a.Named(name)
+		if w == nil || w.Type != "watch" {
+			k.add("%s: no watch for VLAN %d, which the AP carries on its uplink for the intent; the prober tells from it whether the VLAN reaches the AP (0064)", where, v)
+			continue
+		}
+		k.option(where, w, "vlan", vlan)
+		k.option(where, w, "device", uplink)
+		k.option(where, w, "tagged", map[bool]string{false: "0", true: "1"}[strings.Contains(entry, "t")])
+		if k.ap != "" {
+			k.option(where, w, "mac", SegmentMAC(k.ap, "vlan", v))
+		}
+	}
+	return names
+}
+
+// hostname checks the AP's hostname, which is its name in Aeolus (0076).
+func (k *checker) hostname(ap map[string]any) {
+	h, ok := ap["hostname"].(string)
+	if !ok {
+		return
+	}
+	var s *uci.Section
+	if p := k.c.Package("system"); p != nil {
+		if all := p.OfType("system"); len(all) > 0 {
+			s = all[0]
+		}
+	}
+	if s == nil {
+		k.add("system: no system section for the hostname %q", h)
+		return
+	}
+	k.option("system", s, "hostname", h)
+}
+
+func (k *checker) system(sys map[string]any) {
+	if len(sys) == 0 {
+		return
+	}
+	p := k.c.Package("system")
+	checked := sys["tz"] != nil || sys["ntp"] != nil || sys["syslog"] != nil
+	if p == nil {
+		if checked {
+			k.add("package system is missing")
+		}
+		return
+	}
+	var s *uci.Section
+	if all := p.OfType("system"); len(all) > 0 {
+		s = all[0]
+	}
+	if s == nil {
+		if sys["tz"] != nil || sys["syslog"] != nil {
+			k.add("system: no system section")
+		}
+	} else {
+		if tz, ok := sys["tz"].(string); ok {
+			k.option("system", s, "zonename", tz)
+			// The rule sets the clock: a name alone leaves it on UTC (0074).
+			if rule, ok := schema.ZoneRule(tz); ok {
+				k.option("system", s, "timezone", rule)
+			}
+		}
+		if syslog, ok := sys["syslog"].(string); ok {
+			host, port := splitHostPort(syslog)
+			k.option("system", s, "log_ip", host)
+			if port != "" {
+				k.option("system", s, "log_port", port)
+			}
+		}
+	}
+	if ntp := list(sys["ntp"]); sys["ntp"] != nil {
+		var got []string
+		if t := p.Named("ntp"); t != nil && t.Type == "timeserver" {
+			got = t.List("server")
+		}
+		if !sameSet(got, ntp) {
+			k.add("system.ntp: servers are %v, want %v", got, ntp)
+		}
+	} else if t := p.Named("ntp"); t != nil && t.Type == "timeserver" {
+		// Never OpenWrt's internet pool (0069).
+		for _, v := range t.List("server") {
+			if strings.HasSuffix(v, ".openwrt.pool.ntp.org") {
+				k.add("system.ntp: OpenWrt's internet pool is still set (%s)", v)
+				break
+			}
+		}
+	}
+	k.rebind(sys)
+}
+
+// hostName matches a DNS name, not an address.
+var hostName = regexp.MustCompile(`^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*$`)
+var dotted = regexp.MustCompile(`^[0-9.]+$`)
+
+// rebind checks that each name the AP's time servers and syslog host are
+// given by may resolve to a private address (0069): dnsmasq's rebind
+// protection lists it in rebind_domain, where the AP runs dnsmasq.
+func (k *checker) rebind(sys map[string]any) {
+	d := k.c.Package("dhcp")
+	if d == nil {
+		return
+	}
+	all := d.OfType("dnsmasq")
+	if len(all) == 0 {
+		return
+	}
+	names := list(sys["ntp"])
+	if syslog, ok := sys["syslog"].(string); ok {
+		host, _ := splitHostPort(syslog)
+		names = append(names, host)
+	}
+	have := map[string]bool{}
+	for _, n := range all[0].List("rebind_domain") {
+		have[n] = true
+	}
+	for _, n := range names {
+		if hostName.MatchString(n) && !dotted.MatchString(n) && !have[n] {
+			k.add("dnsmasq: %s, which the AP uses, is not in rebind_domain, so it cannot resolve to a private address", n)
+		}
+	}
+}
+
+// agent checks the settings rendered for the agent itself, in its own
+// package (0040): the poll interval.
+func (k *checker) agent(sys map[string]any) {
+	poll, ok := sys["poll"]
+	if !ok {
+		return
+	}
+	s := k.c.Package("aeolus").Named("agent")
+	if s == nil || s.Type != "agent" {
+		k.add("aeolus: no agent section, want poll %s", text(poll))
+		return
+	}
+	k.option("aeolus.agent", s, "poll", text(poll))
+}
+
+// option checks one option's value. Only non-secret options go through here.
+func (k *checker) option(where string, s *uci.Section, name, want string) {
+	if got, ok := s.Option(name); !ok {
+		k.add("%s: %s is missing, want %q", where, name, want)
+	} else if got != want {
+		k.add("%s: %s is %q, want %q", where, name, got, want)
+	}
+}
+
+// switchOption checks a radio's on-or-off option (0196): "1" or "0" where
+// the switch is set, none where it is unset, OpenWrt's default.
+func (k *checker) switchOption(where string, s *uci.Section, name string, v any) {
+	if b, ok := v.(bool); ok {
+		k.option(where, s, name, bit(b))
+	} else {
+		k.absent(where, s, name)
+	}
+}
+
+// absent checks an option is not there.
+func (k *checker) absent(where string, s *uci.Section, name string) {
+	if got, ok := s.Option(name); ok {
+		k.add("%s: %s is %q, want none (unset)", where, name, got)
+	}
+}
+
+// downs checks the prober's plan for each network that goes off the air on
+// this AP while it cannot reach its way on (0201): what it is judged by,
+// the switch of a network with a fallback, else its tunnel's probe by VNI
+// or its VLAN's; and the network's Wi-Fi sections here.
+func (k *checker) downs(doc map[string]any) {
+	wl, a := k.c.Package("wireless"), k.c.Package("aeolus")
+	for _, id := range keys(obj(doc, "network")) {
+		n := obj(obj(doc, "network"), id)
+		tr := obj(n, "transport")
+		if on, _ := tr["down_when_lost"].(bool); !on || n["enabled"] == false || wl == nil {
+			continue
+		}
+		var ifaces []string
+		for _, r := range wl.OfType("wifi-device") {
+			if s := wl.Named(IfaceName(id, r.Name)); s != nil && s.Type == "wifi-iface" {
+				ifaces = append(ifaces, s.Name)
+			}
+		}
+		if len(ifaces) == 0 {
+			continue
+		}
+		slices.Sort(ifaces)
+		p := obj(tr, "primary")
+		via := ""
+		switch {
+		case obj(tr, "fallback")["type"] != nil:
+			via = "switch"
+		case p["type"] == "vxlan":
+			via = text(p["vni"])
+		case p["type"] == "vlan":
+			via = "vlan" + text(p["vlan"])
+		}
+		sect := "aeolus_down_" + NetHash(id)
+		k.downPlans = append(k.downPlans, sect)
+		at := "aeolus." + sect
+		var plan *uci.Section
+		if a != nil {
+			plan = a.Named(sect)
+		}
+		if plan == nil || plan.Type != "down" {
+			k.add("%s: no plan for the prober, which takes network %s off the air while it cannot reach its way on (0201)", at, id)
+			continue
+		}
+		k.option(at, plan, "network", id)
+		k.option(at, plan, "via", via)
+		if got := plan.List("iface"); !slices.Equal(got, ifaces) {
+			k.add("%s: its Wi-Fi sections are %v, want %v", at, got, ifaces)
+		}
+	}
+}
+
+// splitHostPort reads "host", "host:port", "[v6]" or "[v6]:port".
+func splitHostPort(s string) (host, port string) {
+	if strings.HasPrefix(s, "[") {
+		end := strings.Index(s, "]")
+		if end < 0 {
+			return s, ""
+		}
+		host, rest := s[1:end], s[end+1:]
+		return host, strings.TrimPrefix(rest, ":")
+	}
+	if strings.Count(s, ":") == 1 {
+		host, port, _ := strings.Cut(s, ":")
+		return host, port
+	}
+	return s, ""
+}
+
+func obj(m map[string]any, key string) map[string]any {
+	v, _ := m[key].(map[string]any)
+	return v
+}
+
+func keys(m map[string]any) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func list(v any) []string {
+	var out []string
+	for _, e := range asSlice(v) {
+		out = append(out, text(e))
+	}
+	return out
+}
+
+func asSlice(v any) []any {
+	s, _ := v.([]any)
+	return s
+}
+
+// text writes a JSON value as UCI holds it: numbers without a decimal point.
+func text(v any) string {
+	switch x := v.(type) {
+	case float64:
+		return strconv.FormatFloat(x, 'f', -1, 64)
+	case string:
+		return x
+	case nil:
+		return ""
+	}
+	return fmt.Sprint(v)
+}
+
+func value(s *uci.Section, name string) string {
+	v, _ := s.Option(name)
+	return v
+}
+
+func onOff(b bool) string {
+	if b {
+		return "on"
+	}
+	return "off"
+}
+
+// bit writes a boolean as OpenWrt's options hold one.
+func bit(b bool) string {
+	if b {
+		return "1"
+	}
+	return "0"
+}
+
+func sameSet(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	seen := map[string]int{}
+	for _, x := range a {
+		seen[x]++
+	}
+	for _, x := range b {
+		seen[x]--
+	}
+	for _, n := range seen {
+		if n != 0 {
+			return false
+		}
+	}
+	return true
+}

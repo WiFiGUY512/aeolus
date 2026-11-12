@@ -1,0 +1,13 @@
+mode 0 1 2 null null null
+op class 81 82 115 118 121 125 131
+report { "mac": "50:31:23:9d:72:62", "token": 1, "op_class": 126, "channel": 157, "dbm": -56, "rsni": null, "bssid": "3a:86:2d:ef:2f:c0" }
+report { "mac": "04:4a:69:29:d3:26", "token": 1, "op_class": 121, "channel": 100, "dbm": -62, "rsni": 82, "bssid": "3a:86:2d:bc:a5:c0" }
+report, half a dB -61.5
+report, a signed dBm { "mac": "50:31:23:9d:72:62", "token": 1, "op_class": 126, "channel": 157, "dbm": -62, "rsni": null, "bssid": "3a:86:2d:ef:2f:c0", "quirk": true }, -102 null
+report refused null, too short null, another line null, nothing null
+due [ "aa:00:00:00:00:02", "aa:00:00:00:00:05" ]
+due, all [ "aa:00:00:00:00:02", "aa:00:00:00:00:05", "aa:00:00:00:00:03" ]
+hears -62, power down 6 -68, no power said -70, stale null, another BSSID null, nothing null
+notified { "mac": "50:31:23:9d:72:62", "op_class": 115, "channel": 44, "dbm": -66, "bssid": "20:05:b6:df:64:e9" }
+notified, the signal in dBm as a signed byte { "mac": "50:31:23:9d:72:62", "op_class": 115, "channel": 44, "dbm": -62, "bssid": "20:05:b6:df:64:e9", "quirk": true }, no rep-mode said { "mac": "50:31:23:9d:72:62", "op_class": 115, "channel": 44, "dbm": -66, "bssid": "20:05:b6:df:64:e9" }
+not: refused null, incapable null, no signal null, no BSSID null, no channel null, nothing null

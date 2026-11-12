@@ -1,0 +1,111 @@
+an authentication the radio heard: heard, 30 bytes beginning b0000000, interface 14, 2462 MHz, -48 dBm
+the same from a processor that counts the other way: heard, 30 bytes beginning b0000000, interface 14, 2462 MHz, -48 dBm
+its answer, as hostapd asks for it: sent, 30 bytes beginning b0000000, interface 14, 2462 MHz
+the radio's word on the answer: status, 30 bytes beginning b0000000, interface 14, acknowledged
+its word on one the client did not acknowledge: status, 26 bytes beginning c0000000, interface 14, not acknowledged
+an answer to a probe, sent with no word asked for: sent, 104 bytes beginning 50000000, interface 14, 2462 MHz, no word asked for
+a key message to the client: sent, a key message, 99 bytes beginning 0203005f, the client 30:86:2d:ef:2f:f0, interface 14
+the client's answer: heard, a key message, 99 bytes beginning 0203005f, the client 30:86:2d:ef:2f:f0, interface 14
+the radio's word on a key message: status, a key message, 99 bytes beginning 0203005f, the client 30:86:2d:ef:2f:f0, interface 14, acknowledged
+a neighbour's beacon: nothing
+the kernel's answer to a frame asked for: its number alone: nothing
+a client's counters (another command): nothing
+netlink's own answer: nothing
+a word on a frame, going the wrong way: nothing
+a data frame handed up as management: nothing
+a frame too short for its header: nothing
+an entry cut short: nothing
+a key message that names no client: nothing
+nothing at all: nothing
+a probe for any network: 30:86:2d:ef:2f:f0, find: probe request, for any network
+a probe for one by name: 30:86:2d:ef:2f:f0, find: probe request, for "Sweet ?Spot?"
+the AP's answer to a probe: not said
+an authentication request: 30:86:2d:ef:2f:f0, auth: request from it
+one by a fast transition: 30:86:2d:ef:2f:f0, auth: request from it, by a fast transition (802.11r)
+its answer: 30:86:2d:ef:2f:f0, auth: answer to it: ok
+an answer that refuses: 30:86:2d:ef:2f:f0, auth: answer to it: refused, status 17 [no]
+the radio's word that the answer was acknowledged: not said
+its word that it was not: 30:86:2d:ef:2f:f0, auth: answer to it: ok, not acknowledged by it [no]
+WPA3's commit: 30:86:2d:ef:2f:f0, auth: SAE commit from it
+the AP's, asking for a token first: 30:86:2d:ef:2f:f0, auth: SAE commit to it
+WPA3's confirm, refused: 30:86:2d:ef:2f:f0, auth: SAE confirm to it: refused, status 15 [no]
+an association request: 30:86:2d:ef:2f:f0, assoc: request from it
+a reassociation request: 30:86:2d:ef:2f:f0, assoc: request from it, as one that comes from 72:bb:66:9f:76:94
+the association's answer: 30:86:2d:ef:2f:f0, assoc: answer to it: ok, AID 1
+one that refuses: 30:86:2d:ef:2f:f0, assoc: answer to it: refused, status 17 [no]
+key message 1: 30:86:2d:ef:2f:f0, key: message 1 of 4 to it
+key message 2: 30:86:2d:ef:2f:f0, key: message 2 of 4 from it
+key message 3: 30:86:2d:ef:2f:f0, key: message 3 of 4 to it
+key message 4: 30:86:2d:ef:2f:f0, key: message 4 of 4 from it
+key message 3, not acknowledged: 30:86:2d:ef:2f:f0, key: message 3 of 4 to it, not acknowledged by it [no]
+a group key message: 30:86:2d:ef:2f:f0, key: group key message 1 of 2 to it
+a sign-in's request: 30:86:2d:ef:2f:f0, signin: EAP request to it
+its response: 30:86:2d:ef:2f:f0, signin: EAP response from it
+a sign-in refused: 30:86:2d:ef:2f:f0, signin: EAP failure to it [no]
+a client that starts a sign-in: 30:86:2d:ef:2f:f0, signin: it asks to sign in (EAPOL-Start)
+a deauthentication from the client: 30:86:2d:ef:2f:f0, end: deauthentication from it, reason 3 (leaving)
+one to it, for a handshake that timed out: 30:86:2d:ef:2f:f0, end: deauthentication to it, reason 15 (the key handshake timed out)
+a disassociation with a reason not named: 30:86:2d:ef:2f:f0, end: disassociation to it, reason 99
+a deauthentication to every station: not said
+asked to move: 30:86:2d:ef:2f:f0, steer: asked to move (BSS transition request)
+it agrees: 30:86:2d:ef:2f:f0, steer: it agrees to move (BSS transition response)
+it will not: 30:86:2d:ef:2f:f0, steer: it will not move (BSS transition response, status 6)
+it asks for the neighbours: 30:86:2d:ef:2f:f0, steer: it asks for the neighbours (neighbour report request)
+another action: 30:86:2d:ef:2f:f0, said: action frame from it, category 127
+heard on 2.4 GHz: header 00000f002a00000000009e098000d0, then b0000000..., names [ "32:86:2d:ef:2f:c0", "30:86:2d:ef:2f:f0", "32:86:2d:ef:2f:c0" ]
+sent on 2.4 GHz: header 000010000a80000000009e0980000000, then b0000000..., names [ "30:86:2d:ef:2f:f0", "32:86:2d:ef:2f:c0", "32:86:2d:ef:2f:c0" ]
+a key message heard, on a radio last said to be on 5 GHz: header 00000e000a000000000064140001, then 08010000..., names [ "32:86:2d:ef:2f:c0", "30:86:2d:ef:2f:f0", "32:86:2d:ef:2f:c0" ]
+a key message sent, on 6 GHz: header 000010000a8000000000e31700000000, then 08020000..., names [ "30:86:2d:ef:2f:f0", "32:86:2d:ef:2f:c0", "32:86:2d:ef:2f:c0" ]
+one on a radio whose frequency was never said: header 00000c000280000000000000, then 08020000..., names [ "30:86:2d:ef:2f:f0", "32:86:2d:ef:2f:c0", "32:86:2d:ef:2f:c0" ]
+a key message heard, after its header: 0801000032862def2fc030862def2ff032862def2fc00000aaaa03000000888e0203005f02008a00100000000000000007
+the ring: 15 frames, 1319 bytes, on 2462 MHz; 1 wait for the radio's word
+  +    0.0 ms  client management 40  heard
+  +    1.0 ms  AP     management 50  sent, no word yet, none asked for, its header's word 0000
+  + 5000.0 ms  client management b0  heard
+  + 5001.5 ms  AP     management b0  sent, acknowledged, its header's word 0000
+  + 5007.0 ms  client management 00  heard
+  + 5010.0 ms  AP     management 10  sent, acknowledged, its header's word 0000
+  + 5110.0 ms  AP     key message 1  sent, acknowledged, its header's word 0000
+  + 5114.0 ms  client key message 1  heard
+  + 5114.5 ms  AP     key message 2  sent, not acknowledged, its header's word 0100 [The client did not acknowledge this.]
+  + 6114.5 ms  AP     key message 3  sent, acknowledged, its header's word 0000
+  + 7000.0 ms  AP     management c0  sent, not acknowledged, its header's word 0100 [The client did not acknowledge this.]
+  + 7001.0 ms  AP     management c0  sent, acknowledged, its header's word 0000
+  + 7100.0 ms  AP     management c0  sent, not acknowledged, to every station, its header's word 0000
+  + 7200.0 ms  AP     management 10  sent, acknowledged, its header's word 0000
+  + 7300.0 ms  AP     management b0  sent, no word yet, its header's word 0000 [The radio did not say whether the client acknowledged this.]
+a probe to every station, handed up six times, another client's among them, and again 100 ms on: kept [ true, false, true, false, false, false, false, true ]
+one to this network alone, handed up twice: kept [ true, true ]
+a word six seconds after its frame: 2 frames kept, the first with no word
+of 100 frames sent in a tenth of a second, 64 wait for a word
+the client's, from 104 to 106: 7; from 90: 14; another's: 1; no one's: 0
+a full ring: 1052 frames, 2145028 bytes, never more than 2620115, made anew 6 times in 2600 frames, the oldest from 1015.00
+a ring of small frames: 10000 at the most, 8099 now
+of 700 frames of one client, 600 are given, from 1001.00
+what names no station is not kept: null, null
+capture: 15 frames, 14 from the radio, 1 from the wire side, 2400 bytes
+  section: byte order 1a2b3c4d, version 1.0
+  interface: link type 127, at most 2048 bytes a frame, named "phy0, as hostapd had it"
+  interface: link type 1, at most 2048 bytes a frame, named "phy0-ap1, the wire side"
+  frame: interface 0, at 0 us, 79 bytes
+  frame: interface 0, at 1000 us, 120 bytes
+  frame: interface 0, at 5000000 us, 45 bytes
+  frame: interface 0, at 5001500 us, 46 bytes
+  frame: interface 0, at 5007000 us, 99 bytes
+  frame: interface 0, at 5010000 us, 86 bytes
+  frame: interface 0, at 5110000 us, 147 bytes
+  frame: interface 0, at 5114000 us, 145 bytes
+  frame: interface 0, at 5114500 us, 147 bytes, noted: The client did not acknowledge this.
+  frame: interface 1, at 5300000 us, 314 bytes
+  frame: interface 0, at 6114500 us, 147 bytes
+  frame: interface 0, at 7000000 us, 42 bytes, noted: The client did not acknowledge this.
+  frame: interface 0, at 7001000 us, 42 bytes
+  frame: interface 0, at 7200000 us, 86 bytes
+  frame: interface 0, at 7300000 us, 46 bytes, noted: The radio did not say whether the client acknowledged this.
+nothing kept of a client: null
+no ring, and frames from the wire side alone: 1
+three minutes on: 17 frames held of 17, 1 of the client given from then
+four minutes on: 2 frames, the oldest from 290.000
+of 400 large frames of one client, 262 are in its file: as many as fit, as it may hold 524288 bytes of them
+a stamp of 16 bytes: 1791750185354.910; the other way round: 1791750185354.910; of 8 bytes: 1791750185354.910
+read into numbers: 1791750185354.910, 1791750185354.910; with no part of a second: null; from another day: null; later than now: null; nothing: null

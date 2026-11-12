@@ -1,0 +1,22 @@
+[
+  {"hostname": "tower-switch", "fqdn": "tower-switch.example.com"},
+  {"mfgName": "Arista", "modelName": "DCS-7050SX-64", "systemMacAddress": "2c:dd:e9:12:72:e2", "version": "4.28.3M"},
+  {"lldpNeighbors": [
+    {"port": "Ethernet18", "neighborDevice": "homelab.example.com", "neighborPort": "Ethernet28", "ttl": 120},
+    {"port": "Ethernet1", "neighborDevice": "firewall", "neighborPort": "igb1", "ttl": 120}
+  ]},
+  {"unicastTable": {"tableEntries": [
+    {"vlanId": 1010, "macAddress": "28:e7:1d:d2:d0:13", "entryType": "dynamic", "interface": "Ethernet18"},
+    {"vlanId": 2, "macAddress": "00:0d:b9:aa:bb:cc", "entryType": "dynamic", "interface": "Ethernet1"}
+  ]}},
+  {"interfaces": {
+    "Vlan1010": {"name": "Vlan1010", "lineProtocolStatus": "up", "interfaceAddress": {"ipAddr": {"address": "10.0.1.250", "maskLen": 30}}},
+    "Vlan2": {"name": "Vlan2", "lineProtocolStatus": "up", "interfaceAddress": {"ipAddr": {"address": "10.0.0.2", "maskLen": 24}}}
+  }},
+  {"vrfs": {"default": {"routes": {"0.0.0.0/0": {"routeType": "static", "vias": [{"nexthopAddr": "10.0.0.1", "interface": "Vlan2"}]}}}}},
+  {"ipV4Neighbors": [
+    {"address": "10.0.1.249", "hwAddress": "28e7.1dd2.d013", "interface": "Vlan1010, Ethernet18"},
+    {"address": "10.0.0.1", "hwAddress": "000d.b9aa.bbcc", "interface": "Vlan2, Ethernet1"}
+  ]},
+  {"portChannels": {}}
+]

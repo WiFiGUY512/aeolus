@@ -1,0 +1,286 @@
+// Inputs made from the schema's description of each field (0048), so a field
+// added to the schema can be edited without new UI code. The server checks
+// every value again before anything is recorded.
+
+import { h } from '../dom.js';
+import { bandName, security, group, value, hint, fieldLink } from '../format.js';
+
+// describe finds a field's description: network.lab.ssid is described as
+// network.*.ssid.
+export function describe(d, path) {
+	if (d.fields[path]) return d.fields[path];
+	const p = path.split('.');
+	for (const [k, f] of Object.entries(d.fields)) {
+		const q = k.split('.');
+		if (q.length === p.length && q.every((s, i) => s === '*' || s === p[i])) return f;
+	}
+	return null;
+}
+
+// speedName is a port's speed as people say it: Auto, 100M, 2.5G (0094).
+export const speedName = (v) => (v === 'auto' ? 'Auto' : v >= 1000 ? `${v / 1000}G` : `${v}M`);
+
+// input makes an input for the field at path, described by f, showing
+// current. changed() says whether the person changed it; read() returns the
+// value to set, or throws with what is wrong. A secret is never shown: left
+// empty, it stays as it is.
+export function input(path, f, current) {
+	const last = path.split('.').pop();
+	current ??= f.default; // what an unset field means, where the schema says
+	let el;
+	let read;
+	if (f.type === 'boolean') {
+		el = h('input', { type: 'checkbox', class: 'switch', role: 'switch', checked: current === true });
+		read = () => el.checked;
+	} else if (f['x-aeolus-enum'] === 'countries' && f['x-aeolus-countries']) {
+		// Countries by name, as tzselect offers them (0074). One set before
+		// the list was shows as it is.
+		const list = f['x-aeolus-countries'];
+		const unlisted = typeof current === 'string' && !list.some((c) => c.code === current);
+		el = h('select', null,
+			current === undefined && h('option', { value: '' }, '—'),
+			unlisted && h('option', { value: current, selected: true }, `${current} (not in the list)`),
+			list.map((c) => h('option', { value: c.code, selected: c.code === current }, `${c.name} (${c.code})`)));
+		read = () => (el.value === '' ? undefined : el.value);
+	} else if (f['x-aeolus-enum'] === 'zones' && f.enum) {
+		el = h('select');
+		const zones = zoneSelect(el, f, current);
+		read = () => (el.value === '' || el.value === ALL ? undefined : el.value);
+		const it = { el, read, narrow: zones.narrow };
+		const initial = JSON.stringify(read());
+		it.changed = () => JSON.stringify(read()) !== initial;
+		return it;
+	} else if (Array.isArray(f.oneOf) && f.oneOf.every((o) => 'const' in o || Array.isArray(o.enum))) {
+		// One of a few words or numbers, such as a port's speed: auto, or
+		// 1000 (0094).
+		const choices = f.oneOf.flatMap((o) => ('const' in o ? [o.const] : o.enum));
+		const label = (v) => (last === 'speed' ? speedName(v) : String(v));
+		el = h('select', null,
+			current === undefined && h('option', { value: '' }, '—'),
+			choices.map((v) => h('option', { value: String(v), selected: v === current }, label(v))));
+		read = () => (el.value === '' ? undefined : choices.find((v) => String(v) === el.value));
+	} else if (Array.isArray(f['x-aeolus-choices'])) {
+		// One of some named choices, or a value of one's own: a remote
+		// speed server (0134), a public one by its name or one's own by its
+		// URL. The pulldown has the choices, and one's own last, which shows
+		// a field to write it in; and none, where none is set: one that is
+		// set is taken away as any setting is, where it is shown (0046).
+		const choices = f['x-aeolus-choices'];
+		const OWN = '\u0000own';
+		const named = choices.some(([v]) => v === current);
+		// A name the list has not, as one a later manager had: shown as
+		// that, and it measures nothing. One's own is a URL.
+		const stray = typeof current === 'string' && !named && !current.includes('://');
+		const sel = h('select', null,
+			current === undefined && h('option', { value: '' }, 'none'),
+			stray && h('option', { value: current, selected: true }, `${current} (not in the list: it measures nothing)`),
+			choices.map(([v, label]) => h('option', { value: v, selected: v === current }, label)),
+			h('option', { value: OWN, selected: current !== undefined && !named && !stray }, `${f['x-aeolus-own'] || 'Another'}…`));
+		const own = h('input', { type: 'text', maxlength: f.maxLength, value: current !== undefined && !named && !stray ? current : '', placeholder: f['x-aeolus-own-as'] || '', 'aria-label': f['x-aeolus-own'] || 'Another' });
+		const show = () => { own.hidden = sel.value !== OWN; };
+		sel.addEventListener('change', show);
+		show();
+		el = h('span', { class: 'choiceown' }, sel, own);
+		// A field that is locked is its two controls, locked.
+		Object.defineProperty(el, 'disabled', { get: () => sel.disabled, set: (v) => { sel.disabled = v; own.disabled = v; } });
+		read = () => {
+			if (sel.value === '') return undefined;
+			if (sel.value !== OWN) return sel.value;
+			if (own.value.trim() === '') throw new Error(`write it${f['x-aeolus-own-as'] ? `, as ${f['x-aeolus-own-as']}` : ''}, or choose another`);
+			return own.value.trim();
+		};
+	} else if (f.enum) {
+		el = h('select', null,
+			current === undefined && h('option', { value: '' }, '—'),
+			f.enum.map((v) => h('option', { value: String(v), selected: v === current }, last === 'security' ? security(v)
+				: last === 'mode' || path === 'assurance.tests.every' || path === 'assurance.tests.over' || path === 'assurance.tests.on' || path === 'apc.clients' || path === 'system.advisor.model' || path.endsWith('.radius.test.method') ? value(path, v) : String(v))));
+		read = () => (el.value === '' ? undefined : f.enum.find((v) => String(v) === el.value));
+	} else if (f.type === 'array' && f.items?.enum) {
+		const all = f.items.enum;
+		const on = current ?? all; // a list nobody set means all of them
+		const boxes = all.map((v) => h('input', { type: 'checkbox', value: v, checked: on.includes(v) }));
+		el = h('span', { class: 'choices' }, all.map((v, i) => h('label', null, boxes[i], last === 'bands' ? bandName(v) : v)));
+		read = () => {
+			const list = all.filter((v, i) => boxes[i].checked);
+			if (f.minItems && list.length < f.minItems) throw new Error(`choose at least ${f.minItems}`);
+			return list;
+		};
+	} else if (f.type === 'array' && f.items?.type === 'integer') {
+		// A list of numbers, such as tagged VLANs: "10, 20".
+		const { minimum: lo, maximum: hi } = f.items;
+		el = h('input', { type: 'text', value: (current ?? []).join(', '), placeholder: '10, 20' });
+		read = () => el.value.split(/[\s,]+/).filter(Boolean).map((x) => {
+			const n = Number(x);
+			if (!Number.isInteger(n) || (lo != null && n < lo) || (hi != null && n > hi)) throw new Error(`${x} is not a whole number from ${lo} to ${hi}`);
+			return n;
+		});
+	} else if (f.type === 'array') {
+		// A list of words, such as NTP servers or SSH keys: one a line.
+		el = h('textarea', { rows: Math.max(2, (current ?? []).length + 1), placeholder: f['x-aeolus-placeholder'] || '' },(current ?? []).join('\n'));
+		// Emptied, a list that had something is set empty, so its last line
+		// can be taken out, such as the last client blocked (0100); one that
+		// must keep some stays as it is.
+		const had = (current ?? []).length > 0;
+		read = () => {
+			const list = el.value.split('\n').map((x) => x.trim()).filter(Boolean);
+			if (!list.length && had && !f.minItems) return [];
+			return list.length ? list : undefined;
+		};
+	} else if (f.type === 'integer') {
+		el = h('input', { type: 'number', step: 1, min: f.minimum, max: f.maximum, value: current ?? '' });
+		read = () => {
+			if (el.value === '') return undefined;
+			const n = Number(el.value);
+			if (!Number.isInteger(n)) throw new Error('a whole number');
+			return n;
+		};
+	} else if (f.writeOnly) {
+		el = h('input', { type: 'password', autocomplete: 'new-password', maxlength: f.maxLength, placeholder: current !== undefined ? 'unchanged' : f['x-aeolus-placeholder'] || '' });
+		read = () => (el.value === '' ? undefined : el.value);
+	} else {
+		el = h('input', { type: 'text', maxlength: f.maxLength, value: current ?? '', placeholder: f['x-aeolus-placeholder'] || '' });
+		// A field that is a word or a number, such as a channel: numbers as
+		// numbers; one that is only a number, as a latitude, with its sign
+		// and point too.
+		const numeric = f.type === 'number' ? /^-?\d+(\.\d+)?$/ : /^\d+$/;
+		read = () => (el.value === '' ? undefined : f.type !== 'string' && numeric.test(el.value) ? Number(el.value) : el.value);
+	}
+	const initial = JSON.stringify(f.writeOnly ? undefined : read());
+	return {
+		el,
+		read,
+		changed: () => {
+			try {
+				return JSON.stringify(read()) !== initial;
+			} catch {
+				return true; // invalid now, so it was changed
+			}
+		},
+	};
+}
+
+// ALL is the zone dropdown's last choice when it offers one country's
+// zones: it offers them all instead.
+const ALL = '*';
+
+// zoneSelect fills select with time zones (0074), showing current. All of
+// them, by region as Linux lists them, each by its city; or, narrowed to a
+// country (narrow('US')), UTC and that country's, in tzselect's order and
+// with its notes ("Central (most areas) · Chicago"), and a last choice that
+// shows them all. A zone set outside the list, or the country, shows as it
+// is, so nothing changes unless the person changes it.
+function zoneSelect(select, f, current) {
+	const places = f['x-aeolus-zones'] || [];
+	const city = (z) => z.slice(z.indexOf('/') + 1).replaceAll('_', ' ');
+	const option = (z, label) => h('option', { value: z }, label);
+	let country = null;
+	const fill = () => {
+		const keep = select.value && select.value !== ALL ? select.value : current;
+		const mine = country ? places.filter((p) => p.country === country) : [];
+		let body;
+		if (mine.length) {
+			body = [option('UTC', 'UTC'), mine.map((p) => option(p.zone, p.note ? `${p.note} · ${city(p.zone)}` : city(p.zone))),
+				option(ALL, 'Show all zones…')];
+		} else {
+			const regions = new Map();
+			for (const z of f.enum) {
+				const i = z.indexOf('/');
+				const region = i < 0 ? '' : z.slice(0, i);
+				if (!regions.has(region)) regions.set(region, []);
+				regions.get(region).push(z);
+			}
+			body = [...regions].map(([region, list]) => (region
+				? h('optgroup', { label: region }, list.map((z) => option(z, city(z))))
+				: list.map((z) => option(z, z))));
+		}
+		const shown = new Set([...(mine.length ? ['UTC', ...mine.map((p) => p.zone)] : f.enum)]);
+		select.replaceChildren(...[
+			keep === undefined && option('', '—'),
+			typeof keep === 'string' && !shown.has(keep) &&
+				option(keep, f.enum.includes(keep) ? `${keep} (outside ${country})` : `${keep} (not in the list)`),
+			body,
+		].flat(Infinity).filter(Boolean));
+		select.value = keep ?? '';
+	};
+	let last = current;
+	select.addEventListener('change', () => {
+		if (select.value !== ALL) {
+			last = select.value || undefined;
+			return;
+		}
+		country = null;
+		select.value = '';
+		current = last;
+		fill();
+	});
+	fill();
+	return {
+		narrow(c) {
+			const next = /^[A-Z]{2}$/.test(c || '') ? c : null;
+			if (next === country) return;
+			country = next;
+			fill();
+		},
+	};
+}
+
+// fieldsForm lays out an input for each field in sections ([[title,
+// [path], intro?]]), with the values in force (fields, by path: {value,
+// from, origin}). A section's intro says what it is for, under its title; a
+// field's hint, how to fill it in, under it; and its label, pointed at, the
+// whole of its description. A field locked above the node at cannot be
+// changed there. The section titled more folds away. It returns the body,
+// the inputs that can be changed, and every field's input and row, by path.
+export function fieldsForm(d, sections, fields, at, more) {
+	const inputs = new Map();
+	const rows = new Map();
+	const rowFor = (path) => {
+		const f = describe(d, path);
+		if (!f) return null;
+		const cur = fields[path];
+		const it = input(path, f, cur?.value);
+		const locked = cur?.origin === 'locked' && cur.from !== at;
+		if (locked) it.el.disabled = true;
+		else inputs.set(path, it);
+		const help = hint(path), out = fieldLink(path);
+		const row = h('label', { class: 'field' },
+			h('span', { class: f.description ? 'label described' : 'label', title: f.description || null }, group(path).label),
+			it.el,
+			out && h('a', { class: 'button small', href: out[1], target: '_blank', rel: 'noopener noreferrer' }, out[0]),
+			locked && h('span', { class: 'sub' }, 'locked above'),
+			// A line of its own, under the input, however wide the form.
+			help && h('span', { class: 'hint' }, h('span', null, help)));
+		rows.set(path, { it, row });
+		return row;
+	};
+	const body = sections.map(([title, paths, intro]) => {
+		const list = paths.map(rowFor).filter(Boolean);
+		if (!list.length) return null;
+		if (title === more) return h('details', null, h('summary', null, title), h('div', { class: 'fields' }, list));
+		return [title && h('h3', null, title), intro && h('p', { class: 'intro' }, intro), h('div', { class: 'fields' }, list)];
+	});
+	return { body, inputs, rows };
+}
+
+// put shows v in a field's input, as another part of the page set it (0202).
+export function put(el, v) {
+	if (el.type === 'checkbox') el.checked = v === true;
+	else if ('value' in el) el.value = v ?? '';
+}
+
+// changedValues reads what the person changed into {path: value}, leaving
+// out fields that are not on show, or throws with the first that is wrong.
+export function changedValues(inputs, rows) {
+	const out = {};
+	for (const [path, it] of inputs) {
+		if (rows.get(path)?.row.hidden || !it.changed()) continue;
+		let v;
+		try {
+			v = it.read();
+		} catch (e) {
+			throw new Error(`${group(path).label}: ${e.message}`);
+		}
+		if (v !== undefined) out[path] = v;
+	}
+	return out;
+}

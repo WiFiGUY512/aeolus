@@ -1,0 +1,26 @@
+radio { "channel": 36, "width": 80, "power": 17, "busy": 22.7, "busy_max": 50.0, "rx": 10.0, "tx": 4.0, "noise": -95, "clients": 2.0, "clients_max": 2 }
+radio, its counts gone back { "channel": 36, "width": 80, "power": 17, "busy": 24.3, "busy_max": 50.0, "rx": 10.0, "tx": 4.0, "noise": -94, "clients": 2.0, "clients_max": 2 }
+radio, its first minute { "channel": 36, "width": 80, "power": 17, "busy": 20.0, "busy_max": 20.0, "rx": 10.0, "tx": 4.0, "noise": -95, "clients": 2.0, "clients_max": 2 }
+radio, no survey { "channel": 6, "width": 20, "power": 20, "busy": null, "busy_max": null, "rx": null, "tx": null, "noise": null, "clients": 0.0, "clients_max": 0 }
+radio, nothing null
+station { "signal": -60, "tx_rate": 866.7, "rx_rate": 130.0, "tx_packets": 100, "tx_retries": 0, "tx_failed": 1, "rx_packets": 90, "tx_bytes": 50000, "rx_bytes": 20000, "connected": 300 }
+station on ath11k { "signal": -60, "tx_rate": 866.7, "rx_rate": 130.0, "tx_packets": 100, "tx_retries": 7, "tx_failed": 1, "rx_packets": 90, "tx_bytes": 50000, "rx_bytes": 20000, "connected": 300 }
+station on ath11k, not read { "signal": -60, "tx_rate": 866.7, "rx_rate": 130.0, "tx_packets": 100, "tx_retries": null, "tx_failed": 1, "rx_packets": 90, "tx_bytes": 50000, "rx_bytes": 20000, "connected": 300 }
+client { "signal": -66, "signal_min": -70, "tx_rate": 86.7, "rx_rate": 130.0, "tx_packets": 260, "tx_retries": 4, "tx_failed": 1, "rx_packets": 260, "tx_bytes": 26000, "rx_bytes": 13000, "secs": 20 }
+client, its first sample { "signal": -62, "signal_min": -62, "tx_rate": 86.7, "rx_rate": 130.0, "tx_packets": 0, "tx_retries": 0, "tx_failed": 0, "rx_packets": 0, "tx_bytes": 0, "rx_bytes": 0, "secs": 5 }
+client, nothing null
+client, retries below zero 10
+grew by 5 null null null 9
+minute { "at": 1792627200, "radios": [ { "radio": "radio0", "band": "2g", "channel": 6, "width": 20, "power": 8, "busy": null, "busy_max": null, "rx": null, "tx": null, "noise": null, "clients": 0.0, "clients_max": 0, "tx_packets": 0, "tx_retries": 0, "tx_failed": 0, "rx_packets": 0, "tx_bytes": 0, "rx_bytes": 0 }, { "radio": "radio1", "band": "5g", "channel": 36, "width": 80, "power": 17, "busy": 22.7, "busy_max": 50.0, "rx": 10.0, "tx": 4.0, "noise": -95, "clients": 2.0, "clients_max": 2, "tx_packets": 264, "tx_retries": 4, "tx_failed": 1, "rx_packets": 264, "tx_bytes": 925990, "rx_bytes": 462995 } ], "clients": [ { "mac": "aa:bb:cc:00:00:01", "band": "5g", "ssid": "Lab", "signal": -51, "signal_min": -52, "tx_rate": 86.7, "rx_rate": 130.0, "tx_packets": 4, "tx_retries": 0, "tx_failed": 0, "rx_packets": 4, "tx_bytes": 899990, "rx_bytes": 449995, "secs": 10 }, { "mac": "aa:bb:cc:00:00:02", "band": "5g", "ssid": "Lab", "signal": -66, "signal_min": -70, "tx_rate": 86.7, "rx_rate": 130.0, "tx_packets": 260, "tx_retries": 4, "tx_failed": 1, "rx_packets": 260, "tx_bytes": 26000, "rx_bytes": 13000, "secs": 20 } ] }
+tenth 12.3 -0.1 0.0 whole -61 2
+load { "at": 1792627200, "radios": { "2g": { "radio": "radio0", "channel": 6, "busy": null, "busy_max": null, "clients": 0.0, "retried": null }, "5g": { "radio": "radio1", "channel": 36, "busy": 22.7, "busy_max": 50.0, "clients": 2.0, "retried": 0.015 }, "6g": { "radio": "radio9", "channel": 5, "busy": 1.5, "busy_max": 2.0, "clients": 1.0, "retried": 1.0 } } }
+load of nothing { "at": null, "radios": { } }
+port sample { "rx_bytes": 80524384720, "tx_bytes": 16165091524, "rx_errors": 0, "tx_errors": 2, "changes": 3, "up": true, "speed": 2500, "full": true }
+port sample, no link { "rx_bytes": 10, "tx_bytes": null, "rx_errors": null, "tx_errors": null, "changes": 4, "up": false, "speed": null, "full": null }
+port sample, nothing { "rx_bytes": null, "tx_bytes": null, "rx_errors": null, "tx_errors": null, "changes": null, "up": false, "speed": null, "full": null }
+uplink { "up": true, "speed": 2500, "full": true, "secs": 15, "rx": 70.0, "tx": 833.3, "rx_max": 100.0, "tx_max": 2300.0, "rx_bytes": 131250000, "tx_bytes": 1562500000, "errors": 3, "changes": 2 }
+uplink, no base { "up": true, "speed": 2500, "full": true, "secs": 0, "rx": null, "tx": null, "rx_max": null, "tx_max": null, "rx_bytes": 0, "tx_bytes": 0, "errors": 0, "changes": 0 }
+uplink, nothing null
+wire grew 6250000000 16 null null
+minute with its uplink { "at": 1792627200, "radios": [ ], "clients": [ ], "uplink": [ { "port": "lan1", "up": true, "speed": 2500, "full": true, "secs": 15, "rx": 70.0, "tx": 833.3, "rx_max": 100.0, "tx_max": 2300.0, "rx_bytes": 131250000, "tx_bytes": 1562500000, "errors": 3, "changes": 2 } ] }
+minute without null

@@ -1,0 +1,368 @@
+package conditions
+
+import (
+	"cmp"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"slices"
+	"time"
+
+	"github.com/WiFiGUY512/aeolus/internal/hierarchy"
+)
+
+// Action is one thing a person asked an AP to do once (0104): locate,
+// restart-wifi or reboot; or disconnect, of one client, its target (0107). It is pending until the AP takes it up, running
+// once it has, which hands it to the AP only once, so a report of it that
+// is lost never has it done again; then done or failed, as the AP says.
+// One not finished within ActionWait expires. A client test (0121) is one
+// too: it carries what to test, its params, and brings back what it found,
+// its detail, both JSON.
+type Action struct {
+	ID     int64           `json:"id"`
+	AP     string          `json:"ap"`
+	Kind   string          `json:"kind"`
+	Target string          `json:"target,omitempty"` // what of the AP it is for: the client's MAC, for disconnect
+	Actor  string          `json:"actor"`
+	At     time.Time       `json:"at"`
+	State  string          `json:"state"` // pending, running, done, failed or expired
+	DoneAt *time.Time      `json:"done_at,omitempty"`
+	Result string          `json:"result,omitempty"`
+	Params json.RawMessage `json:"params,omitempty"`
+	Detail json.RawMessage `json:"detail,omitempty"`
+}
+
+// ActionWait is how long an action waits for its AP: an AP that comes back
+// later should not reboot because someone asked an hour ago.
+const ActionWait = 10 * time.Minute
+
+// ErrNoAction is an action the AP does not have pending.
+var ErrNoAction = errors.New("no such pending action")
+
+const actionsTable = `
+CREATE TABLE actions (
+	id      INTEGER PRIMARY KEY AUTOINCREMENT,
+	ap      TEXT NOT NULL,
+	kind    TEXT NOT NULL,
+	actor   TEXT NOT NULL,
+	at      TEXT NOT NULL,
+	state   TEXT NOT NULL,
+	done_at TEXT,
+	result  TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX actions_ap ON actions (ap, id);`
+
+// actionsByKind is the client tests' own index (0285): every page and
+// alert that reads them reads those of a time, and expires the ones that
+// waited too long, by kind, state and time, and so never the rest of the
+// table, whose client tests keep every step they took.
+const actionsByKind = `CREATE INDEX actions_kind ON actions (kind, state, at);`
+
+// actionsOnce makes one pending action of a kind for an AP the database's
+// own rule, so two asks at once cannot make two.
+// Two pending already, made before the rule, keep the first; the others
+// expire.
+const actionsOnce = `
+UPDATE actions SET state = 'expired' WHERE state = 'pending' AND id NOT IN (SELECT MIN(id) FROM actions WHERE state = 'pending' GROUP BY ap, kind);
+CREATE UNIQUE INDEX actions_pending ON actions (ap, kind) WHERE state = 'pending';`
+
+// actionsOpen widens it to one open, pending or running, so asking for
+// what the AP is doing already gives that action, not another: a reboot
+// pressed twice, or a read-back that raced the AP taking it up, never
+// reboots it twice. Two open already, a pending asked while one ran, keep
+// the first, the one the AP is doing.
+const actionsOpen = `
+DROP INDEX actions_pending;
+UPDATE actions SET state = 'expired' WHERE state IN ('pending', 'running') AND id NOT IN (SELECT MIN(id) FROM actions WHERE state IN ('pending', 'running') GROUP BY ap, kind);
+CREATE UNIQUE INDEX actions_open ON actions (ap, kind) WHERE state IN ('pending', 'running');`
+
+// actionsTarget gives an action what of the AP it is for (0107), the client
+// a disconnect is of, and makes the rule one open action of a kind for each
+// target: two clients may be disconnected at once, one client not twice.
+const actionsTarget = `
+ALTER TABLE actions ADD COLUMN target TEXT NOT NULL DEFAULT '';
+DROP INDEX actions_open;
+CREATE UNIQUE INDEX actions_open ON actions (ap, kind, target) WHERE state IN ('pending', 'running');`
+
+// actionsMore gives an action what it is asked, where that is more than a
+// kind and a target, and what it found, where that is more than a line
+// (0121): a client test's network and where to join it, and each step of
+// its way online.
+const actionsMore = `
+ALTER TABLE actions ADD COLUMN params TEXT NOT NULL DEFAULT '';
+ALTER TABLE actions ADD COLUMN detail TEXT NOT NULL DEFAULT '';`
+
+const actionCols = `id, ap, kind, target, actor, at, state, done_at, result, params, detail`
+
+// AddAction records an action for an AP, pending, for target where it acts
+// on one thing of the AP's, else for "". One of the same kind and target
+// already open, pending or running, is returned instead, so a second click
+// does not reboot an AP twice. It looks and adds in one transaction, which
+// the database opens immediate, so the AP taking up or finishing the open
+// one cannot come between them.
+func (s *Store) AddAction(ap hierarchy.NodeID, kind, target, actor string) (Action, error) {
+	return s.AddActionWith(ap, kind, target, actor, nil)
+}
+
+// AddActionWith is AddAction for an action that carries what it is asked,
+// params, as JSON (0121).
+func (s *Store) AddActionWith(ap hierarchy.NodeID, kind, target, actor string, params json.RawMessage) (Action, error) {
+	s.expire(ap)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return Action{}, err
+	}
+	defer tx.Rollback()
+	var id int64
+	err = tx.QueryRow(`SELECT id FROM actions WHERE ap = ? AND kind = ? AND target = ? AND state IN ('pending', 'running')`, string(ap), kind, target).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		var res sql.Result
+		if res, err = tx.Exec(`INSERT INTO actions (ap, kind, target, actor, at, state, params) VALUES (?, ?, ?, ?, ?, 'pending', ?)`,
+			string(ap), kind, target, actor, stamp(s.now()), string(params)); err == nil {
+			id, err = res.LastInsertId()
+		}
+	}
+	if err != nil {
+		return Action{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return Action{}, err
+	}
+	return s.action(id)
+}
+
+// expire marks an AP's actions that waited too long.
+func (s *Store) expire(ap hierarchy.NodeID) {
+	s.db.Exec(`UPDATE actions SET state = 'expired', done_at = ? WHERE ap = ? AND state IN ('pending', 'running') AND at < ?`,
+		stamp(s.now()), string(ap), stamp(s.now().Add(-ActionWait)))
+}
+
+// PendingActions is what waits for an AP, not yet taken up, oldest first.
+func (s *Store) PendingActions(ap hierarchy.NodeID) ([]Action, error) {
+	s.expire(ap)
+	return s.actions(`SELECT `+actionCols+` FROM actions WHERE ap = ? AND state = 'pending' ORDER BY id`, string(ap))
+}
+
+// ClaimActions hands an AP what waits for it, and marks each running, in
+// one transaction: what it takes up is never handed it again.
+func (s *Store) ClaimActions(ap hierarchy.NodeID) ([]Action, error) {
+	s.expire(ap)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	rows, err := tx.Query(`SELECT id FROM actions WHERE ap = ? AND state = 'pending' ORDER BY id`, string(ap))
+	if err != nil {
+		return nil, err
+	}
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	rows.Close()
+	for _, id := range ids {
+		if _, err := tx.Exec(`UPDATE actions SET state = 'running' WHERE id = ? AND state = 'pending'`, id); err != nil {
+			return nil, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	out := []Action{}
+	for _, id := range ids {
+		a, err := s.action(id)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, nil
+}
+
+// FinishAction records what came of an AP's pending action.
+func (s *Store) FinishAction(ap hierarchy.NodeID, id int64, ok bool, result string) (Action, error) {
+	return s.FinishActionWith(ap, id, ok, result, nil)
+}
+
+// FinishActionWith is FinishAction for an action that brings back what it
+// found, detail, as JSON (0121).
+func (s *Store) FinishActionWith(ap hierarchy.NodeID, id int64, ok bool, result string, detail json.RawMessage) (Action, error) {
+	state := "done"
+	if !ok {
+		state = "failed"
+	}
+	res, err := s.db.Exec(`UPDATE actions SET state = ?, done_at = ?, result = ?, detail = ? WHERE id = ? AND ap = ? AND state IN ('pending', 'running')`,
+		state, stamp(s.now()), result, string(detail), id, string(ap))
+	if err != nil {
+		return Action{}, err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return Action{}, ErrNoAction
+	}
+	return s.action(id)
+}
+
+// Actions is an AP's latest actions, newest first.
+func (s *Store) Actions(ap hierarchy.NodeID, limit int) ([]Action, error) {
+	s.expire(ap)
+	return s.actions(`SELECT `+actionCols+` FROM actions WHERE ap = ? ORDER BY id DESC LIMIT ?`, string(ap), limit)
+}
+
+// ClientTests are the client tests (0121) asked of every AP since a time,
+// newest first: what service assurance (0123) is worked out from. One that
+// waited too long for its AP is expired first, whichever AP's it is.
+func (s *Store) ClientTests(since time.Time) ([]Action, error) {
+	s.expireTests()
+	return s.actions(`SELECT `+actionCols+` FROM actions WHERE kind = 'client-test' AND at >= ? ORDER BY id DESC`, stamp(since))
+}
+
+// expireTests expires the client tests that waited too long for their AP,
+// whichever AP's: by actions_kind, without reading the others (0285).
+func (s *Store) expireTests() {
+	s.db.Exec(`UPDATE actions SET state = 'expired', done_at = ? WHERE kind = 'client-test' AND state IN ('pending', 'running') AND at < ?`,
+		stamp(s.now()), stamp(s.now().Add(-ActionWait)))
+}
+
+// TestHead is a client test's ID and state, without what it found: enough
+// to tell whether what was read of it before still stands (0285).
+type TestHead struct {
+	ID    int64
+	State string
+}
+
+// ClientTestHeads lists the client tests asked since a time, newest first,
+// as ClientTests does, but only their IDs and states, from actions_kind
+// alone: a test over is as it will stay, and its reader keeps what it read
+// (0285). One that waited too long for its AP is expired first.
+func (s *Store) ClientTestHeads(since time.Time) ([]TestHead, error) {
+	s.expireTests()
+	rows, err := s.db.Query(`SELECT id, state FROM actions INDEXED BY actions_kind WHERE kind = 'client-test' AND at >= ?`, stamp(since))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []TestHead
+	for rows.Next() {
+		var t TestHead
+		if err := rows.Scan(&t.ID, &t.State); err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	// Newest first, as ClientTests: sorted here, so that the index is
+	// read in its own order and the table is not.
+	slices.SortFunc(out, func(a, b TestHead) int { return cmp.Compare(b.ID, a.ID) })
+	return out, nil
+}
+
+// ActionsByID reads the actions with these IDs, newest first; one that is
+// gone is left out.
+func (s *Store) ActionsByID(ids []int64) ([]Action, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	list, err := json.Marshal(ids)
+	if err != nil {
+		return nil, err
+	}
+	return s.actions(`SELECT `+actionCols+` FROM actions WHERE id IN (SELECT value FROM json_each(?)) ORDER BY id DESC`, string(list))
+}
+
+// PruneClientTests forgets the client tests asked before a time, and says
+// how many: on a schedule they are many, and each keeps every step it took.
+func (s *Store) PruneClientTests(before time.Time) (int64, error) {
+	res, err := s.db.Exec(`DELETE FROM actions WHERE kind = 'client-test' AND state NOT IN ('pending', 'running') AND at < ?`, stamp(before))
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// ActionsOfKind is the actions of one kind asked of every AP, newest first:
+// the captures people started (0148). One that waited too long for its AP
+// is expired first, whichever AP's it is.
+func (s *Store) ActionsOfKind(kind string, limit int) ([]Action, error) {
+	s.db.Exec(`UPDATE actions SET state = 'expired', done_at = ? WHERE kind = ? AND state IN ('pending', 'running') AND at < ?`,
+		stamp(s.now()), kind, stamp(s.now().Add(-ActionWait)))
+	return s.actions(`SELECT `+actionCols+` FROM actions WHERE kind = ? ORDER BY id DESC LIMIT ?`, kind, limit)
+}
+
+// ActionOfKind is the action with that ID, where it is of that kind.
+func (s *Store) ActionOfKind(id int64, kind string) (Action, bool, error) {
+	s.db.Exec(`UPDATE actions SET state = 'expired', done_at = ? WHERE id = ? AND state IN ('pending', 'running') AND at < ?`,
+		stamp(s.now()), id, stamp(s.now().Add(-ActionWait)))
+	out, err := s.actions(`SELECT `+actionCols+` FROM actions WHERE id = ? AND kind = ?`, id, kind)
+	if err != nil || len(out) == 0 {
+		return Action{}, false, err
+	}
+	return out[0], true, nil
+}
+
+// DeleteAction forgets an action of that kind, by its ID.
+func (s *Store) DeleteAction(id int64, kind string) error {
+	_, err := s.db.Exec(`DELETE FROM actions WHERE id = ? AND kind = ?`, id, kind)
+	return err
+}
+
+// OpenAction is one of an AP's actions that is not yet finished, by its ID:
+// what the AP may say the outcome of.
+func (s *Store) OpenAction(ap hierarchy.NodeID, id int64) (Action, error) {
+	s.expire(ap)
+	out, err := s.actions(`SELECT `+actionCols+` FROM actions WHERE id = ? AND ap = ? AND state IN ('pending', 'running')`, id, string(ap))
+	if err != nil || len(out) == 0 {
+		return Action{}, errors.Join(err, ErrNoAction)
+	}
+	return out[0], nil
+}
+
+func (s *Store) action(id int64) (Action, error) {
+	out, err := s.actions(`SELECT `+actionCols+` FROM actions WHERE id = ?`, id)
+	if err != nil || len(out) == 0 {
+		return Action{}, errors.Join(err, ErrNoAction)
+	}
+	return out[0], nil
+}
+
+func (s *Store) actions(q string, args ...any) ([]Action, error) {
+	rows, err := s.db.Query(q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Action{}
+	for rows.Next() {
+		var a Action
+		var at, params, detail string
+		var done sql.NullString
+		if err := rows.Scan(&a.ID, &a.AP, &a.Kind, &a.Target, &a.Actor, &at, &a.State, &done, &a.Result, &params, &detail); err != nil {
+			return nil, err
+		}
+		if params != "" {
+			a.Params = json.RawMessage(params)
+		}
+		if detail != "" {
+			a.Detail = json.RawMessage(detail)
+		}
+		if a.At, err = time.Parse(time.RFC3339Nano, at); err != nil {
+			return nil, err
+		}
+		if done.Valid {
+			t, err := time.Parse(time.RFC3339Nano, done.String)
+			if err != nil {
+				return nil, err
+			}
+			a.DoneAt = &t
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}

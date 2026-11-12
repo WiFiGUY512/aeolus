@@ -1,0 +1,63 @@
+{
+	"about": "The same test network with its time up by the AP's clock (0179): left out, as the manager's check leaves it out; the network beside it is rendered as before.",
+	"current": "shed-current.json",
+	"facts": {
+		"uplink": "wan",
+		"now": 1792533600,
+		"radios": {
+			"radio0": {
+				"htmodes": [
+					"HT20",
+					"HT40",
+					"VHT20",
+					"VHT40",
+					"VHT80",
+					"VHT80+80",
+					"VHT160"
+				]
+			},
+			"radio1": {
+				"htmodes": [
+					"HT20",
+					"HT40"
+				]
+			}
+		}
+	},
+	"intent": {
+		"system": {
+			"country": "US",
+			"poll": 60
+		},
+		"network": {
+			"lab": {
+				"ssid": "Aeolus Lab",
+				"security": "wpa2-psk",
+				"passphrase": "fixture-passphrase-1",
+				"transport": {
+					"primary": {
+						"type": "vlan",
+						"vlan": 20
+					}
+				}
+			},
+			"trial": {
+				"ssid": "Aeolus Trial",
+				"security": "wpa2-psk",
+				"passphrase": "fixture-passphrase-2",
+				"test": true,
+				"transport": {
+					"primary": {
+						"type": "vlan",
+						"vlan": 30
+					}
+				}
+			}
+		},
+		"test_network": {
+			"network": "trial",
+			"until": 1792533600
+		}
+	},
+	"errors": []
+}

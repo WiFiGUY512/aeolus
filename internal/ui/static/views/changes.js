@@ -1,0 +1,114 @@
+// The change log, newest first (0009): who changed what, when and why.
+
+import { h } from '../dom.js';
+import { get, health } from '../api.js';
+import { when } from '../format.js';
+
+const PAGE = 50;
+
+export async function changesPage(ctx) {
+	const { seq } = await health();
+	const list = h('div');
+	const more = h('div', { class: 'more' });
+	let next = seq; // the newest change not yet shown
+
+	const load = async () => {
+		const after = Math.max(0, next - PAGE);
+		const { changes } = await get(`/v1/changes?after=${after}&limit=${PAGE}`);
+		for (const c of changes.filter((x) => x.seq <= next).reverse()) list.append(entry(ctx, c));
+		next = after;
+		more.replaceChildren(next > 0 ? h('button', { type: 'button', onclick: load }, 'Older changes') : 'That is the first change.');
+	};
+	await load();
+	return {
+		main: [
+			h('div', { class: 'head' },
+				h('div', null,
+					h('h1', null, 'Changes'),
+					h('div', { class: 'sub' }, `${seq} changes. Each one is logged with who made it and when, and none can be edited or removed.`))),
+			h('section', { class: 'panel' }, list, more),
+		],
+	};
+}
+
+function entry(ctx, c) {
+	return h('div', { class: 'change' },
+		h('span', { class: 'seq' }, '#' + c.seq),
+		h('span', null, when(c.at)),
+		h('strong', null, c.actor),
+		h('span', { class: 'what' }, summary(ctx, c.op), c.op.kind === 'facts' && factsSaid(c.effect),
+			c.op.until && c.op.kind !== 'move-end' && h('span', { class: 'sub' }, ` (ends itself ${when(c.op.until)})`)),
+		c.reason && h('span', { class: 'why' }, c.reason));
+}
+
+// factsSaid is what an AP said of itself that changed (0122): a fact that
+// is a word or a number, from what to what; one that is more, as its
+// radios, that it changed.
+function factsSaid(effect) {
+	const before = effect?.before || {}, after = effect?.after || {};
+	const keys = [...new Set([...Object.keys(before), ...Object.keys(after)])].sort();
+	if (!keys.length) return null;
+	const plain = (v) => v == null || ['string', 'number', 'boolean'].includes(typeof v);
+	const said = keys.map((k) => (plain(before[k]) && plain(after[k]) ? `${k} ${before[k] ?? '—'} → ${after[k] ?? '—'}` : `${k} changed`));
+	return h('span', { class: 'sub' }, `: ${said.join('; ')}`);
+}
+
+// summary says what a change did, in a line.
+function summary(ctx, op) {
+	const tree = op.tree || 'locations';
+	const node = (id, t = tree) => ctx.name(t, id);
+	const val = (v) => (v && typeof v === 'object' && v.sealed ? '(sealed)' : JSON.stringify(v));
+	switch (op.kind) {
+	case 'set': return `${op.tree} › ${node(op.node)}: ` + (op.values
+		? Object.keys(op.values).sort().map((p) => `${p} = ${val(op.values[p])}`).join(', ')
+		: `${op.path} = ${val(op.value)}`);
+	case 'unset': return `${op.tree} › ${node(op.node)}: unset ${op.paths ? op.paths.join(', ') : op.path}`;
+	case 'lock': return `${op.tree} › ${node(op.node)}: lock ${op.path}`;
+	case 'unlock': return `${op.tree} › ${node(op.node)}: unlock ${op.path}`;
+	case 'add-folder': return `${op.tree}: add folder ${op.name} under ${node(op.parent)}`;
+	case 'add-ap': return `add AP ${op.name} under ${node(op.parent)}`;
+	case 'move': return `${op.tree}: move ${node(op.node)} to ${node(op.parent)}`;
+	case 'break-hierarchy': return `${op.tree} › ${node(op.node)}: break hierarchy`;
+	case 'assign-services': return `${node(op.node, 'locations')} offers ${(op.services || []).map((s) => node(s, 'services')).join(' + ') || 'nothing'}`;
+	case 'enroll': return `AP ${op.name} enrolled (${op.value?.mac || op.node})`;
+	case 'facts': return `AP ${node(op.node, 'locations')} said what it is again`;
+	case 'remove-ap': return `remove AP ${op.node}`;
+	case 'remove-folder': return `${op.tree}: remove folder ${op.node}`;
+	case 'set-concentrator': return `library: set concentrator ${op.concentrator}`;
+	case 'remove-concentrator': return `library: remove concentrator ${op.concentrator}`;
+	case 'set-vni': return `library: VNI ${op.vni} on ${op.concentrator} = ${op.name}`;
+	case 'remove-vni': return `library: remove VNI ${op.vni} from ${op.concentrator}`;
+	case 'add-template': return `library: add template ${op.name} for ${(op.boards || []).join(', ')} at ${node(op.parent, 'locations')}` + (op.default ? ', picked there' : '');
+	case 'edit-template': return `library: template ${op.template} is ${op.name}, for ${(op.boards || []).join(', ')}`;
+	case 'set-template': return `library: template ${op.template}: ` + (op.values
+		? Object.keys(op.values).sort().map((p) => `${p} = ${val(op.values[p])}`).join(', ')
+		: `${op.path} = ${val(op.value)}`);
+	case 'unset-template': return `library: template ${op.template}: unset ${op.paths ? op.paths.join(', ') : op.path}`;
+	case 'remove-template': return `library: remove template ${op.template}`;
+	case 'grant': return `grant ${op.account} ${op.role} on ${op.tree} › ${node(op.node)}`;
+	case 'revoke': return `revoke ${op.account} ${op.role} on ${op.tree} › ${node(op.node)}`;
+	case 'add-account': return `add account ${op.account}`;
+	case 'issue-token': return `issue a token for ${op.account}`;
+	case 'revoke-token': return `revoke token ${op.token_id}`;
+	case 'set-account': return `rename account ${op.account} to ${op.name}`;
+	case 'set-password': return op.must_change ? `set a temporary password for ${op.account}` : `new password for ${op.account}`;
+	case 'disable-account': return `disable account ${op.account}`;
+	case 'enable-account': return `enable account ${op.account}`;
+	case 'remove-account': return `remove account ${op.account}`;
+	case 'set-owner': return op.owner ? `make ${op.account} a super admin` : `${op.account} is no longer a super admin`;
+	// Invites (0336): what each gives, never its secret.
+	case 'add-invite': return `invite someone as ${[op.owner && 'a super admin', ...(op.roles || []).map((r) => `${r.role} on ${r.tree} › ${node(r.node, r.tree)}`)].filter(Boolean).join(', ')}${op.note ? ` (${op.note})` : ''}`;
+	case 'revoke-invite': return `revoke invite ${op.token_id}`;
+	case 'use-invite': return `${op.account} joins with invite ${op.token_id}`;
+	case 'create-org': return `create the Org ${op.name}, admin ${op.account}`;
+	case 'add-builtins': return 'add the built-in folders';
+	// A batch is several changes made as one (0203): sets and unsets, and
+	// since 0320 a new folder and the service folders a location takes.
+	case 'batch': return (op.ops || []).map((o) => summary(ctx, o)).join('; ');
+	// A change that ends itself (0345): its end, what it put back; or its
+	// end moved, with what was set with it.
+	case 'end-change': return `end of #${op.ends}` + ((op.ops || []).length ? `: ${op.ops.map((o) => summary(ctx, o)).join('; ')}` : ': nothing to put back');
+	case 'move-end': return `#${op.ends} now ends ${when(op.until)}` + (op.values ? `; ${summary(ctx, { ...op, kind: 'set' })}` : '');
+	}
+	return op.kind;
+}

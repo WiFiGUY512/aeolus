@@ -1,0 +1,10 @@
+# Starts aeolus-updater.service when the manager leaves a request (0183).
+[Unit]
+Description=Aeolus manager updater: a request waits
+
+[Path]
+PathExists=/var/lib/aeolus/update/request
+Unit=aeolus-updater.service
+
+[Install]
+WantedBy=multi-user.target

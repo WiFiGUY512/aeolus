@@ -1,0 +1,96 @@
+{
+	"about": "The C-360 with protected management frames set on three networks (0227): optional on a WPA2 network, which is not offered on 6 GHz; required on a WPA2/WPA3 one, whose 6 GHz BSS is WPA3 alone and left to OpenWrt, which requires them there; and optional on a WPA3 network, which always requires them, so the renderer says so; the render check refuses nothing it could see, as nothing is written for it, so the agent's error is what holds it. A network with none set is left to OpenWrt's default.",
+	"current": "c360-current.json",
+	"facts": {
+		"uplink": "eth0",
+		"radios": {
+			"radio0": {
+				"htmodes": [
+					"HE20",
+					"HE40",
+					"HE80",
+					"HE160"
+				]
+			},
+			"radio1": {
+				"htmodes": [
+					"HE20",
+					"HE40"
+				]
+			},
+			"radio3": {
+				"htmodes": [
+					"HE20",
+					"HE40",
+					"HE80",
+					"HE160"
+				]
+			}
+		},
+		"ap": "ap-30862def2fff"
+	},
+	"intent": {
+		"system": {
+			"country": "US",
+			"poll": 60
+		},
+		"network": {
+			"iot": {
+				"ssid": "Home_Wi-Fi_IoT",
+				"security": "wpa2-psk",
+				"passphrase": "fixture-passphrase-2",
+				"pmf": "optional",
+				"transport": {
+					"primary": {
+						"type": "vlan",
+						"vlan": 30
+					}
+				}
+			},
+			"home": {
+				"ssid": "Home Wi-Fi",
+				"security": "wpa2-wpa3",
+				"passphrase": "fixture-passphrase-1",
+				"pmf": "required",
+				"transport": {
+					"primary": {
+						"type": "vlan",
+						"vlan": 20
+					}
+				}
+			},
+			"lab": {
+				"ssid": "Aeolus Lab",
+				"security": "wpa2-psk",
+				"passphrase": "fixture-passphrase-3",
+				"bands": [
+					"5g"
+				],
+				"transport": {
+					"primary": {
+						"type": "vlan",
+						"vlan": 20
+					}
+				}
+			},
+			"safe": {
+				"ssid": "Safe",
+				"security": "wpa3-sae",
+				"passphrase": "fixture-passphrase-4",
+				"pmf": "optional",
+				"bands": [
+					"5g"
+				],
+				"transport": {
+					"primary": {
+						"type": "vlan",
+						"vlan": 20
+					}
+				}
+			}
+		}
+	},
+	"errors": [
+		"network.safe: pmf is for a network that takes WPA2; wpa3-sae has them required always"
+	]
+}

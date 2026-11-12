@@ -1,0 +1,143 @@
+{
+	"about": "ShedAP with its clients steered a network at a time (0138). The lab network has all three ways on, with a weak signal of its own and sticky's other settings of its own (0289), which a network with sticky on and none set renders as unset; the guest network holds clients back and asks none of them anything, so it gets neither 802.11k nor 802.11v; the old name band_steering is suggest, and steering.suggest set off wins over it; a network that is off is not steered. The daemon's section lists each way's networks, and usteer, which the AP has, steers nothing. Two clients have a home (0319): one on this AP and the other, on 5 and 6 GHz, marked here by the manager; one on another AP alone, held 20 seconds; each is an entry of the daemon's section, sorted by MAC, the hold written out where unset. A third has a rule of the nearest (0321), among two APs on 5 GHz: nearest, the APs, the bands. The lab network weighs the scan radios' readings too (0324).",
+	"current": "shed-current.json",
+	"facts": {
+		"uplink": "wan",
+		"radios": {
+			"radio0": {
+				"htmodes": [
+					"HT20",
+					"HT40",
+					"VHT20",
+					"VHT40",
+					"VHT80",
+					"VHT80+80",
+					"VHT160"
+				]
+			},
+			"radio1": {
+				"htmodes": [
+					"HT20",
+					"HT40"
+				]
+			}
+		}
+	},
+	"intent": {
+		"system": {
+			"country": "US",
+			"poll": 60
+		},
+		"network": {
+			"lab": {
+				"ssid": "Aeolus Lab",
+				"security": "wpa2-psk",
+				"passphrase": "fixture-passphrase-1",
+				"transport": {
+					"primary": {
+						"type": "vlan",
+						"vlan": 20
+					}
+				},
+				"steering": {
+					"suggest": true,
+					"hold_back": true,
+					"sticky": true,
+					"sticky_signal": -70,
+					"sticky_margin": 8,
+					"sticky_floor": -60,
+					"sticky_hold_down": 15,
+					"sticky_scan": true
+				}
+			},
+			"guest": {
+				"ssid": "Aeolus Guest",
+				"security": "wpa2-psk",
+				"passphrase": "fixture-passphrase-1",
+				"transport": {
+					"primary": {
+						"type": "vlan",
+						"vlan": 20
+					}
+				},
+				"steering": {
+					"hold_back": true
+				}
+			},
+			"older": {
+				"ssid": "Aeolus Older",
+				"security": "wpa2-psk",
+				"passphrase": "fixture-passphrase-1",
+				"transport": {
+					"primary": {
+						"type": "vlan",
+						"vlan": 20
+					}
+				},
+				"band_steering": true
+			},
+			"plain": {
+				"ssid": "Aeolus Plain",
+				"security": "wpa2-psk",
+				"passphrase": "fixture-passphrase-1",
+				"transport": {
+					"primary": {
+						"type": "vlan",
+						"vlan": 20
+					}
+				},
+				"band_steering": true,
+				"steering": {
+					"suggest": false,
+					"sticky": true
+				}
+			},
+			"resting": {
+				"ssid": "Aeolus Resting",
+				"security": "wpa2-psk",
+				"passphrase": "fixture-passphrase-1",
+				"transport": {
+					"primary": {
+						"type": "vlan",
+						"vlan": 20
+					}
+				},
+				"enabled": false,
+				"steering": {
+					"suggest": true,
+					"sticky": true
+				}
+			}
+		},
+		"homes": {
+			"02:00:00:00:00:0b": {
+				"aps": [
+					"ap-2005b6df64e0"
+				],
+				"hold": 20
+			},
+			"02:00:00:00:00:0a": {
+				"aps": [
+					"ap-a0046082275e",
+					"ap-2005b6df64e0"
+				],
+				"bands": [
+					"5g",
+					"6g"
+				],
+				"here": true
+			},
+			"02:00:00:00:00:0c": {
+				"nearest": true,
+				"aps": [
+					"ap-a0046082275e",
+					"ap-2005b6df64e0"
+				],
+				"bands": [
+					"5g"
+				]
+			}
+		}
+	},
+	"errors": []
+}

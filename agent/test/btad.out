@@ -1,0 +1,45 @@
+== what an advertisement says
+a name, complete: { "flags": 6, "name": "N05L8", "name_complete": true }
+a short name, then a complete one: { "name": "ABC", "name_complete": true }
+a name with a control character: { "name": "AB", "name_complete": true }
+iBeacon: { "flags": 6, "company": 76, "mfr_data": "02150102030405060708090a0b0c0d0e0f100007012cc5", "beacon": { "type": "ibeacon", "uuid": "01020304-0506-0708-090a-0b0c0d0e0f10", "major": 7, "minor": 300, "tx_1m": -59 } }
+Apple Find My: { "company": 76, "mfr_data": "121900", "tracker": "apple_find_my" }
+Apple, nearby: { "flags": 6, "company": 76, "mfr_data": "1005031c" }
+Eddystone URL: { "uuid16": [ "feaa" ], "beacon": { "type": "eddystone", "frame": "url" } }
+Google Find My Device: { "uuid16": [ "feaa" ], "beacon": { "type": "eddystone", "frame": "fmdn" }, "tracker": "google_find_my_device" }
+Tile: { "uuid16": [ "feed" ], "tracker": "tile" }
+Samsung SmartTag: { "uuid16": [ "fd5a" ], "tracker": "samsung_smarttag" }
+BTHome, with power and appearance: { "uuid16": [ "fcd2" ], "tx_power": -12, "appearance": 961 }
+a 128-bit service: { "uuid128": [ "01020304-0506-0708-090a-0b0c0d0e0f10" ] }
+one that says it is longer than it is: { }
+nothing: { }
+== the kinds of random address
+C1:00:00:00:00:01 static
+41:00:00:00:00:02 resolvable
+01:00:00:00:00:03 non-resolvable
+81:00:00:00:00:04 reserved
+== the table the daemon keeps
+{ "addr": "0a:00:00:00:00:20", "type": "random", "first_seen": 1020, "seen_total": 1, "random": "non-resolvable", "last_seen": 1020, "rssi": -66, "rssi_max": -66, "company": 76, "mfr_data": "1005", "rssi_avg": -66 }
+{ "addr": "40:00:00:00:00:10", "type": "random", "first_seen": 1018, "seen_total": 1, "random": "resolvable", "last_seen": 1018, "rssi": -80, "rssi_max": -80, "company": 6, "mfr_data": "010920", "rssi_avg": -80 }
+{ "addr": "41:00:00:00:00:11", "type": "random", "first_seen": 1019, "seen_total": 1, "random": "resolvable", "last_seen": 1019, "rssi": -79, "rssi_max": -79, "company": 6, "mfr_data": "010920", "rssi_avg": -79 }
+{ "addr": "42:00:00:00:00:12", "type": "random", "first_seen": 1020, "seen_total": 1, "random": "resolvable", "last_seen": 1020, "rssi": -78, "rssi_max": -78, "company": 6, "mfr_data": "010920", "rssi_avg": -78 }
+{ "addr": "aa:bb:cc:00:00:02", "type": "public", "first_seen": 1015, "seen_total": 1, "last_seen": 1015, "rssi": -70, "rssi_max": -70, "company": 89, "mfr_data": "0102", "rssi_avg": -70 }
+{ "addr": "c1:00:00:00:00:01", "type": "random", "first_seen": 1000, "seen_total": 3, "random": "static", "last_seen": 1020, "rssi": -50, "rssi_max": -50, "flags": 6, "name": "Sensor", "rssi_avg": -59 }
+{ "addr": "c2:00:00:00:00:30", "type": "random", "first_seen": 1020, "seen_total": 1, "random": "static", "last_seen": 1020, "rssi": -75, "rssi_max": -75, "company": 76, "mfr_data": "1219", "tracker": "apple_find_my", "rssi_avg": -75 }
+== forgotten: what was last heard long ago, and the oldest past the most
+0a:00:00:00:00:20 40:00:00:00:00:10 41:00:00:00:00:11 42:00:00:00:00:12 c1:00:00:00:00:01 c2:00:00:00:00:30
+0a:00:00:00:00:20 42:00:00:00:00:12 c1:00:00:00:00:01 c2:00:00:00:00:30
+== the survey taken with the table
+9 devices; c1:00:00:00:00:01 is named Sensor and has [ "fd3d" ]
+== reported
+{ "mac": "c1:00:00:00:00:01", "type": "random", "random": "static", "rssi": -50, "rssi_avg": -59, "rssi_max": -50, "seen": 3, "first_ago": 30, "last_ago": 10, "name": "Sensor", "flags": 6, "uuid16": [ "fd3d" ] }
+{ "mac": "aa:bb:cc:00:00:02", "type": "public", "rssi": -70, "rssi_avg": -70, "rssi_max": -70, "seen": 1, "first_ago": 15, "last_ago": 15, "company": 89, "mfr": "0102" }
+{ "mac": "c2:00:00:00:00:30", "type": "random", "random": "static", "rssi": -75, "rssi_avg": -75, "rssi_max": -75, "seen": 1, "first_ago": 10, "last_ago": 10, "company": 76, "mfr": "1219", "tracker": "apple_find_my" }
+{ "mac": "aa:bb:cc:00:00:99", "type": "public", "rssi": -88, "rssi_avg": -88, "rssi_max": -86, "seen": 2, "first_ago": 130, "last_ago": 29, "name": "Only the survey" }
+rotating: { "company": 6, "mfr": "010920", "count": 3, "rssi_max": -78, "last_ago": 10 }
+rotating: { "company": 76, "mfr": "1005", "count": 1, "rssi_max": -66, "last_ago": 10 }
+nothing: { "devices": [ ], "rotating": [ ] }; not a list: { "devices": [ ], "rotating": [ ] }
+64 of 80 reported, the strongest first: -41 to -82
+the fridge at 99 dBm: rssi -68, strongest -68
+reported from a table kept at 99: { "mac": "38:68:a4:3c:59:f1", "type": "public", "rssi": -68, "rssi_avg": -62, "seen": 9, "first_ago": 12, "last_ago": 1 }
+dbm: [ null, -127, -60, 20, null, null, null, -60, null, null ]

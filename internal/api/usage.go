@@ -1,0 +1,331 @@
+package api
+
+import (
+	"encoding/json"
+	"net/http"
+	"slices"
+	"sort"
+	"strconv"
+	"time"
+
+	"github.com/WiFiGUY512/aeolus/internal/access"
+	"github.com/WiFiGUY512/aeolus/internal/change"
+	"github.com/WiFiGUY512/aeolus/internal/conditions"
+	"github.com/WiFiGUY512/aeolus/internal/hierarchy"
+)
+
+// usageOf is what an AP's clients moved since its previous report (0108),
+// down being what the AP sent them and up what it received: for a client
+// in both reports, how much its counters grew; for one that joined since,
+// all it moved. A client whose counters went back without its joining
+// again, as a 32-bit counter does when it wraps, counts nothing this time.
+// With no previous report, or one older than usageGap, only the clients
+// that joined in the last report interval count: what the others moved in
+// the gap would all fall in this report's bucket, a spike that never was.
+func usageOf(prev *conditions.State, now time.Time, clients []wifiClient) (down, up int64) {
+	for _, c := range clientsMoved(prev, now, clients) {
+		down += c.Down
+		up += c.Up
+	}
+	return down, up
+}
+
+// clientsMoved is what each client moved, as usageOf counts it, each that
+// moved anything once (0110).
+func clientsMoved(prev *conditions.State, now time.Time, clients []wifiClient) []conditions.ClientUse {
+	type counters struct{ rx, tx, connected int64 }
+	before := map[string]counters{}
+	since := float64(stateEvery / time.Second)
+	if prev != nil && now.Sub(prev.At) <= usageGap {
+		since = now.Sub(prev.At).Seconds()
+		var r struct {
+			Clients []wifiClient `json:"clients"`
+		}
+		if json.Unmarshal(prev.Report, &r) == nil {
+			for _, c := range r.Clients {
+				before[c.MAC] = counters{c.RxBytes, c.TxBytes, c.Connected}
+			}
+		}
+	}
+	var out []conditions.ClientUse
+	for _, c := range clients {
+		b, ok := before[c.MAC]
+		var down, up int64
+		switch {
+		case ok && c.Connected >= b.connected && c.RxBytes >= b.rx && c.TxBytes >= b.tx:
+			down, up = c.TxBytes-b.tx, c.RxBytes-b.rx
+		case (!ok || c.Connected < b.connected) && float64(c.Connected) <= since+60:
+			down, up = c.TxBytes, c.RxBytes
+		}
+		if down+up > 0 {
+			out = append(out, conditions.ClientUse{MAC: c.MAC, Host: c.Host, Down: down, Up: up})
+		}
+	}
+	return out
+}
+
+// usageClient is one client's part of an AP's usage (0110): what it moved
+// over the span, on the APs the caller may view, and which those were.
+type usageClient struct {
+	MAC  string   `json:"mac"`
+	Host string   `json:"host,omitempty"`
+	Down int64    `json:"down"`
+	Up   int64    `json:"up"`
+	APs  []string `json:"aps"`
+	// The AP whose scan radio it is, where it is one making client tests
+	// (0121): its bytes are the tests' speed measurements.
+	Tester string `json:"tester,omitempty"`
+}
+
+// topClients is the clients that moved the most over the span on the APs
+// in mine, at most 10, the most first. long is a span whose reports' own
+// rows may be gone (0140): where they are, the clients are counted by
+// whole days, from the first wholly in it.
+func (s *Server) topClients(since time.Time, mine map[hierarchy.NodeID]*usageAP, long bool) ([]usageClient, error) {
+	read := s.conds.ClientTotals
+	if long {
+		read = s.conds.ClientTotalsOver
+	}
+	totals, err := read(since)
+	if err != nil {
+		return nil, err
+	}
+	by := map[string]*usageClient{}
+	named := map[string]conditions.ClientTotal{} // where each client's host name is from
+	for _, t := range totals {
+		a := mine[t.AP]
+		if a == nil {
+			continue
+		}
+		c := by[t.MAC]
+		if c == nil {
+			c = &usageClient{MAC: t.MAC, APs: []string{}}
+			by[t.MAC] = c
+		}
+		// The name it gave last, on whichever AP; of two given at one time,
+		// the one recorded last where the rows say, not that of the AP that
+		// comes last here.
+		if n := named[t.MAC]; t.Host != "" && (t.HostAt.After(n.HostAt) || t.HostAt.Equal(n.HostAt) && t.HostRow > n.HostRow) {
+			c.Host, named[t.MAC] = t.Host, t
+		}
+		c.Down += t.Down
+		c.Up += t.Up
+		c.APs = append(c.APs, a.Name)
+	}
+	out := make([]usageClient, 0, len(by))
+	for _, c := range by {
+		sort.Strings(c.APs)
+		out = append(out, *c)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if x, y := out[i].Down+out[i].Up, out[j].Down+out[j].Up; x != y {
+			return x > y
+		}
+		return out[i].MAC < out[j].MAC
+	})
+	return out[:min(len(out), 10)], nil
+}
+
+// stateEvery is how often an agent reports its state (0040); usageGap is
+// how long since its last report a report's counters still count from it:
+// three intervals, as an alert takes a report to be too old (0099).
+const (
+	stateEvery = 5 * time.Minute
+	usageGap   = 3 * stateEvery
+)
+
+// A span of usage longer than usageFine is read from the trends (0140): an
+// AP's hours and each client's days, which are kept when the reports' own
+// rows are gone. trendHours is the longest span that can be asked for, a
+// year.
+const (
+	usageFine  = 48 * time.Hour
+	trendHours = 8760
+)
+
+// usageBucket is one stretch of a usage chart: the clients the APs had at
+// most in it, summed over the APs, and what they moved in it.
+type usageBucket struct {
+	At      time.Time `json:"at"`
+	Clients int       `json:"clients"`
+	Down    int64     `json:"down"`
+	Up      int64     `json:"up"`
+	// Bands is the clients on each band as Clients counts them all (0166),
+	// where the APs' rows say; Failed the attempts to come online that
+	// failed in the bucket.
+	Bands  map[string]int `json:"bands,omitempty"`
+	Failed int            `json:"failed"`
+}
+
+// usageAP is one AP's part of it.
+type usageAP struct {
+	AP    hierarchy.NodeID `json:"ap"`
+	Name  string           `json:"name"`
+	Peak  int              `json:"peak"`
+	Down  int64            `json:"down"`
+	Up    int64            `json:"up"`
+	Heard []bool           `json:"heard"` // whether it reported in each bucket
+}
+
+// usageView is the Wi-Fi clients and traffic of the APs the caller may
+// view (0108), below one Locations node where ?under= names it, over the
+// last ?hours= (24 unless set, at most 8760, a year): GET /v1/usage. It is
+// in at most 48 buckets of whole minutes, each the clients the APs had at
+// most in it, summed over the APs, and the bytes they moved; with each AP's
+// peak and totals, the busiest first, and whether it reported in each
+// bucket, its connectivity; and the ten clients that moved the most (0110).
+// Over more than two days it is read from the trends (0140): its buckets
+// are whole hours, and where the reports' own rows no longer reach back to
+// its start, its clients are counted by whole days, from the first wholly
+// in the span.
+func (s *Server) usageView(w http.ResponseWriter, r *http.Request, c call) error {
+	hours := 24
+	if q := r.URL.Query().Get("hours"); q != "" {
+		n, err := strconv.Atoi(q)
+		if err != nil || n < 1 || n > trendHours {
+			return badRequest("hours: from 1 to %d", trendHours)
+		}
+		hours = n
+	}
+	t := c.state.Org.Locations
+	under := hierarchy.NodeID(r.URL.Query().Get("under"))
+	mine := map[hierarchy.NodeID]*usageAP{}
+	for _, id := range t.APs() {
+		if !may(c, change.Locations, t, id, access.View) {
+			continue
+		}
+		if under != "" && under != id && !slices.Contains(t.Ancestry(id), under) {
+			continue
+		}
+		n, _ := t.Node(id)
+		mine[id] = &usageAP{AP: id, Name: n.Name, Heard: []bool{}}
+	}
+	span := time.Duration(hours) * time.Hour
+	// Whole minutes, rounded up, so there are never more than 48; whole
+	// hours where it is read by the hour.
+	bucket := max(stateEvery, ((span+47)/48 + time.Minute - 1).Truncate(time.Minute))
+	long := span > usageFine
+	uses := s.conds.Uses
+	if long {
+		bucket = ((span+47)/48 + time.Hour - 1).Truncate(time.Hour)
+		uses = s.conds.UsesByHour
+	}
+	end := time.Now().UTC().Truncate(bucket).Add(bucket)
+	count := int((span + bucket - 1) / bucket)
+	start := end.Add(-time.Duration(count) * bucket)
+	buckets := make([]usageBucket, count)
+	for i := range buckets {
+		buckets[i].At = start.Add(time.Duration(i) * bucket)
+	}
+	for _, a := range mine {
+		a.Heard = make([]bool, count)
+	}
+	// The most clients each AP had in each bucket, and on each band.
+	peaks := map[hierarchy.NodeID][]int{}
+	bandPeaks := map[hierarchy.NodeID][]map[string]int{}
+	err := uses(start, func(u conditions.Use) error {
+		a := mine[u.AP]
+		i := int(u.At.Sub(start) / bucket)
+		if a == nil || i < 0 || i >= count {
+			return nil
+		}
+		p := peaks[u.AP]
+		if p == nil {
+			p = make([]int, count)
+			peaks[u.AP] = p
+		}
+		p[i] = max(p[i], u.Clients)
+		if u.Bands != nil {
+			bp := bandPeaks[u.AP]
+			if bp == nil {
+				bp = make([]map[string]int, count)
+				bandPeaks[u.AP] = bp
+			}
+			if bp[i] == nil {
+				bp[i] = map[string]int{}
+			}
+			for b, n := range u.Bands {
+				bp[i][b] = max(bp[i][b], n)
+			}
+		}
+		a.Heard[i] = true
+		a.Peak = max(a.Peak, u.Clients)
+		a.Down += u.Down
+		a.Up += u.Up
+		buckets[i].Down += u.Down
+		buckets[i].Up += u.Up
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	var down, up int64
+	peak := 0
+	for i := range buckets {
+		for _, p := range peaks {
+			buckets[i].Clients += p[i]
+		}
+		for _, bp := range bandPeaks {
+			for b, n := range bp[i] {
+				if buckets[i].Bands == nil {
+					buckets[i].Bands = map[string]int{}
+				}
+				buckets[i].Bands[b] += n
+			}
+		}
+		peak = max(peak, buckets[i].Clients)
+		down += buckets[i].Down
+		up += buckets[i].Up
+	}
+	// The attempts to come online that failed, in each bucket, and the
+	// clients that made them (0166).
+	failed, whose := 0, map[string]bool{}
+	err = s.conds.Failures(start, func(f conditions.Failure) error {
+		i := int(f.At.Sub(start) / bucket)
+		if mine[f.AP] == nil || i < 0 || i >= count {
+			return nil
+		}
+		buckets[i].Failed++
+		failed++
+		whose[f.MAC] = true
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	top, err := s.topClients(start, mine, long)
+	if err != nil {
+		return err
+	}
+	own := testClients(c.state)
+	for i := range top {
+		top[i].Tester = testerOf(c, own, top[i].MAC)
+	}
+	// Before the oldest row kept, a bucket says nothing of an AP.
+	var from any
+	kept := s.conds.UsageFrom
+	if long {
+		kept = s.conds.UsageHoursFrom
+	}
+	if t, ok, err := kept(); err != nil {
+		return err
+	} else if ok {
+		from = t
+	}
+	aps := make([]*usageAP, 0, len(mine))
+	for _, a := range mine {
+		aps = append(aps, a)
+	}
+	sort.Slice(aps, func(i, j int) bool {
+		if x, y := aps[i].Down+aps[i].Up, aps[j].Down+aps[j].Up; x != y {
+			return x > y
+		}
+		return aps[i].Name < aps[j].Name
+	})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"from": start, "to": end, "bucket": int(bucket / time.Second), "buckets": buckets,
+		"down": down, "up": up, "peak": peak, "aps": aps, "clients": top, "recorded_from": from,
+		"failed": failed, "failed_clients": len(whose),
+	})
+	return nil
+}

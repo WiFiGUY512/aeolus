@@ -1,0 +1,10 @@
+# The transmit power Aeolus sets a radio to is held with iw (0349), and
+# netifd sets a radio to its own power as it sets it up again: when hostapd
+# makes an interface anew, aeolus-power holds its radio again, once the
+# network is up. With nothing held and no power set there is nothing to do.
+
+[ "$ACTION" = add ] || exit 0
+case "$INTERFACE" in phy*-ap* | wlan*) ;; *) exit 0 ;; esac
+[ -x /usr/libexec/aeolus-power ] || exit 0
+uci -q get aeolus.aeolus_power >/dev/null || [ -n "$(ls /var/run/aeolus/power 2>/dev/null)" ] || exit 0
+setsid /usr/libexec/aeolus-power "$INTERFACE" </dev/null >/dev/null 2>&1 &

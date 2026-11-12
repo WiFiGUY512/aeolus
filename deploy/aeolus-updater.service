@@ -1,0 +1,15 @@
+# Updates the manager when it asks (0183): started by aeolus-updater.path
+# when a request is left in /var/lib/aeolus/update. Runs as root, as the
+# installer does.
+[Unit]
+Description=Aeolus manager updater
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/aeolus-updater
+TimeoutStartSec=30min
+# A build the kernel kills for want of memory fails the update, and the
+# updater says so; by default systemd stops the whole updater, which then
+# says nothing (2026-10-21).
+OOMPolicy=continue

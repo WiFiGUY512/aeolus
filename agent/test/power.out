@@ -1,0 +1,30 @@
+wanted: { "radio0": 20, "radio6": 1, "radio7": 30 }
+wanted, no section: { }
+held: { "power": 20, "phy": "phy0", "index": "12" }
+held, not its own: null
+held, nothing: null
+said: "17 phy1 41\n"
+a power set, none held: [ { "radio": "radio0", "do": "hold", "power": 20, "phy": "phy0", "why": "new" } ]
+held already: [ ]
+set to another: [ { "radio": "radio0", "do": "hold", "power": 17, "phy": "phy0", "why": "changed" } ]
+set up again by netifd: [ { "radio": "radio0", "do": "hold", "power": 20, "phy": "phy0", "why": "again" } ]
+on another wiphy now: [ { "radio": "radio0", "do": "hold", "power": 20, "phy": "phy0", "why": "again" } ]
+none set now: [ { "radio": "radio0", "do": "let_go", "phy": "phy0" } ]
+none set now, set up again: [ { "radio": "radio0", "do": "forget", "phy": "phy0" } ]
+none set, none held: [ ]
+interfaces not there: [ ]
+a shared wiphy: [ { "radio": "radio0", "do": "shared", "power": 20, "phy": "phy0" } ]
+a shared wiphy, one held: [ { "radio": "radio0", "do": "shared", "power": 20, "phy": "phy0" }, { "radio": "radio0", "do": "let_go", "phy": "phy0" } ]
+a C-360: [ { "radio": "radio1", "do": "hold", "power": 15, "phy": "phy1", "why": "new" } ]
+a radio gone: [ { "radio": "radio9", "do": "forget" } ]
+a radio gone, not settled: [ ]
+command hold: "iw phy 'phy1' set txpower fixed 1500"
+command let_go: "iw phy 'phy1' set txpower auto"
+command forget: null
+command shared: null
+held, sends louder: [ { "radio": "radio0", "do": "hold", "power": 15, "phy": "phy0", "why": "louder" } ]
+held, sends at it: [ ]
+held, sends at it to a tenth: [ ]
+held, sends quieter: [ ]
+held, says nothing: [ ]
+none set, sends loud: [ ]

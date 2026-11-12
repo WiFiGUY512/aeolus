@@ -1,0 +1,1246 @@
+#!/usr/bin/ucode -S
+// aeolus-live: the line the AP holds open to the manager (0145).
+//
+// The AP reaches the manager and never the other way (0007), so what the
+// manager has to say to it waited for the AP's next poll, which may be a
+// minute off. This daemon asks the manager for /v1/ap/live and the manager
+// does not finish its answer: it writes a line on it when it has something
+// to say, and the AP has it at once. What it says there is which clients
+// to trace (0144), all of them each time, and its own clock.
+//
+// Told to trace, the daemon writes whom beside aeolus-journey's records and
+// tells aeolus-journey to look, and from then takes each thing
+// aeolus-journey sees of those clients, on a socket of its own, and sends
+// it to the manager as it comes: a POST on a connection it keeps open, so
+// that nothing is spent on opening one, a few together where they came
+// together.
+//
+// With each it sends the time by the AP's clock, and the manager answers
+// with the times by its own at which that came and at which the answer
+// left. From the four the daemon reckons how far the AP's clock is from the
+// manager's, as NTP does, every second while a client is traced. A clock
+// that is being corrected slides against another by up to half a
+// millisecond a second, so it goes by the newest reckoning that travelled
+// about as quickly as any of the last few, moved on by how fast the two
+// clocks are parting, which it reckons from them too; and it says that with
+// what it sends next. The manager puts every time this AP names on its own
+// clock by it. What two APs saw of one client is then in its true order to
+// about a millisecond, whatever their own clocks say or do.
+//
+// It also sends what each minute came to on the AP's radios (0207): it
+// samples each radio and its clients every five seconds, and at each
+// minute's end sends how busy each radio's channel was, its noise and its
+// clients, and each client's signal, rates and what was sent to it. What
+// cannot be sent waits, the last hour of it. While someone watches the AP
+// live, as the manager says on the line, it sends what each five seconds
+// came to as well, at once (0207 part 2). And it sends at once what the
+// AP's other daemons hand it as news, such as power control's steps, and
+// each client aeolus-journey sees join the AP or leave it (0252).
+//
+// It is the AP's flight recorder too (0207 part 3): it keeps what each
+// five seconds came to over the last half hour, and when something goes
+// wrong (what was sent to clients tried again all at once, many of them
+// gone at once, a channel pinned full, power control's clients struggling)
+// or the manager asks, it sends the ten minutes before, and the ten after
+// as they come.
+//
+// It asks the clients that can say it what they hear of the AP (802.11k
+// beacon reports), each every few minutes: power control goes by what each
+// says, not by a reckoning (0206), and the minutes say it too. hostapd says
+// the reports on its control socket, which this daemon is attached to only
+// while it waits for them; it never has hostapd wait for it.
+//
+// Nothing rests on it. Without the line the agent still learns at its poll
+// whom to trace, and this daemon sends what is seen all the same; without
+// this daemon the AP serves as before and is only not traced.
+//
+//	aeolus-live [-u <manager URL>] [-t <token file>] [-c <certificate, or none>]
+//	            [-d <directory of aeolus-journey's records>] [-p <its UDP port>] [-v]
+//	            [-m <minutes>] [-w <points>]
+//
+// The options are for trying it out beside the one procd runs. -v prints
+// each reckoning of the clock: what it came to, how long its asking took,
+// and how far it was from where the ones before put the clock. -m samples
+// the radios for so many minutes, prints what each came to, and ends,
+// with no line to the manager (0207); -w does the same with what each five
+// seconds comes to, as if watched live (0207 part 2).
+
+'use strict';
+
+import * as fs from 'fs';
+import * as uloop from 'uloop';
+import * as uclient from 'uclient';
+import * as socket from 'socket';
+import * as math from 'math';
+import { cursor } from 'uci';
+import { connect } from 'ubus';
+import { openlog, syslog, LOG_PID, LOG_DAEMON, LOG_INFO, LOG_WARNING } from 'log';
+import * as minutes from 'aeolus.minutes';
+import * as measure from 'aeolus.measure';
+import * as record from 'aeolus.record';
+import { ath11k_retries, counts_retries } from 'aeolus.probe';
+import * as wifinames from 'aeolus.wifinames';   // netifd's Wi-Fi status through a radio being set up again (0301)
+import * as uplinks from 'aeolus.uplink';   // the uplink's ports (0096), whose minutes are said too (0351)
+
+// nl80211 reads the radios for the minutes (0207); an AP without it is
+// traced all the same.
+let nl = null;
+try {
+	nl = require('nl80211');
+} catch (e) {
+}
+
+let url = null, token_file = '/etc/aeolus/token', cert = '/etc/aeolus/manager.crt', dir = '/var/run/aeolus', port = 16731, wordy = false, print_minutes = 0, print_points = 0;
+for (let i = 0; i < length(ARGV); i++) {
+	if (ARGV[i] == '-u')
+		url = rtrim(ARGV[++i], '/');
+	else if (ARGV[i] == '-t')
+		token_file = ARGV[++i];
+	else if (ARGV[i] == '-c')
+		cert = ARGV[++i] == 'none' ? null : ARGV[i];
+	else if (ARGV[i] == '-d')
+		dir = rtrim(ARGV[++i], '/');
+	else if (ARGV[i] == '-p')
+		port = int(ARGV[++i]);
+	else if (ARGV[i] == '-v')
+		wordy = true;
+	else if (ARGV[i] == '-m')
+		print_minutes = int(ARGV[++i]);
+	else if (ARGV[i] == '-w')
+		print_points = int(ARGV[++i]);
+}
+
+const TRACE = dir + '/trace.json';   // the clients to trace, for aeolus-journey: { at, macs: { mac: until, in seconds } }
+const SOCK = dir + '/live.sock';     // where aeolus-journey hands over what it sees of them
+const POKE = 'aeolus-trace';         // what aeolus-journey is sent, on its log's socket, when whom to trace has changed
+const LOAD = dir + '/load.json';     // what the last minute came to on each radio, for RRM and steering (0207)
+const HEARD = dir + '/heard.json';   // what each client said it hears of the AP (802.11k), for power control
+const HOSTAPD_CTL = '/var/run/hostapd/';   // where hostapd's networks have their control sockets
+const CTL_WAIT = 15;      // seconds the control sockets are held for the reports to the askings
+const POLL_NOW = dir + '/poll';      // written when the manager says something waits for this AP: the agent, which sleeps between its polls, wakes for it
+const CAPTURE = '/usr/sbin/aeolus-capture';   // what begins a capture someone started (0148)
+const SHELL = '/usr/sbin/aeolus-shell';   // what joins a terminal someone opened to dropbear (0198)
+const QUIET = 25;         // seconds of nothing on the line before it is taken to be dead: the manager says its clock every 10
+const OPENING = 20;       // seconds the line is given to open
+const WAIT_MOST = 30;     // seconds, at the most, before the line is asked for again
+const NO_LINE = 600;      // seconds before a manager that has no line is asked again
+const QUEUE = 2000;       // things kept for the manager while they cannot be sent; past that, the oldest go
+const BATCH = 100;        // things sent at a time
+const SYNC_EVERY = 1;     // seconds between two reckonings of the clock while a client is traced
+const SAMPLES = 8;        // reckonings kept
+const SAMPLE_OLD = 10;    // seconds a reckoning is good for: a clock being corrected moves half a ms a second
+const PARTING_MOST = 1;   // ms a second, the fastest two clocks are taken to part: twice what a correction does
+const STEPPED = 3;        // ms a reckoning may be from where the last ones put it before the clock is taken to have been set
+const BURST = 4;          // reckonings made one after another as a trace begins: the first opens the connection
+const HOLD = 1;           // seconds what is seen may wait for the first reckoning, as a trace begins
+const IDLE = 10;          // seconds after the last trace before the connection up is closed
+const UNANSWERED = 10;    // seconds what went up is given to be answered: the connection's own limit is 5
+const COLLECT_EVERY = 60; // seconds between two runs of the garbage collector
+const MINUTES_BATCH = 3;  // minutes sent at a time (0207)
+const NEWS_KEPT = 200;    // news kept while it cannot be sent; past that, the oldest goes
+const NEWS_BATCH = 50;    // news sent at a time
+const WATCH_MOST = 600;   // seconds, at the most, the AP sends its points for one asking (0207 part 2)
+const POINTS_KEPT = 24;   // points kept while they cannot be sent: two minutes
+const POINTS_BATCH = 12;  // points sent at a time
+const POINTS_RECORDED = 480;   // points kept to be sent while recording: all a recording comes to (0207 part 3)
+const ATH11K = '/sys/kernel/debug/ieee80211/';   // where an ath11k radio counts its clients' retries (0164)
+let own_retries = {};   // the phys whose driver fills nl80211's retries (0270)
+
+openlog('aeolus-live', LOG_PID, LOG_DAEMON);
+
+function log(fmt, ...args) {
+	syslog(LOG_INFO, fmt, ...args);
+}
+
+function note(fmt, ...args) {
+	syslog(LOG_WARNING, fmt, ...args);
+}
+
+function read(path) {
+	let v = fs.readfile(path);
+	return v == null ? null : trim(v);
+}
+
+// store writes a file whole, through a temporary one, so it is never half
+// written.
+function store(path, data) {
+	let tmp = path + '.new';
+	if (fs.writefile(tmp, data) == null)
+		return false;
+	return fs.rename(tmp, path);
+}
+
+// after runs fn once, ms from now. ucode's uloop keeps a timer that has gone
+// off until it is cancelled, and with it all its function holds, so one that
+// is let go off is cancelled as it does: in its function, this is the timer.
+function after(ms, fn) {
+	return uloop.timer(ms, function() {
+		this.cancel();
+		fn();
+	});
+}
+
+// collect runs the garbage collector, and again a minute on. ucode -S runs
+// with it off, and a connection to the manager and the functions that answer
+// it refer to each other, and would never be freed. It is run from a timer
+// of its own, where nothing is half made, and never started with gc('start'):
+// started, it may run inside a function filter() or map() calls and free the
+// array being made, which then comes back null (airscan, 2026-10-16).
+function collect() {
+	gc('collect');
+	after(COLLECT_EVERY * 1000, collect);
+}
+
+// mono is steady time in seconds; wall the calendar's in ms, to the
+// microsecond.
+function mono() {
+	let c = clock(true);
+	return c[0] + c[1] / 1e9;
+}
+
+function wall() {
+	let c = clock();
+	return c[0] * 1000.0 + c[1] / 1e6;
+}
+
+function manager() {
+	return url ?? rtrim(cursor().get('aeolus', 'agent', 'url') ?? '', '/');
+}
+
+// client makes one connection to the manager's line, trusting only its
+// pinned certificate (0033), with what to do as its answer comes.
+function client(base, cb) {
+	let uc = uclient.new(base + '/v1/ap/live', null, cb);
+	if (!uc)
+		return null;
+	if (cert && !uc.ssl_init({ ca_files: [cert], verify: true })) {
+		uc.free();
+		return null;
+	}
+	return uc;
+}
+
+let tracing = {};        // a client traced -> until when, in seconds by the calendar's clock
+let queue = [];          // what aeolus-journey saw of them and the manager has not taken
+let poker = null;        // the socket aeolus-journey is told on
+let sock = null, sock_handle = null;
+
+let down = null;         // the line: the answer that does not end
+let down_buf = '';       // what has come of a line of it and is not yet whole
+let down_open = false;   // the manager is answering on it
+let down_at = 0;         // when it was asked for
+let down_heard = 0;      // when something last came on it
+let down_wait = 1;       // seconds before it is asked for again
+let down_due = false;    // it is to be asked for again, and a timer is set for it
+let down_why = null;     // why there is none, as last logged
+
+let up = null;           // the connection what is seen goes up on
+let up_busy = false;     // something is on its way up
+let up_warm = false;     // it has carried one already: the next shows only the way there and back
+let up_sent = [];        // what is on its way
+let up_t1 = 0;           // when that was sent, by the calendar's clock in ms
+let up_body = '';        // the manager's answer, as it comes
+let up_at = 0;           // when something last went up
+let up_fail = 0;         // how many have failed, one after another
+let up_drop = false;     // the connection is to be closed before it is used again
+let up_off = 0;          // until when a manager that cannot take this is left alone
+let burst = 0;           // reckonings still to make one after another
+let hold_until = 0;      // until when what is seen waits for the first reckoning
+let samples = [];        // reckonings of the clock: { offset, rtt, at }
+
+let bus = null;          // ubus, for the radios
+let wifi_names = wifinames.keeper();   // what netifd's Wi-Fi status last said of each radio it is not setting up (0301)
+let rads = {};           // each radio this minute (0207): { band, base, samples, clients: { mac: { ssid, base, samples } } }
+let ups = {};            // each of the uplink's Ethernet ports this minute (0351): { base, samples }
+let wire_ports = null;   // which they are, looked up again each minute
+let cur_minute = null;   // the minute being sampled, in minutes since 1970
+let mins_q = [];         // what minutes came to, that the manager has not taken
+let up_mins = [];        // those on their way
+let news = [];           // news the AP's daemons handed over, that the manager has not taken
+let up_news = [];        // that on its way
+let watched_until = 0;   // until when someone watches the AP live, by the steady clock (0207 part 2)
+let said = {};           // what each client said it hears of the AP: { dbm, at, bssid, band, power }
+let asked = {};          // when each client was last asked
+let waiting = {};        // the askings not answered: { bssid, band, power }
+let ctls = {};           // the control sockets attached while reports are waited for, by network
+let ctl_until = 0;       // until when they are held
+let points_q = [];       // what each five seconds came to while watched or recording, that the manager has not taken
+let ring = [];           // what each five seconds came to, the last record.KEEP seconds of it, for the flight recorder
+let rec = null;          // the recording going on: { at, why, said, from, until }
+let rec_auto = 0;        // when the AP last began one itself
+let phys_up = null;      // each radio's phy, by name, when it was last up: one on another is its driver loaded again
+let all_down = null;     // since when every radio has been down, or null
+let settled = 0;         // until when radios coming back are of the restart said already
+let up_points = [];      // those on their way
+
+// active says whether any client is traced now.
+function active() {
+	let t = time();
+	for (let mac, until in tracing)
+		if (until > t)
+			return true;
+	return false;
+}
+
+// best is the reckoning to go by now: the newest that travelled about as
+// quickly as any kept, which is the least wrong of the fresh ones, moved on
+// by how fast the clocks are parting, where enough are kept to say.
+function best() {
+	let t = mono();
+	samples = filter(samples, s => t - s.at <= SAMPLE_OLD);
+	let n = length(samples);
+	if (!n)
+		return null;
+	let quick = samples[0].rtt;
+	for (let s in samples)
+		if (s.rtt < quick)
+			quick = s.rtt;
+	let b = samples[n - 1];
+	for (let i = n - 1; i >= 0; i--) {
+		if (samples[i].rtt <= quick * 2 + 0.5) {
+			b = samples[i];
+			break;
+		}
+	}
+	// How fast they part, in ms a second: the line that fits what is kept.
+	let rate = 0.0;
+	if (n >= 3 && samples[n - 1].at - samples[0].at >= 2) {
+		let mt = 0.0, mo = 0.0;
+		for (let s in samples) {
+			mt += s.at;
+			mo += s.offset;
+		}
+		mt /= n;
+		mo /= n;
+		let num = 0.0, den = 0.0;
+		for (let s in samples) {
+			num += (s.at - mt) * (s.offset - mo);
+			den += (s.at - mt) * (s.at - mt);
+		}
+		if (den > 0)
+			rate = num / den;
+		if (rate > PARTING_MOST)
+			rate = PARTING_MOST;
+		else if (rate < -PARTING_MOST)
+			rate = -PARTING_MOST;
+	}
+	return { offset: b.offset + rate * (t - b.at), rtt: b.rtt };
+}
+
+// reckoned keeps a reckoning. One far from where the others put the clock
+// says the clock was set: they are let go, and it starts afresh.
+function reckoned(offset, rtt) {
+	let was = best();
+	if (wordy)
+		printf('%.3f clock: %.3f ms over %.3f ms, %s\n', mono(), offset, rtt, was ? sprintf('%.3f from where it was put', offset - was.offset) : 'the first');
+	if (was && (offset > was.offset ? offset - was.offset : was.offset - offset) > STEPPED + rtt)
+		samples = [];
+	push(samples, { offset: offset, rtt: rtt, at: mono() });
+	if (length(samples) > SAMPLES)
+		shift(samples);
+}
+
+let up_go;
+
+// trace_begun has the clock reckoned at once as a trace begins, and what
+// is seen wait a moment for it.
+function trace_begun() {
+	burst = BURST;
+	hold_until = mono() + HOLD;
+	after(1, up_go);
+}
+
+// trace_keep has the file say whom this daemon is tracing, and tells
+// aeolus-journey to look where it had to be put right. The agent writes
+// the same file from its poll's answer, and one that was on its way as the
+// manager spoke on the line says what was true a moment before.
+function trace_keep() {
+	let f = null;
+	try {
+		f = json(read(TRACE) ?? 'null');
+	} catch (e) {
+	}
+	let have = f?.macs ?? {}, want = {}, t = time();
+	for (let mac, until in tracing)
+		if (until > t)
+			want[mac] = until;
+	let same = length(keys(have)) == length(keys(want));
+	for (let mac, until in want)
+		if (type(have[mac]) != 'int' || have[mac] - until > 5 || until - have[mac] > 5)
+			same = false;
+	if (same)
+		return;
+	if (!length(keys(want)))
+		fs.unlink(TRACE);
+	else
+		store(TRACE, sprintf('%J\n', { at: t, macs: want }));
+	poker?.send(POKE, socket.MSG_DONTWAIT);
+}
+
+// trace_set takes whom to trace from the manager's line, each with the
+// seconds it has left.
+function trace_set(left) {
+	let want = {}, t = time();
+	for (let mac, secs in left)
+		if (match(mac, /^[0-9a-f][0-9a-f](:[0-9a-f][0-9a-f]){5}$/) && type(secs) == 'int' && secs > 0 && secs <= 7200 && length(keys(want)) < 16)
+			want[mac] = t + secs;
+	let was = active();
+	tracing = want;
+	trace_keep();
+	if (!was && active())
+		trace_begun();
+}
+
+// trace_file takes whom to trace from the file, which the agent writes at
+// its poll: for when the line has not said.
+function trace_file() {
+	let f = null;
+	try {
+		f = json(read(TRACE) ?? 'null');
+	} catch (e) {
+	}
+	let want = {}, t = time();
+	for (let mac, until in f?.macs ?? {})
+		if (type(until) == 'int' && until > t)
+			want[mac] = until;
+	let was = active();
+	tracing = want;
+	if (!was && active())
+		trace_begun();
+}
+
+// ---- the flight recorder (0207 part 3)
+
+// begin_recording records what went wrong at at, a five-second mark: why,
+// and what was said of it. What was kept from before seconds before goes to
+// the manager now, and each five seconds after, as it comes, to after
+// seconds after. One going on is made longer instead.
+function begin_recording(at, why, said, before, after) {
+	if (print_minutes || print_points)
+		return;
+	let was = rec;
+	rec = record.window(rec, at, why, before, after);
+	if (was && rec.at == was.at) {
+		log('recording: made longer, to %d s after it began (%s)', rec.until - rec.at, said ?? why);
+		return;
+	}
+	rec.said = said;
+	log('recording what went wrong (%s): %s', why, said ?? '');
+	let back = filter(ring, x => x.at >= rec.from && x.at < at);
+	points_q = slice([ ...points_q, ...back ], -POINTS_RECORDED);
+	up_go();
+}
+
+// ---- the line down
+
+let down_ask;
+
+// down_lost notes that the line is gone, or was never had, and has it asked
+// for again: soon where it had held, later each time it does not.
+function down_lost(why, wait) {
+	if (down_due)
+		return;
+	let t = mono();
+	if (down_open)
+		log('the line to the manager is lost (%s)', why);
+	else if (why != down_why)
+		log('no line to the manager: %s', why);
+	down_why = why;
+	down_wait = down_open && t - down_at > 30 ? 1 : min(WAIT_MOST, down_wait * 2);
+	down_open = false;
+	down_due = true;
+	// A little apart from the other APs, who lost it at the same moment.
+	after(int((wait ?? down_wait) * 1000 * (75 + math.rand() % 51) / 100), down_ask);
+}
+
+function down_said(line) {
+	let m = null;
+	try {
+		m = json(line);
+	} catch (e) {
+	}
+	if (type(m) != 'object')
+		return;
+	if (type(m.trace) == 'object')
+		trace_set(m.trace);
+	// Someone watches the AP live (0207 part 2): it sends what each five
+	// seconds comes to, for as long as it is told, and stops at 0.
+	if (type(m.watch) == 'int') {
+		let was = mono() < watched_until;
+		watched_until = m.watch > 0 ? mono() + min(m.watch, WATCH_MOST) : 0;
+		if (!was && m.watch > 0)
+			log('watched live: sending every %d seconds', minutes.EVERY);
+		else if (was && m.watch <= 0) {
+			log('no longer watched live');
+			points_q = [];
+		}
+	}
+	// Someone asked the AP to record what is going on (0207 part 3): it
+	// sends what it kept of the minutes before, and goes on.
+	if (type(m.record) == 'object') {
+		let n = (v, d) => type(v) == 'int' && v > 0 ? min(v, record.KEEP) : d;
+		begin_recording(int(wall() / 1000 / minutes.EVERY) * minutes.EVERY, 'asked', type(m.record.said) == 'string' ? substr(m.record.said, 0, 120) : 'asked',
+			n(m.record.before, record.BEFORE), n(m.record.after, record.AFTER));
+	}
+	// A capture someone started (0148) is begun now, before the agent has
+	// so much as asked: whoever asked for it is about to do what they want
+	// captured. aeolus-capture begins it, beside this daemon, which waits
+	// for nothing.
+	if (type(m.capture) == 'object' && type(m.capture.id) == 'int' && m.capture.id > 0 && type(m.capture.params) == 'object' && fs.access(CAPTURE)) {
+		let ask = sprintf('%s/capture-line-%d.ask', dir, m.capture.id);
+		if (store(ask, sprintf('%J', m.capture.params)))
+			system(sprintf('setsid sh -c \'%s %d %s %d; rm -f %s\' </dev/null >/dev/null 2>&1 &', CAPTURE, m.capture.id, ask, int(wall()), ask));
+	}
+	// A terminal someone opened (0198) is joined to this AP's dropbear
+	// now, by aeolus-shell, beside this daemon: whoever opened it waits.
+	if (type(m.shell) == 'object' && match(m.shell.id ?? '', /^[0-9a-f]{32}$/) && fs.access(SHELL))
+		system(sprintf("setsid %s %s -u '%s' -c '%s' </dev/null >/dev/null 2>&1 &", SHELL, m.shell.id, manager(), cert ?? 'none'));
+	// Something waits for this AP: the agent is woken to fetch it, and
+	// does not sleep until its next poll.
+	if (m.poll === true || type(m.capture) == 'object')
+		fs.writefile(POLL_NOW, '1');
+}
+
+down_ask = function() {
+	down_due = false;
+	if (down) {
+		down.disconnect();
+		down.free();
+		down = null;
+	}
+	down_buf = '';
+	down_at = mono();
+	let base = manager(), token = read(token_file);
+	if (!base || !token)
+		return down_lost('the agent is not set up');
+	let uc;
+	uc = client(base, {
+		header_done: function() {
+			let code = uc.status()?.status;
+			if (code == 404)
+				return down_lost('this manager has none', NO_LINE);
+			if (code != 200)
+				return down_lost(sprintf('the manager answered %s', code));
+			down_open = true;
+			down_heard = mono();
+			down_why = null;
+			log('the line to the manager is open');
+		},
+		data_read: function() {
+			let chunk;
+			while (length(chunk = uc.read() ?? ''))
+				down_buf += chunk;
+			if (!down_open)
+				return;
+			down_heard = mono();
+			let lines = split(down_buf, '\n');
+			down_buf = pop(lines);
+			if (length(down_buf) > 65536)
+				down_buf = '';
+			for (let l in lines)
+				if (length(l))
+					down_said(l);
+		},
+		data_eof: function() {
+			down_lost('the manager ended it');
+		},
+		error: function(cb, code) {
+			down_lost('connection error ' + code);
+		},
+	});
+	if (!uc)
+		return down_lost('cannot make a connection');
+	down = uc;
+	// The answer has no end: how long it has been quiet is watched here.
+	uc.set_timeout(24 * 3600 * 1000);
+	if (!uc.connect() || !uc.request('GET', { headers: { 'User-Agent': 'aeolus-live', 'Authorization': 'Bearer ' + token } }))
+		down_lost('cannot connect to ' + base);
+};
+
+// ---- the way up
+
+// up_close ends the connection up; it is made again when next wanted.
+function up_close() {
+	if (up) {
+		up.disconnect();
+		up.free();
+	}
+	up = null;
+	up_warm = false;
+	up_drop = false;
+}
+
+// up_done takes the manager's answer to what went up: the clock is
+// reckoned from it; what it took is let go; what did not get there waits to
+// go again on a new connection.
+function up_done(code, why) {
+	if (!up_busy)
+		return;
+	let t4 = wall();
+	up_busy = false;
+	if (code == 200) {
+		let r = null;
+		try {
+			r = json(up_body);
+		} catch (e) {
+		}
+		let num = v => type(v) in ['int', 'double'];
+		// The first on a connection waited for it to open, which the
+		// reckoning would take for the way there.
+		if (up_warm && num(r?.got) && num(r?.sent)) {
+			let rtt = (t4 - up_t1) - (r.sent - r.got);
+			if (rtt >= 0 && rtt < 1000)
+				reckoned(((r.got - up_t1) + (r.sent - t4)) / 2, rtt);
+		}
+		up_warm = true;
+		up_fail = 0;
+		up_sent = [];
+		up_mins = [];
+		up_news = [];
+		up_points = [];
+		if (burst > 0)
+			burst--;
+	} else if (code == 400 || code == 404 || code == 413) {
+		// What the manager cannot take is let go: keeping it helps no one.
+		// One that has no such path is an older manager, left alone a while.
+		up_sent = [];
+		up_mins = [];
+		up_news = [];
+		up_points = [];
+		burst = 0;
+		if (code == 404) {
+			queue = [];
+			mins_q = [];
+			news = [];
+			points_q = [];
+			up_off = mono() + NO_LINE;
+		}
+	} else if (code == 401 || code == 403) {
+		// A manager that does not know this AP takes nothing from it: what
+		// was seen is let go, and it is asked again in a while.
+		up_sent = [];
+		queue = [];
+		up_mins = [];
+		mins_q = [];
+		up_news = [];
+		news = [];
+		up_points = [];
+		points_q = [];
+		burst = 0;
+		up_off = mono() + 60;
+	} else {
+		queue = [ ...up_sent, ...queue ];
+		up_sent = [];
+		mins_q = slice([ ...up_mins, ...mins_q ], -minutes.KEPT);
+		up_mins = [];
+		news = slice([ ...up_news, ...news ], -NEWS_KEPT);
+		up_news = [];
+		points_q = slice([ ...up_points, ...points_q ], -(rec ? POINTS_RECORDED : POINTS_KEPT));
+		up_points = [];
+		up_fail++;
+		up_drop = true;
+		burst = 0;
+		// Tried again in a moment, and less often each time it fails.
+		up_off = mono() + min(WAIT_MOST, up_fail * 2);
+		if (up_fail == 1)
+			note('what was seen did not reach the manager (%s); it waits', why ?? sprintf('it answered %d', code));
+		// A manager that went without a word leaves the line looking open:
+		// one that cannot be reached, and has missed its turn to say its
+		// clock, is taken to have gone.
+		if (!code && down_open && mono() - down_heard > 12)
+			down_lost('the manager cannot be reached');
+	}
+	// What came meanwhile goes at once, and the next of a run of
+	// reckonings.
+	if (!up_fail && (length(queue) || length(mins_q) || length(news) || length(points_q) || burst > 0))
+		after(1, up_go);
+}
+
+// up_go sends the manager what waits, where there is something to send or
+// the clock is to be reckoned, and nothing is on its way already.
+up_go = function() {
+	if (up_busy)
+		return;
+	let t = mono();
+	if (t < up_off)
+		return;
+	let have = best();
+	// As a trace begins what is seen waits a moment for the first
+	// reckoning, so that no time goes up uncorrected.
+	let take = have || t >= hold_until ? min(length(queue), BATCH) : 0;
+	let sync = burst > 0 || (active() && t - up_at >= SYNC_EVERY);
+	let mins = min(length(mins_q), MINUTES_BATCH), said_news = min(length(news), NEWS_BATCH), pts = min(length(points_q), POINTS_BATCH);
+	if (!take && !sync && !mins && !said_news && !pts)
+		return;
+	let base = manager(), token = read(token_file);
+	if (!base || !token)
+		return;
+	if (up_drop)
+		up_close();
+	if (!up) {
+		let uc;
+		uc = client(base, {
+			header_done: function() {},
+			data_read: function() {
+				let chunk;
+				while (length(chunk = uc.read() ?? ''))
+					up_body += chunk;
+			},
+			data_eof: function() {
+				if (uc == up)
+					up_done(uc.status()?.status ?? 0);
+			},
+			error: function(cb, code) {
+				if (uc != up)
+					return;
+				// One that went while nothing was on it is made again
+				// when next wanted.
+				if (up_busy)
+					up_done(0, 'connection error ' + code);
+				else
+					up_drop = true;
+			},
+		});
+		if (!uc)
+			return;
+		uc.set_timeout(5000);
+		up = uc;
+		up_warm = false;
+	}
+	up_sent = slice(queue, 0, take);
+	queue = slice(queue, take);
+	up_mins = slice(mins_q, 0, mins);
+	mins_q = slice(mins_q, mins);
+	up_news = slice(news, 0, said_news);
+	news = slice(news, said_news);
+	up_points = slice(points_q, 0, pts);
+	points_q = slice(points_q, pts);
+	// The time and the signal as whole numbers, which is what the manager
+	// reads them as: one that was not would have it refuse them all.
+	let events = sprintf('%J', map(up_sent, e => ({
+		at: int(e.at), mac: e.mac, network: e.network, band: e.band, stage: e.stage, what: e.what, ok: e.ok,
+		signal: e.signal != null ? int(e.signal) : null,
+	})));
+	let said = have ? sprintf('"offset":%.3f,"rtt":%.3f,', have.offset, have.rtt) : '';
+	// Minutes and news only where there are some: a manager older than
+	// them takes none of what goes with them either.
+	if (length(up_mins))
+		said += sprintf('"minutes":%J,', up_mins);
+	if (length(up_news))
+		said += sprintf('"news":%J,', up_news);
+	if (length(up_points))
+		said += sprintf('"points":%J,', up_points);
+	// A recording going on, for the manager to keep its points (0207 part 3).
+	if (rec)
+		said += sprintf('"record":%J,', rec);
+	up_body = '';
+	up_busy = true;
+	up_at = t;
+	if (!up.connect()) {
+		up_done(0, 'cannot connect to ' + base);
+		return;
+	}
+	// The time is taken last, when all that is left is to send.
+	up_t1 = wall();
+	if (!up.request('POST', {
+		headers: { 'User-Agent': 'aeolus-live', 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' },
+		post_data: sprintf('{"sent":%.3f,%s"events":%s}', up_t1, said, events),
+	}))
+		up_done(0, 'cannot send');
+};
+
+// ---- what aeolus-journey hands over
+
+function on_seen() {
+	let msg;
+	while ((msg = sock.recv(4096, socket.MSG_DONTWAIT)) != null) {
+		let e = null;
+		try {
+			e = json(msg);
+		} catch (x) {
+		}
+		if (type(e) == 'object' && type(e.mac) == 'string' && type(e.stage) == 'string')
+			push(queue, e);
+		// News from the AP's other daemons (0207), such as power control's
+		// steps: it goes up at once.
+		else if (type(e) == 'object' && e.t == 'news' && type(e.kind) == 'string') {
+			push(news, e);
+			// Power control's clients took a step badly: recorded.
+			if (e.kind == 'apc' && e.why in ['distress', 'distress-seen'])
+				begin_recording(int(wall() / 1000 / minutes.EVERY) * minutes.EVERY, 'distress', sprintf('%s: its clients took a step down badly (%s)', e.band, join(', ', filter([
+					e.scanning ? `${e.scanning} scanning` : null, e.left ? `${e.left} left` : null], x => x)) || 'retries'));
+		}
+	}
+	if (length(queue) > QUEUE)
+		queue = slice(queue, -QUEUE);
+	if (length(news) > NEWS_KEPT)
+		news = slice(news, -NEWS_KEPT);
+	up_go();
+}
+
+// ---- what each minute came to (0207)
+
+// radios_now is the radios that are up, by name: each its band, the
+// interface whose survey is its channel's, the interfaces of its networks
+// with their SSIDs, a per-user key's VLAN's among them (0070), and its phy
+// where it counts its clients' retries in debugfs (ath11k, 0164). A radio
+// netifd is setting up again is as it last was (0301), so its minute goes
+// on.
+function radios_now() {
+	let out = {};
+	for (let name, d in wifi_names.view(bus?.call('network.wireless', 'status')) ?? {}) {
+		let band = d.config?.band;
+		if (!(band in ['2g', '5g', '6g']) || !d.up)
+			continue;
+		let ifs = filter(d.interfaces ?? [], i => i.ifname && i.config?.mode == 'ap');
+		if (!length(ifs))
+			continue;
+		let r = out[name] = { band: band, bss: ifs[0].ifname, ifaces: {}, nets: map(ifs, i => i.ifname) };
+		for (let i in ifs) {
+			r.ifaces[i.ifname] = i.config?.ssid ?? '';
+			for (let p in fs.glob(`/sys/class/net/${i.ifname}-k*`) ?? [])
+				r.ifaces[replace(p, /^.*\//, '')] = i.config?.ssid ?? '';
+		}
+		let phy = read(`/sys/class/net/${r.bss}/phy80211/name`);
+		r.phy = phy && match(phy, /^phy[0-9]+$/) ? phy : null;
+		r.ath = r.phy && fs.access(`${ATH11K}${phy}/ath11k/ext_tx_stats`) ? phy : null;
+	}
+	return out;
+}
+
+// sample reads each radio and its clients once: its channel's survey, its
+// power, channel and width, and each client's station. full reads too what
+// is slow to read, an ath11k radio's count of retries, which a minute needs
+// only at its ends.
+function sample(full) {
+	let now = {};
+	for (let name, r in radios_now()) {
+		let info = bus.call('iwinfo', 'info', { device: r.bss }) ?? {};
+		// The survey of the frequency it serves on, whose counts run on:
+		// not the one it says is in use, which some drivers never say and
+		// others say of where RRM last looked (2026-10-22: ath10k, mt76).
+		let si = null;
+		for (let x in nl.request(nl.const.NL80211_CMD_GET_SURVEY, nl.const.NLM_F_DUMP, { dev: r.bss }) ?? [])
+			if (info.frequency && x.survey_info?.frequency == info.frequency)
+				si = x.survey_info;
+		let s = minutes.survey(si);
+		s.power = info.txpower;
+		s.channel = info.channel;
+		s.width = int(match(info.htmode ?? '', /([0-9]+)$/)?.[1] ?? 20);
+		let clients = {};
+		for (let ifn, ssid in r.ifaces) {
+			let sts = nl.request(nl.const.NL80211_CMD_GET_STATION, nl.const.NLM_F_DUMP, { dev: ifn }) ?? [];
+			// An ath11k radio's own count, once its driver fills it (0270).
+			let ath = r.ath && !counts_retries(own_retries, r.phy, sts) ? r.ath : null;
+			for (let st in sts) {
+				let mac = lc(st.mac ?? '');
+				if (!mac || st.sta_info?.connected_time == null)
+					continue;
+				let retries = null;
+				if (ath && full)
+					retries = ath11k_retries(fs.readfile(`${ATH11K}${ath}/netdev:${ifn}/stations/${mac}/tx_stats`) ??
+						fs.readfile(`${ATH11K}${ath}/netdev:${r.bss}/stations/${mac}/tx_stats`));
+				clients[mac] = { ssid: ssid, s: minutes.station(st.sta_info, !!ath, retries) };
+			}
+		}
+		s.clients = length(keys(clients));
+		now[name] = { band: r.band, phy: r.phy, survey: s, clients: clients };
+	}
+	return now;
+}
+
+// wire_now is a sample of each of the uplink's Ethernet ports (0351), by
+// name, as sysfs says it: a bond's members, else the uplink itself, as the
+// renderer names it. Which they are is looked up again each minute (fresh).
+function wire_now(fresh) {
+	if (fresh || wire_ports == null) {
+		let out = [];
+		for (let p in uplinks.ports(cursor()))
+			for (let e in uplinks.physical(p))
+				if (index(out, e) < 0)
+					push(out, e);
+		wire_ports = slice(out, 0, 8);
+	}
+	let now = {};
+	for (let p in wire_ports) {
+		let d = `/sys/class/net/${p}`;
+		if (!fs.access(d))
+			continue;
+		let f = {};
+		for (let k in ['carrier', 'speed', 'duplex', 'carrier_changes'])
+			f[k] = read(`${d}/${k}`);
+		for (let k in ['rx_bytes', 'tx_bytes', 'rx_errors', 'tx_errors'])
+			f[k] = read(`${d}/statistics/${k}`);
+		now[p] = minutes.port_sample(f);
+	}
+	return now;
+}
+
+// ctl_read takes what hostapd says on a network's control socket: of it,
+// the beacon reports to the askings, each kept as what the client said it
+// hears of the AP, where it is of the BSSID it was asked of.
+function ctl_read(k) {
+	let m;
+	while ((m = k.recv(8192, socket.MSG_DONTWAIT)) != null) {
+		let r = measure.report(m), w = r ? waiting[r.mac] : null;
+		if (!w || r.bssid != w.bssid)
+			continue;
+		said[r.mac] = { dbm: r.dbm, at: time(), bssid: w.bssid, band: w.band, power: w.power };
+		delete waiting[r.mac];
+	}
+}
+
+// ctl_close lets the control sockets go once the reports are in, or
+// waited for long enough.
+function ctl_close() {
+	if (time() < ctl_until)
+		return;
+	for (let ifn, c in ctls) {
+		c.k.send('DETACH');
+		c.h.delete();
+		c.k.close();
+		fs.unlink(c.path);
+	}
+	ctls = {};
+	waiting = {};
+}
+
+// ctl_open attaches to a network's control socket, to hear its reports.
+function ctl_open(ifn) {
+	if (ctls[ifn])
+		return true;
+	let path = sprintf('%s/hostapd-ctl-live-%s', dir, ifn), k = socket.create(socket.AF_UNIX, socket.SOCK_DGRAM);
+	fs.unlink(path);
+	if (!k || !k.bind({ path: path }) || !fs.chmod(path, 0o666) || !k.connect({ path: HOSTAPD_CTL + ifn }) || k.send('ATTACH') == null) {
+		k?.close();
+		fs.unlink(path);
+		return false;
+	}
+	ctls[ifn] = { k: k, path: path, h: uloop.handle(k, () => ctl_read(k), uloop.ULOOP_READ) };
+	return true;
+}
+
+// ask_heard asks the clients that can say it, and are due, what they hear
+// of the AP (802.11k): on each of the radios' networks, at most
+// measure.PER_MINUTE a minute, the longest unasked first. power is each
+// radio's power now, by band, which what they say is measured at.
+function ask_heard(power) {
+	let t = time(), budget = measure.PER_MINUTE;
+	for (let name, r in radios_now()) {
+		for (let ifn in r.nets) {
+			if (budget <= 0)
+				break;
+			let obj = 'hostapd.' + ifn, st = bus.call(obj, 'get_status');
+			let oc = measure.op_class(st?.freq, st?.channel);
+			if (!st?.bssid || oc == null)
+				continue;
+			let cs = [];
+			for (let mac, c in bus.call(obj, 'get_clients')?.clients ?? {})
+				push(cs, { mac: lc(mac), mode: measure.mode(c.rrm), asked: asked[lc(mac)] });
+			for (let c in measure.due(cs, t, budget)) {
+				if (!ctl_open(ifn))
+					break;
+				asked[c.mac] = t;
+				budget--;
+				let w = { bssid: lc(st.bssid), band: r.band, power: power[r.band] };
+				if (bus.call(obj, 'rrm_beacon_req', { addr: c.mac, mode: c.mode, op_class: oc, channel: st.channel, duration: measure.DURATION, bssid: st.bssid }) != null)
+					waiting[c.mac] = w;
+			}
+		}
+	}
+	if (length(keys(waiting))) {
+		ctl_until = t + CTL_WAIT;
+		after(CTL_WAIT * 1000 + 500, ctl_close);
+	}
+	// What each said lately, for power control; the rest forgotten.
+	for (let mac, s in said)
+		if (t - s.at > measure.FRESH)
+			delete said[mac];
+	for (let mac, a in asked)
+		if (t - a > measure.FRESH)
+			delete asked[mac];
+	// Tried out (-m), what they said is printed with the minutes instead.
+	if (!print_minutes)
+		store(HEARD, sprintf('%J\n', said));
+}
+
+// with_heard has a minute's or a point's clients say what each said it
+// hears of the AP, where it said so lately on that band, at the radio's
+// power now.
+function with_heard(m) {
+	let power = {};
+	for (let r in m.radios)
+		power[r.band] = r.power;
+	for (let c in m.clients) {
+		let s = said[c.mac];
+		if (s && s.band == c.band) {
+			let h = measure.hears(s, time(), power[c.band], null);
+			if (h != null)
+				c.heard = h;
+		}
+	}
+	return m;
+}
+
+// point is what the last five seconds came to on each radio and for each
+// of its clients, at, the end of them, as a minute is reckoned: from each
+// one's sample before to its last (0207 part 2). One not in the last
+// sample is left out.
+function point(at) {
+	let pr = {};
+	for (let name, r in rads) {
+		let n = length(r.samples);
+		if (!n || r.samples[n - 1].at != at)
+			continue;
+		let p = pr[name] = { band: r.band, base: n > 1 ? r.samples[n - 2] : r.base, samples: [r.samples[n - 1]], clients: {} };
+		for (let mac, c in r.clients) {
+			let k = length(c.samples);
+			if (k && c.samples[k - 1].at == at)
+				p.clients[mac] = { ssid: c.ssid, base: k > 1 ? c.samples[k - 2] : c.base, samples: [c.samples[k - 1]] };
+		}
+	}
+	return with_heard(minutes.minute(at - minutes.EVERY, pr));
+}
+
+// radios_watch sees every radio go down at once and come back, or come
+// back on another phy (Griff, 2026-10-23: a driver reloaded by hand was
+// taken for channel moves): said as news, and recorded, from before it went
+// down. Radios that come back one after another within a minute are one
+// restart.
+function radios_watch(at, now) {
+	if (print_minutes || print_points)
+		return;
+	let up = filter(keys(now), n => now[n].survey?.channel != null);
+	if (!length(up)) {
+		if (phys_up != null && all_down == null)
+			all_down = at;
+		return;
+	}
+	let cur = {};
+	for (let n in up)
+		if (now[n].phy)
+			cur[n] = now[n].phy;
+	let e = phys_up != null && at >= settled ? record.restarted(phys_up, cur, all_down, at) : null;
+	all_down = null;
+	phys_up = { ...(phys_up ?? {}), ...cur };
+	if (!e)
+		return;
+	settled = at + 60;
+	push(news, e);
+	let said = e.how == 'driver' ? sprintf('%s came back on new phys after %d s: the Wi-Fi driver was loaded again', join(', ', e.radios), e.down_s)
+		: sprintf('every radio came back after %d s: the Wi-Fi restarted', e.down_s);
+	log('radios restarted: %s', said);
+	begin_recording(e.at, 'radios-restart', said);
+	up_go();
+}
+
+// minute_work samples the radios on every fifth second, and at each
+// minute's end has what it came to sent. A sample on the minute ends the
+// minute before, and is the base of the next: so each minute counts what
+// grew from its start to its end. It says false where it ended the program
+// (-m, -w), and the ticks are to stop.
+function minute_work() {
+	let at = int((wall() / 1000.0 + 2.5) / minutes.EVERY) * minutes.EVERY;
+	let m = int((at - 1) / 60);
+	// Watched live, an ath11k radio's retries are read every time too.
+	let live = mono() < watched_until;
+	let now = nl && bus ? sample(at % 60 == 0 || cur_minute == null || live) : {};
+	let wire = wire_now(at % 60 == 0 || cur_minute == null);
+	if (nl && bus)
+		radios_watch(at, now);
+	if (cur_minute != null && m != cur_minute) {
+		push(mins_q, with_heard(minutes.minute(cur_minute * 60, rads, ups)));
+		// The clients that can say what they hear of the AP are asked,
+		// each every few minutes (802.11k).
+		if (!print_points) {
+			let power = {};
+			for (let r in mins_q[length(mins_q) - 1].radios)
+				power[r.band] = r.power;
+			ask_heard(power);
+		}
+		// The AP's own daemons go by it too: RRM says it in its hellos,
+		// and steering sends clients by it.
+		if (!print_minutes && !print_points)
+			store(LOAD, sprintf('%J\n', minutes.load(mins_q[length(mins_q) - 1])));
+		if (print_minutes > 0) {
+			printf('%.J\n', mins_q[length(mins_q) - 1]);
+			mins_q = [];
+			if (--print_minutes == 0) {
+				uloop.end();
+				return false;
+			}
+		}
+		if (length(mins_q) > minutes.KEPT)
+			mins_q = slice(mins_q, -minutes.KEPT);
+		let next = {};
+		for (let name, r in rads) {
+			if (!length(r.samples))
+				continue;
+			let n = { band: r.band, base: r.samples[length(r.samples) - 1], samples: [], clients: {} };
+			for (let mac, c in r.clients)
+				if (length(c.samples))
+					n.clients[mac] = { ssid: c.ssid, base: c.samples[length(c.samples) - 1], samples: [] };
+			next[name] = n;
+		}
+		rads = next;
+		let up_next = {};
+		for (let p, u in ups)
+			if (length(u.samples))
+				up_next[p] = { base: u.samples[length(u.samples) - 1], samples: [] };
+		ups = up_next;
+		// Trying it out (-m, -w), nothing goes to the manager.
+		if (print_points > 0)
+			mins_q = [];
+		else if (!print_minutes)
+			up_go();
+	}
+	cur_minute = m;
+	for (let p, x in wire) {
+		let u = ups[p] ??= { base: null, samples: [] };
+		x.at = at;
+		push(u.samples, x);
+	}
+	for (let name, x in now) {
+		let r = rads[name] ??= { band: x.band, base: null, samples: [], clients: {} };
+		r.band = x.band;
+		x.survey.at = at;
+		push(r.samples, x.survey);
+		for (let mac, c in x.clients) {
+			let k = r.clients[mac] ??= { ssid: c.ssid, base: null, samples: [] };
+			k.ssid = c.ssid;
+			c.s.at = at;
+			push(k.samples, c.s);
+		}
+	}
+	// Watched live: what these five seconds came to goes up at once.
+	if (live && print_points > 0 && length(keys(now))) {
+		printf('%.J\n', point(at));
+		if (--print_points == 0) {
+			uloop.end();
+			return false;
+		}
+	} else if (!print_minutes && !print_points && length(keys(now))) {
+		// Kept for the flight recorder, the last half hour of it; what goes
+		// wrong in it is recorded, at most one the AP begins itself each
+		// record.GAP (0207 part 3).
+		let p = point(at), wrong = record.trigger(ring, p);
+		push(ring, record.kept(p));
+		while (length(ring) && ring[0].at < at - record.KEEP)
+			shift(ring);
+		if (wrong && (rec && at <= rec.until || time() - rec_auto >= record.GAP)) {
+			if (!rec || at > rec.until)
+				rec_auto = time();
+			begin_recording(at, wrong.why, `${wrong.band}: ${wrong.said}`);
+		}
+		// Sent at once while watched live, or recording.
+		if (live || (rec && at <= rec.until)) {
+			push(points_q, p);
+			if (length(points_q) > (rec ? POINTS_RECORDED : POINTS_KEPT))
+				points_q = slice(points_q, -(rec ? POINTS_RECORDED : POINTS_KEPT));
+			up_go();
+		}
+		// A recording that is over, and sent, is let go.
+		if (rec && at > rec.until && !length(points_q) && !up_busy) {
+			log('recording ended (%s)', rec.why);
+			rec = null;
+		}
+	}
+	return true;
+}
+
+// minute_tick does five seconds' work, and has the next done after it
+// whatever the work did (0307): an error in it, as of radios set up again
+// under new phys, is logged, and not the end of the minutes. On the Living
+// Room C-360 on 2026-11-04, after its third ath11k swap in two hours, the
+// minutes stopped for 13 hours while the daemon ran on. An error that
+// stays is logged once an hour.
+let tick_errors = 0;
+function minute_tick() {
+	let go = true;
+	try {
+		go = minute_work();
+	}
+	catch (e) {
+		if (tick_errors++ % 720 == 0)
+			note('minute: %s (%d so far)', e?.message ?? e, tick_errors);
+	}
+	if (go === false)
+		return;
+	let at = int((wall() / 1000.0 + 2.5) / minutes.EVERY) * minutes.EVERY;
+	let wait = int((at + minutes.EVERY) * 1000 - wall());
+	after(wait < 1000 ? wait + minutes.EVERY * 1000 : wait, minute_tick);
+}
+
+// ---- now and then
+
+let stopping = false;
+
+function tick() {
+	if (stopping) {
+		uloop.end();
+		return;
+	}
+	let t = mono();
+	// A line that has gone quiet, or never opened, is asked for again.
+	if (down && !down_due && t - (down_open ? down_heard : down_at) > (down_open ? QUIET : OPENING))
+		down_lost(down_open ? 'nothing heard on it' : 'it did not open');
+	// Without the line, whom to trace is what the agent's poll wrote; with
+	// it, what the line said, and the file is kept to that.
+	if (!down_open)
+		trace_file();
+	else
+		trace_keep();
+	// What went up and was never answered is taken to have been lost.
+	if (up_busy && t - up_at > UNANSWERED)
+		up_done(0, 'no answer');
+	if (active() || length(queue) || length(mins_q) || length(news) || length(points_q))
+		up_go();
+	else if (up && !up_busy && t - up_at > IDLE)
+		up_close();
+	after(1000, tick);
+}
+
+function main() {
+	signal('SIGTERM', () => { stopping = true; });
+	signal('SIGINT', () => { stopping = true; });
+	fs.mkdir(dir);
+	uloop.init();
+	after(COLLECT_EVERY * 1000, collect);
+	// Only the minutes, or the points, printed: nothing else is done.
+	if (print_minutes > 0 || print_points > 0) {
+		if (print_points > 0)
+			watched_until = mono() + WATCH_MOST;
+		bus = connect();
+		after(1000, minute_tick);
+		uloop.run();
+		exit(0);
+	}
+	fs.unlink(SOCK);
+	sock = socket.create(socket.AF_UNIX, socket.SOCK_DGRAM);
+	if (!sock || !sock.bind({ path: SOCK })) {
+		note('cannot listen on %s: %s', SOCK, socket.error());
+		exit(1);
+	}
+	sock_handle = uloop.handle(sock, on_seen, uloop.ULOOP_READ);
+	poker = socket.create(socket.AF_INET, socket.SOCK_DGRAM);
+	if (poker && !poker.connect({ address: '127.0.0.1', port: port })) {
+		poker.close();
+		poker = null;
+	}
+	trace_file();
+	down_ask();
+	after(1000, tick);
+	bus = connect();
+	after(1000, minute_tick);
+	uloop.run();
+	if (down) {
+		down.disconnect();
+		down.free();
+	}
+	up_close();
+	sock.close();
+	fs.unlink(SOCK);
+	exit(0);
+}
+
+main();

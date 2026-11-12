@@ -1,0 +1,74 @@
+{
+	"about": "ShedAP with spanning tree turned off (0095): its br-lan ran RSTP, and the stp options go; the bridge priority the AP had set itself stays, Aeolus does not own it, and so does the hello time, the agent's or the AP's own: without spanning tree it does nothing. uplink.bond is false too: its uplink, wan, is no bond, so there is nothing to take apart.",
+	"current": "shed-current.json",
+	"facts": {
+		"uplink": "wan",
+		"radios": {
+			"radio0": {
+				"htmodes": [
+					"HT20",
+					"HT40",
+					"VHT20",
+					"VHT40",
+					"VHT80",
+					"VHT80+80",
+					"VHT160"
+				]
+			},
+			"radio1": {
+				"htmodes": [
+					"HT20",
+					"HT40"
+				]
+			}
+		}
+	},
+	"extra": {
+		"network": {
+			"cfg030f15": {
+				".anonymous": true,
+				".type": "device",
+				".name": "cfg030f15",
+				".index": 2,
+				"name": "br-lan",
+				"type": "bridge",
+				"ports": [
+					"lan1",
+					"lan2",
+					"lan3",
+					"lan4",
+					"wan"
+				],
+				"ipv6": "0",
+				"stp": "1",
+				"stp_proto": "rstp",
+				"priority": "4096",
+				"hello_time": "2"
+			}
+		}
+	},
+	"intent": {
+		"system": {
+			"country": "US",
+			"poll": 60
+		},
+		"uplink": {
+			"stp": false,
+			"bond": false
+		},
+		"network": {
+			"lab": {
+				"ssid": "Aeolus Lab",
+				"security": "wpa2-psk",
+				"passphrase": "fixture-passphrase-1",
+				"transport": {
+					"primary": {
+						"type": "vlan",
+						"vlan": 20
+					}
+				}
+			}
+		}
+	},
+	"errors": []
+}

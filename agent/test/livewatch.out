@@ -1,0 +1,9 @@
+well: { "why": null, "empty": null }
+never wrote: { "why": null, "empty": null }
+stale: { "why": "no minute for 301 s", "empty": null }
+no radio, first: { "why": null, "empty": 1793858900 }
+no radio, 4 min: { "why": null, "empty": 1793858900 }
+no radio, 6 min: { "why": "no radio in its minutes for 360 s while hostapd serves", "empty": 1793858900 }
+no radio, not serving: { "why": null, "empty": null }
+stale, lately started: { "why": null, "empty": null }
+stale, started long ago: { "why": "no minute for 400 s", "empty": null }

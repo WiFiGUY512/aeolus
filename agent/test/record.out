@@ -1,0 +1,22 @@
+share 0.25 null 1.0, median 2 2.5 null
+retries { "why": "retries", "band": "5g", "said": "50% of 400 tried again or lost in five seconds, against 5% as usual" }
+retries, usual for it null
+retries, too few sent null
+retries, too little before null
+clients left { "why": "clients-left", "band": "5g", "said": "4 of its 10 clients gone in five seconds" }
+clients left, two null
+busy { "why": "busy", "band": "5g", "said": "its channel 95% busy or more for fifteen seconds, against 30% as usual" }
+busy, usual for it null
+busy, once null
+nothing wrong null, nothing null
+kept 24 clients, the busiest aa:00:00:00:00:1d, the least aa:00:00:00:00:06; few kept as they are true
+window { "at": 10000, "why": "retries", "from": 9400, "until": 10600 }
+window, again in it { "at": 10000, "why": "retries", "from": 9400, "until": 10900 }
+window, longer than an hour { "at": 10000, "why": "retries", "from": 9400, "until": 13000 }
+window, after it { "at": 20000, "why": "asked", "from": 19700, "until": 20300 }
+down all true false false
+down trigger { "why": "radios-down", "band": "all", "said": "every radio went down at once: the Wi-Fi restarted, or its driver was reloaded" }
+driver { "t": "news", "kind": "radios-restart", "at": 1000, "back": 1035, "down_s": 35, "how": "driver", "radios": [ "radio0", "radio1", "radio2" ], "from": [ "phy14", "phy15", "phy16" ], "to": [ "phy18", "phy19", "phy20" ] }
+wifi { "t": "news", "kind": "radios-restart", "at": 1000, "back": 1030, "down_s": 30, "how": "wifi", "radios": [ "radio0", "radio1" ], "from": [ "phy14", "phy15" ], "to": [ "phy14", "phy15" ] }
+nothing null
+one quickly { "t": "news", "kind": "radios-restart", "at": 1030, "back": 1030, "down_s": 0, "how": "driver", "radios": [ "radio2" ], "from": [ "phy16" ], "to": [ "phy21" ] }

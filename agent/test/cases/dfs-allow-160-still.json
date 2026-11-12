@@ -1,0 +1,23 @@
+{
+	"about": "DFS allowed (0328) at 160 MHz, with radio resource management on but moving no radio (0329): nothing would widen the radio, so it starts at 160 MHz and picks its channel as it starts, which may be DFS. Nothing keeps it off them, and the daemon's section says no width to widen to.",
+	"current": "shed-current.json",
+	"facts": {
+		"ap": "ap-a0046082275e",
+		"uplink": "wan",
+		"radios": {
+			"radio0": { "htmodes": ["HT20", "HT40", "VHT20", "VHT40", "VHT80", "VHT80+80", "VHT160"] },
+			"radio1": { "htmodes": ["HT20", "HT40"] }
+		}
+	},
+	"intent": {
+		"rrm": { "enabled": true, "moves": false },
+		"system": { "country": "US", "poll": 60 },
+		"radio": {
+			"2g": { "channel": "auto" },
+			"5g": { "channel": "auto", "width": 160, "dfs": "allow" }
+		},
+		"network": {
+			"lab": { "ssid": "Aeolus Lab", "security": "wpa2-psk", "passphrase": "fixture-passphrase-1", "transport": { "primary": { "type": "vlan", "vlan": 20 } } }
+		}
+	}
+}

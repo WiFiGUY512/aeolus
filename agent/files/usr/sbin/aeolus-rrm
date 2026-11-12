@@ -1,0 +1,2728 @@
+#!/usr/bin/ucode -S
+// aeolus-rrm: the Aeolus agent's radio resource management (0073), its
+// control plane: the AP's neighbours.
+//
+// Its beacons say it is an Aeolus AP and where to reach it: on each radio,
+// one of its networks, Aeolus's own where it has one, carries a vendor
+// element with its AP ID and its management address. It listens for the
+// others' on its channels, visiting one at a time, briefly, every few
+// seconds, and less while the radio is busy. On each band, the three APs it
+// hears most strongly become its neighbours.
+//
+// On an AP with a scan radio, which airscan runs (0081), its serving radios
+// never scan, while the scan radio is in service: where airscan has not had
+// it for 15 minutes they scan, as on an AP without one, until it is back
+// (0173). It listens through the scan radio instead (0116): airscan's
+// list of the networks in the air, and that radio's survey of each channel.
+// A neighbour's radios are known there by their BSSIDs, which hellos carry.
+// airscan's list does not carry the adverts, so the AP reads them itself, off
+// the scan radio's monitor interface, from the beacons it hears (0161): an
+// advert heard there says where the AP that sent it is, and hellos begin
+// from either side, as between APs that scan for themselves. Two APs with
+// scan radios learn of each other that way, with no manager. A frame that
+// failed its FCS check is passed over, so a frame spoilt in the air never
+// names an AP to send hellos to.
+//
+// Neighbours exchange hellos over the wire, from management address to
+// management address, signed with the key the manager gives, so nothing
+// else on the LAN can pose as one. A hello says its radios, how strongly it
+// hears the APs it hears, and whose hellos it gets. An AP whose hellos come
+// is a neighbour too, though it isn't among the three this one hears best.
+// A neighbour is up when hellos go both ways, and down when its hellos stop.
+// With each hello goes, to every Aeolus AP it knows, how strongly it hears
+// the clients it does not serve by their probes, as aeolus-steer keeps
+// them, and what the others say of theirs is kept for aeolus-steer (0289).
+//
+// Each visit rates the channel visited, as a cost, lower being better: how
+// busy others kept it, its noise, and the other networks heard on it. Each
+// channel keeps a lasting rating, which it earns over many visits, and one
+// for now. A channel a neighbour on that band uses is blotted out.
+//
+// It moves a radio whose channel is automatic to its best channel on the
+// band, where that is clearly better: at once when the radio has just
+// started, or interference suddenly fills its channel; otherwise only in
+// the policy's window. It claims the channel in its hellos first, and waits.
+// Where two neighbours claim at once, the one whose channel rates worse
+// moves first. The move is hostapd's channel switch announcement, which
+// clients that support it follow without reconnecting.
+//
+// Where the AP looks before it uses a DFS channel (0120), hostapd starts
+// the radio outside them, and it looks at them from there. It goes to one
+// that is clearly the best, soon after the radio started or in the window:
+// hostapd, told on its control socket, then starts the radio's networks
+// again on that channel, and they are silent for the minute it listens for
+// radar. A radio there can't scan.
+// It rates its own channel by its own counts, and steps off, to where it
+// came from, when that grows worse, a neighbour takes it, or interference
+// fills it; then it looks again.
+//
+// Where power control is on (0077), it holds each radio's power where the
+// neighbours it looks for hear it at the target, by their hellos: a step up
+// or down at most every ten minutes, between a floor and the power the radio
+// is configured to.
+//
+// Its settings are the agent's own UCI package, as the renderer made it,
+// and the key the agent keeps. What it finds goes to
+// /var/run/aeolus/rrm.json, which the agent reports. procd runs it beside
+// the agent.
+//
+//	aeolus-rrm [-c <UCI directory>] [-o <results file>] [-k <key file>]
+//
+// -c, -o and -k are for trying it out beside the one procd runs.
+
+'use strict';
+
+import * as fs from 'fs';
+import * as socket from 'socket';
+import { cursor } from 'uci';
+import { connect } from 'ubus';
+import { openlog, syslog, LOG_PID, LOG_DAEMON, LOG_INFO, LOG_WARNING } from 'log';
+import * as rrm from 'aeolus.rrm';
+import * as measure from 'aeolus.measure';
+import * as letgo from 'aeolus.letgo';
+import * as probed from 'aeolus.probed';   // the clients each AP hears by probe and does not serve (0289)
+import * as community from 'aeolus.community';   // what clients said they can use, where community sharing is on (0299)
+import * as sentoff from 'aeolus.sentoff';   // what Aeolus sent a client off for (0255)
+import { grew_by } from 'aeolus.minutes';   // a running count's growth (0272)
+import * as wifinames from 'aeolus.wifinames';   // netifd's Wi-Fi status through a radio being set up again (0301)
+import * as power from 'aeolus.power';   // the powers Aeolus sets, which aeolus-power holds (0349)
+
+let nl = require('nl80211');
+
+// The key hellos are signed with is the manager's, which the agent keeps.
+let confdir = null, out = '/var/run/aeolus/rrm.json', keyfile = '/etc/aeolus/rrm.key';
+for (let i = 0; i < length(ARGV); i++) {
+	if (ARGV[i] == '-c')
+		confdir = ARGV[++i];
+	else if (ARGV[i] == '-o')
+		out = ARGV[++i];
+	else if (ARGV[i] == '-k')
+		keyfile = ARGV[++i];
+}
+
+const LOOK_EVERY = 10;      // seconds between looks at the settings, the radios and the address
+const VISIT_EVERY = 15;     // seconds between a radio's visits to a channel
+const VISIT_WAIT = 2;       // seconds a visit is given before its results are read
+const BUSY = 0.6;           // a radio's own channel busier than this puts off a visit elsewhere
+const PUT_OFF = 4;          // visits put off in a row at most
+const HEARD_FOR = 1200;     // seconds an AP stays heard after it was last heard in the air
+const OTHERS_FOR = 3600;    // seconds a network that is not Aeolus's stays listed after it was heard (0105)
+const OTHERS_MAX = 64;      // and how many, the strongest
+const FORGET = 900;         // seconds after which a neighbour that went down is forgotten
+const WRITE_EVERY = 5;      // seconds between writes of the results
+const COLLECT_EVERY = 60;   // seconds between two runs of the garbage collector
+const SCAN_FLAG_AP = 4;     // NL80211_SCAN_FLAG_AP: scan on an AP's own interface
+const LISTED = 64;          // other APs reported at most
+const RATED_FOR = 1800;     // seconds a channel's rating counts without a visit
+const REMEMBER = 86400;     // seconds one is remembered past that, stale: said, never moved by (0332)
+const RATED = 64;           // channel ratings reported at most
+const HOLD = 30;            // seconds a move is claimed in hellos before it is made
+const STEADY = 600;         // seconds a planned move's reason must hold first
+const COOL = 900;           // seconds a radio stays put after it moved, or a move failed
+const START = 600;          // seconds after a radio starts in which it moves at once
+const SETTLE = 20;          // seconds after a neighbour's claim ends before this AP claims
+const WARM_UP = 60;         // seconds the daemon runs before it moves anything
+const HOT = 3;              // own-channel reads in a row, busier than rrm.SUDDEN, that are interference
+const ANNOUNCE = 10;        // beacons a channel switch is announced for
+const KEPT = 16;            // moves reported at most
+const WHYS = ['start', 'shared', 'better', 'interference', 'radar', 'own', 'wide'];
+const STATES = ['announced', 'checking', 'moved', 'yielded', 'withdrawn', 'failed'];
+const APC_EVERY = 600;      // seconds between a radio's power steps (0077)
+const CLIENTS_EVERY = 60;   // seconds between looks at the clients power control listens to (0206)
+const WATCH_FIRST = 120;    // seconds after a step down its clients are first looked at, then every minute to APC_EVERY (0207)
+const LOAD = '/var/run/aeolus/load.json';   // what aeolus-live says the last minute came to on each radio (0207)
+const HEARD = '/var/run/aeolus/heard.json'; // what each client said it hears of the AP (802.11k), as aeolus-live asked
+const PROBES = '/var/run/aeolus/steer.probed.json';            // the clients it hears by probe and does not serve, as aeolus-steer keeps them (0289)
+const NEAR_PROBES = '/var/run/aeolus/steer.probed.near.json';  // and those the other APs hear, as they said, for aeolus-steer
+const SHARES = '/var/run/aeolus/steer.community.json';            // the bands its clients said they can use, as aeolus-steer keeps them (0299)
+const NEAR_SHARES = '/var/run/aeolus/steer.community.near.json';  // and the other APs' clients, as they said, for aeolus-steer
+const CLIENT_SAMPLES = 25;  // looks kept: the ten minutes either side of a step, and some
+const FOLLOW_AFTER = 120;   // seconds after a move is made that its radio's clients are counted (0265)
+const EVENTS_KEPT = 40;     // power control's steps kept for the report (0206)
+const DEAF_AFTER = 3;       // visits refused in a row before a radio is said not to scan
+const SWEEP_EVERY = 30;     // seconds between asks for what the scan radio heard (0116)
+const SPECTRUM_FOR = 2400;  // seconds a spectral sweep of the scan radio's is taken in (0245): airscan sweeps every 15 minutes
+const SWEEP_OLD = 900;      // seconds after which what it heard is too old to take in
+const SCAN_GONE = 900;      // seconds without the scan radio in service before the serving radios scan (0173)
+const DFS_START = 1800;     // seconds after a radio starts in which it may go to a DFS channel at once (0120)
+const CHECK_FOR = 180;      // seconds a radar check is given to end with the radio on its channel
+// The scan radio's radar check (0329), airscan's precheck: how long it holds
+// the block once checked, how long past its check it is given to say the
+// block is there, and how many hellos a claim waits for a busy scan radio.
+const PRE_HOLD = 60;
+const PRE_LATE = 30;
+const PRE_TRIES = 6;
+const OWN_EVERY = 300;      // seconds between the ratings a radio that can't scan gives its own channel
+const STATES_FOR = 60;      // seconds what Linux says of the DFS channels is kept before it is asked again
+const HOSTAPD_CTL = '/var/run/hostapd/';   // where hostapd's networks have their control sockets
+const CTL_SOCKET = '/var/run/aeolus/hostapd-ctl-rrm';   // and this daemon's own, which hostapd answers to
+
+let bus = connect();
+let wifi_names = wifinames.keeper();   // what netifd's Wi-Fi status last said of each radio it is not setting up (0301)
+openlog('aeolus-rrm', LOG_PID, LOG_DAEMON);
+
+function log(fmt, ...args) {
+	syslog(LOG_INFO, fmt, ...args);
+}
+
+function note(fmt, ...args) {
+	syslog(LOG_WARNING, fmt, ...args);
+}
+
+function read(path) {
+	let v = fs.readfile(path);
+	return v == null ? null : trim(v);
+}
+
+function store(path, data) {
+	let tmp = path + '.new';
+	if (fs.writefile(tmp, data) == null)
+		return false;
+	return fs.rename(tmp, path);
+}
+
+// now is monotonic time in seconds, to the microsecond.
+function now() {
+	let c = clock(true);
+	return c[0] + c[1] / 1e9;
+}
+
+function dbm(v) {
+	return type(v) in ['int', 'double'] && v >= -127 && v <= 0 ? int(v < 0 ? v - 0.5 : v) : null;
+}
+
+let cfg = { on: false };
+let address = null;   // the AP's management address, where its neighbours reach it
+let sock = null;
+let radios = {};      // radio -> { name, band, bss, bssid, index, channel, width, mode, dfs, radar_ok, pinned, started, moved, list, next, due, put_off, survey, scan, load, own, hot, claim, plan, far }
+let adverts = {};     // the network carrying a radio's element -> { hex, index }
+let heard = {};       // AP -> { address, port, bands: { <band>: { signal, at } } }
+let others = {};      // a BSSID heard that is not an Aeolus AP's -> { ssid, band, channel, signal, at } (0105)
+let aeolus_bss = {};  // the last five bytes of a BSSID that carried an Aeolus advert -> when (0105)
+let nbrs = {};        // AP -> { address, port, last: { at, seq }, at, msg, state }
+let chosen = {};      // AP -> true, among the three heard most strongly on a band
+let picks = {};       // band -> the APs heard most strongly there
+let rates = {};       // '<band> <channel>' -> { band, channel, cost, now, busy, noise, networks, visits, at }
+let moves = [];       // this AP's last moves: { band, from, to, why, state, at, ap }
+let claimed = {};     // band -> when a neighbour's claim there was last seen
+let gone = false;     // whether netifd's network.wireless object is gone, so no radio can be seen
+let held = {};        // radio -> the power control holds it at (0077): { band, phy, index, power, ceiling, at, step, why, count, weakest, stepped }
+let kept = {};        // radio -> { band, power }: what the daemon's last run held it at
+let own_macs = [];    // the AP's own MACs, its test clients' among them (0206)
+let hears = [];       // clients it hears by probe and does not serve, for its hellos: [mac, band, signal] (0206)
+let heard_said = {};  // what each client said it hears of the AP (802.11k), by MAC, as aeolus-live keeps it
+let apc_events = [];  // power control's steps, the latest last (0206)
+let began = 0;        // when the daemon started
+let stilled = false;  // whether it held still at its last look, in a test window (0344)
+let looked = false;   // whether it has looked at the radios since it started, or was turned on
+let seq = 0;
+let heres = [];       // what other APs said they let on, to let go of here (0226): [{ ap, macs }]
+let here_last = {};   // AP -> { at, seq }: its last such message taken
+let probed_last = {}; // AP -> { at, seq }: its last word on the clients it hears by probe (0289)
+let probed_by = {};   // AP -> { at, clients }: that word, and when it was taken
+let shares_last = {}; // AP -> { at, seq }: its last word on what its clients can use (0299)
+let shares_by = {};   // AP -> { at, clients }: that word, and when it was taken
+let swept = 0;        // the time of the scan radio's look last taken in (0116)
+let unheard = false;  // whether airscan gave nothing when last asked
+let flat_at = 0;      // when an ath10k radio's levels were last set right (0184), by the wall clock: a look of the scan radio's from before is not taken in
+let flat_mono = 0;    // the same by the daemon's clock: a serving radio's scan begun before is not taken in
+let scan_alive = null; // when airscan last answered with its radio (0173)
+let precheck_ok = false; // whether airscan checks a block for radar on the scan radio for a move (0329)
+let pre_seq = 0;      // the last precheck's number, in its id
+let listening = null;  // whether the serving radios keep off scanning: the scan radio is in service (0081, 0173)
+// The adverts the scan radio hears (0161): the packet socket on its monitor
+// interface, the interface it is on, and what was heard: the last five
+// bytes of a BSSID whose beacons carried an advert -> { ap, address, port,
+// at }, as last read.
+let beacons = null, beacon_dev = null, airborne = {};
+let beacon_said = null; // the interface last said to be read, by name (airscan makes it again each time it scans): said again only when it is another, or after the scan radio was off or a read failed
+let away = {};        // band -> a radio on a DFS channel it went to after looking (0120): { radio, to, home, cost, since, checking, move }
+let after_moves = []; // the moves whose radios' clients are yet to be counted (0265): { radio, move, before, at }
+let dfs_read = {};    // phy -> { at, states }: what Linux said of its DFS channels, and when
+let shut = {};        // '<band> <channel>' -> when a DFS channel a radio left, or did not get to, opens to it again (0120)
+
+// settings reads whether RRM is on, the AP it advertises, the key, the
+// policy for moves: whether to move, the window for planned moves, and the
+// margin a better channel must beat the radio's own by; and whether power
+// control is on, how many neighbours it looks for, and its target (0077);
+// and whether the AP has a scan radio to listen through, airscan's (0116):
+// a radio marked as airscan's, read here, at each look, not from the render,
+// as airscan marks it, and takes the mark away when it is turned off (0173);
+// and whether it looks before it uses a DFS channel (0120); and a test
+// window's end, in Unix seconds, until which it holds still (0344).
+function settings() {
+	let c = cursor(confdir);
+	let s = c.get_all('aeolus', 'aeolus_rrm'), hs = c.get_all('aeolus', 'aeolus_hold');
+	let marked = false;
+	cursor().foreach('wireless', 'wifi-device', d => {
+		marked = marked || d.airscan == '1';
+	});
+	let key = rrm.unhex(read(keyfile) ?? '');
+	let on = s?.['.type'] == 'rrm' && s.enabled == '1' && match(s.ap ?? '', /^ap-[0-9a-f]{12}$/) != null && key != null && length(key) >= 16;
+	let margin = int(s?.margin ?? rrm.MARGIN), apart = int(s?.apart ?? rrm.APART), wide = int(s?.wide ?? 0);
+	let wanted = int(s?.apc_neighbours ?? 3), target = int(s?.apc_target ?? -70);
+	let cfloor = int(s?.apc_client_floor ?? -80), hold = int(s?.apc_hold ?? 24);
+	return {
+		on: on, ap: s?.ap, key: key, moves: s?.moves != '0', airscan: marked, dfs: s?.dfs == '1',
+		window: rrm.window(s?.window ?? rrm.WINDOW) ?? rrm.window(rrm.WINDOW),
+		margin: margin >= 5 && margin <= 100 ? margin : rrm.MARGIN,
+		// How far apart its own 5 and 6 GHz are kept (0327); 0 is no rule.
+		apart: apart >= 0 && apart <= 1000 ? apart : rrm.APART,
+		// The width it widens the 5 GHz radio to, where that starts narrower
+		// (0329): 160 MHz, or none.
+		wide: wide == 160 ? wide : null,
+		apc: s?.apc == '1', wanted: wanted >= 1 && wanted <= 6 ? wanted : 3,
+		target: target >= -85 && target <= -50 ? target : -70,
+		// What it does for clients (0206).
+		clients: s?.apc_clients in ['guard', 'ignore'] ? s.apc_clients : 'ask',
+		client_floor: cfloor >= -95 && cfloor <= -60 ? cfloor : -80,
+		hold: hold >= 1 && hold <= 168 ? hold : 24,
+		// A test window (0344): its end, and why.
+		still_until: hs?.['.type'] == 'hold' ? int(hs.until ?? 0) : 0, still_why: hs?.why,
+		// The powers Aeolus sets, which aeolus-power holds (0349), by radio.
+		powers: power.wanted(c.get_all('aeolus', 'aeolus_power')),
+	};
+}
+
+// still says whether the AP holds still now, in a test window (0344): it
+// moves no channel and steps no power until the window's end, by its own
+// clock. Its hellos go on, so its neighbours keep it as one.
+function still() {
+	return cfg.still_until > 0 && time() < cfg.still_until;
+}
+
+// when_said is a time as the log says it, the AP's own.
+function when_said(t) {
+	let l = localtime(t);
+	return sprintf('%04d-%02d-%02d %02d:%02d', l.year, l.mon, l.mday, l.hour, l.min);
+}
+
+// management is the address of the interface that holds the default route,
+// as the agent finds its management (0040).
+function management() {
+	for (let i in bus.call('network.interface', 'dump')?.interface ?? [])
+		if (!i.ip4table)
+			for (let r in i.route ?? [])
+				if (r.target == '0.0.0.0' && r.mask == 0)
+					return i['ipv4-address']?.[0]?.address;
+	return null;
+}
+
+function ifindex(name) {
+	return read(`/sys/class/net/${name}/ifindex`);
+}
+
+// uptime is how long the AP has been up, in seconds.
+function uptime() {
+	return int(split(read('/proc/uptime') ?? '0', ' ')[0]);
+}
+
+// calm forgets what a radio's channel was like: its survey's counts, and
+// whether it was busy with interference. They are another channel's once it
+// moves.
+function calm(r) {
+	r.survey = null;
+	r.load = null;   // what a scan radio's look took for its own channel's (0116)
+	r.own = null;    // and what a radio that can't scan has counted towards its own channel's rating (0120)
+	r.hot = null;
+	r.hot_n = 0;
+	r.hot_sum = 0;
+}
+
+function record(m) {
+	push(moves, m);
+	if (length(moves) > KEPT)
+		moves = slice(moves, length(moves) - KEPT);
+}
+
+// end_claim ends a radio's claim: moved, yielded to a neighbour's claim
+// (ap's), withdrawn, or failed.
+function end_claim(r, how, ap) {
+	let m = r.claim.move;
+	m.state = how;
+	m.at = time();
+	if (ap)
+		m.ap = ap;
+	r.claim = null;
+	r.plan = null;
+	log('%s: the move from channel %d to %d: %s%s', r.band, m.from, m.to, how, ap ? ' to ' + ap : '');
+}
+
+// phy_of is the wiphy a network is on. Power is set for the wiphy.
+function phy_of(ifn) {
+	let p = read(`/sys/class/net/${ifn}/phy80211/name`);
+	return p != null && match(p, /^phy[0-9]+$/) ? p : null;
+}
+
+// set_power holds a wiphy's power at p dBm, or with null lets it go back to
+// what it is configured to, as netifd does when the radio starts (0077).
+function set_power(phy, p) {
+	return system(p == null ? `iw phy ${phy} set txpower auto` : sprintf('iw phy %s set txpower fixed %d', phy, p * 100)) == 0;
+}
+
+// let_go puts the radios power control holds back to their configured power.
+// One whose power is set, or whose network was made anew, netifd already
+// put back. One that can't be put back yet stays held, failed, to be tried
+// again next time. What the last run held them at is forgotten too.
+function let_go() {
+	let still = {};
+	for (let name, h in held) {
+		let r = radios[name];
+		if (!r || h.power == null || r.power_set || r.phy != h.phy || r.index != h.index)
+			continue;
+		if (set_power(h.phy, null)) {
+			log('%s: power control let go of its power', r.band);
+			continue;
+		}
+		if (h.why != 'failed')
+			note('%s: power control cannot let go of its power; it tries again', r.band);
+		h.why = 'failed';
+		still[name] = h;
+	}
+	held = still;
+	kept = {};
+}
+
+// dfs_now is what Linux says of the DFS channels on a radio's phy, as iw
+// prints it: read at most once in STATES_FOR, unless asked anew.
+function dfs_now(r, at, anew) {
+	let c = dfs_read[r.phy];
+	if (c && !anew && at - c.at < STATES_FOR)
+		return c.states;
+	let p = r.phy ? fs.popen(`iw phy ${r.phy} channels 2>/dev/null`) : null;
+	let text = p ? p.read('all') : null;
+	if (p)
+		p.close();
+	dfs_read[r.phy] = { at: at, states: rrm.dfs_states(text) };
+	return dfs_read[r.phy].states;
+}
+
+// left notes a radio that left a DFS channel without this daemon moving it
+// (0120): hostapd moves it, at once, when radar is found there. Linux then
+// keeps the channel closed for half an hour, which tells this from a
+// channel that only reads otherwise for a moment while a move is made. The
+// block is left alone for a day (rrm.bar).
+function left(r, was, ch, at) {
+	if (!rrm.radar(r.band, was) || away[r.band]?.checking || at - (r.moved ?? -60) < 60)
+		return;
+	let states = dfs_now(r, at, true);
+	if (!length(filter(rrm.covers(r.band, was, r.width), c => states['' + c]?.state == 'unavailable')))
+		return;
+	note('%s: radar was found on channel %d, and hostapd moved the radio to %d; channel %d is left alone for a day', r.band, was, ch, was);
+	if (r.claim)
+		end_claim(r, 'withdrawn');
+	record({ band: r.band, from: was, to: ch, why: 'radar', state: 'moved', at: time() });
+	rrm.bar(shut, r.band, rrm.covers(r.band, was, r.width), time());
+	delete away[r.band];
+}
+
+// blind says a radio can't scan for being on a DFS channel, on an AP that
+// looks before it uses one (0120) and has no scan radio to look for it.
+// Linux refuses its scans there; a radio whose driver lets it scan all the
+// same is not blind, and goes on as anywhere.
+function blind(r) {
+	return r.radar_ok == true && !listening && r.deaf != null && rrm.radar(r.band, r.channel);
+}
+
+// look_radios finds the radios that are up, and on each, the network whose
+// beacons carry the element: Aeolus's own where it has one. A radio counts
+// as started when that network's interface is made anew, or when it comes
+// up while the daemon runs; one the daemon finds up when it starts, only if
+// the AP booted within START.
+function look_radios(at) {
+	let seen = {};
+	// netifd's network.wireless object can go while netifd runs on (OpenWrt
+	// 25.12 publishes it once, from ucode): the radios run, unseen, until the
+	// network restarts (2026-10-06, the office AP).
+	let status = bus.call('network.wireless', 'status');
+	let lost = status == null && !!match(bus.error() ?? '', /not found/i);
+	if (lost != gone) {
+		if (lost)
+			note('netifd has no network.wireless object: no radio can be seen until the network restarts');
+		else
+			log('netifd has its network.wireless object again');
+		gone = lost;
+	}
+	// A radio netifd is setting up again is as it last was (0301): taken
+	// for gone, it was forgotten, and its next look counted as a start.
+	for (let name, d in wifi_names.view(status) ?? {}) {
+		let band = d.config?.band;
+		if (!(band in ['2g', '5g', '6g']) || !d.up)
+			continue;
+		let ifs = filter(d.interfaces ?? [], i => i.ifname && i.config?.mode == 'ap');
+		if (!length(ifs))
+			continue;
+		let pick = filter(ifs, i => index(i.section ?? '', 'aeolus_') == 0)[0] ?? ifs[0];
+		let names = map(ifs, i => i.ifname);
+		let info = bus.call('iwinfo', 'info', { device: pick.ifname }) ?? {};
+		let idx = ifindex(pick.ifname);
+		let fresh = !radios[name];
+		let r = radios[name] ??= { next: 0, due: at + 2 + 5 * length(keys(radios)), put_off: 0 };
+		// Its networks made anew by its own radar check are no start (0120).
+		let checking = away[band]?.checking == true;
+		if (fresh)
+			r.started = !checking && (looked || uptime() < START) ? at : null;
+		else if ((r.bss != pick.ifname || r.index != idx) && !checking)
+			r.started = at;
+		r.name = name;
+		r.index = idx;
+		// All its networks' interfaces: power control listens to the
+		// clients on each (0206).
+		r.ifaces = names;
+		let ch = info.channel ?? 0;
+		if (!fresh && r.radar_ok && ch && r.channel && ch != r.channel)
+			left(r, r.channel, ch, at);
+		// The survey's running counts are another network's or another
+		// channel's once any of these change: they start again.
+		if (r.band != band || r.bss != pick.ifname || r.channel != ch)
+			calm(r);
+		r.band = band;
+		r.bss = pick.ifname;
+		// Its BSSID, which hellos carry: an AP that listens through a scan
+		// radio knows this radio's networks by it (0116).
+		r.bssid = lc(read(`/sys/class/net/${pick.ifname}/address`) ?? '');
+		r.channel = ch;
+		r.width = int(match(info.htmode ?? '', /([0-9]+)$/)?.[1] ?? 20);
+		r.mode = info.htmode;
+		// The width it starts at, as its config has it, and where that is
+		// narrower than the policy's wide, the width it is widened to
+		// (0329). A radio widened runs wider than it starts.
+		r.base = int(match(d.config?.htmode ?? '', /([0-9]+)$/)?.[1] ?? r.width);
+		r.wide = band == '5g' && cfg.wide && cfg.wide > r.base ? cfg.wide : null;
+		// Where the AP looks before it uses a DFS channel (0120), hostapd
+		// starts the radio outside them and this daemon may move it there:
+		// it looks at them too.
+		r.radar_ok = cfg.dfs && band == '5g';
+		r.dfs = r.radar_ok || !(d.config?.acs_exclude_dfs in [true, '1']);
+		// A channel set for the radio is left alone, and so is a power:
+		// netifd's, or the one aeolus-power holds it to (0349).
+		let set = d.config?.channel;
+		r.pinned = !(set == null || set == 'auto' || set == '0' || set == 0);
+		r.power_set = !(d.config?.txpower in [null, '']) || cfg.powers?.[name] != null;
+		r.phy = phy_of(pick.ifname);
+		// The channels an automatic channel may be (0075), as the renderer
+		// writes them: each whole block's primary at the radio's width
+		// (0243), which stands for all of its block's channels (0266).
+		let chans = d.config?.channels;
+		chans = type(chans) == 'array' ? chans : type(chans) == 'string' ? split(trim(chans), /[ \t]+/) : [];
+		r.allowed = rrm.allowed_of(band, r.base, chans);
+		r.list = rrm.visits(band, r.channel, r.dfs, r.allowed, r.width);
+		seen[name] = true;
+	}
+	for (let name in keys(radios))
+		if (!seen[name])
+			delete radios[name];
+	// A radio found off the DFS channel it went to, as after its Wi-Fi
+	// started again, has nowhere to step off from.
+	for (let band in keys(away)) {
+		let r = filter(values(radios), x => x.band == band)[0];
+		if (!away[band].checking && r?.channel && !rrm.radar(band, r.channel))
+			delete away[band];
+	}
+	looked = true;
+}
+
+// warned keeps what was said of each interface that could not carry the
+// element: a network not on the air yet, as while its radio listens for
+// radar, is said of once, and again only where what is wrong changes.
+let warned = {};
+
+// advertise puts the element on each radio's chosen network, again whenever
+// that network's interface was made anew, and takes it off where it no
+// longer belongs.
+function advertise() {
+	let want = {};
+	if (cfg.on && address)
+		for (let name, r in radios) {
+			let hex = rrm.advert(cfg.ap, address, rrm.PORT);
+			if (hex)
+				want[r.bss] = hex;
+		}
+	for (let ifn, hex in want) {
+		let idx = ifindex(ifn);
+		if (adverts[ifn]?.hex == hex && adverts[ifn].index == idx)
+			continue;
+		bus.call(`hostapd.${ifn}`, 'set_vendor_elements', { vendor_elements: hex });
+		let err = bus.error();
+		if (err) {
+			let said = sprintf('%s: its beacons cannot carry the element: %s', ifn, err);
+			if (warned[ifn] != said)
+				note('%s', said);
+			warned[ifn] = said;
+		}
+		else {
+			adverts[ifn] = { hex: hex, index: idx };
+			delete warned[ifn];
+		}
+	}
+	for (let ifn in keys(adverts))
+		if (!want[ifn]) {
+			bus.call(`hostapd.${ifn}`, 'set_vendor_elements', { vendor_elements: '' });
+			delete adverts[ifn];
+		}
+}
+
+// monitor_dev is the scan radio's monitor interface, by the phy airscan
+// says it has, with its index: a monitor interface made again has another.
+function monitor_dev() {
+	let phy = bus.call('airscan', 'status')?.phy;
+	if (type(phy) != 'string' || !match(phy, /^[a-z0-9]+$/))
+		return null;
+	for (let ifn in fs.lsdir('/sys/class/net') ?? [])
+		if (read(`/sys/class/net/${ifn}/phy80211/name`) == phy && read(`/sys/class/net/${ifn}/type`) == '803')
+			return { name: ifn, key: ifn + ' ' + read(`/sys/class/net/${ifn}/ifindex`) };
+	return null;
+}
+
+// listen_beacons opens the packet socket the scan radio's beacons are read
+// on (0161), where the AP has one, or keeps the one open; and closes it
+// where the AP has none. One that cannot be opened is tried again at the
+// next look.
+function listen_beacons() {
+	let dev = cfg.on && listening ? monitor_dev() : null;
+	// Off, the next reading is said again (not while the radio is lent,
+	// when there is no interface for a moment).
+	if (!cfg.on || !listening)
+		beacon_said = null;
+	if (beacons && dev?.key == beacon_dev)
+		return;
+	if (beacons) {
+		beacons.close();
+		beacons = null;
+	}
+	beacon_dev = null;
+	if (!dev)
+		return;
+	let s = socket.create(socket.AF_PACKET, socket.SOCK_RAW, 0);
+	if (!s || !s.bind({ family: socket.AF_PACKET, protocol: 3, address: '00:00:00:00:00:00', interface: dev.name }) ||
+	    !s.setopt(socket.SOL_SOCKET, socket.SO_ATTACH_FILTER, { len: length(rrm.BEACONS), filter: rrm.BEACONS })) {
+		note('cannot read the scan radio\'s beacons on %s: %s', dev.name, socket.error());
+		beacon_said = null;
+		s?.close();
+		return;
+	}
+	// What came before the filter took hold goes.
+	while (s.recv(2048, socket.MSG_DONTWAIT) != null)
+		;
+	beacons = s;
+	beacon_dev = dev.key;
+	if (beacon_said != dev.name)
+		log('reading the Aeolus adverts the scan radio hears, on %s', dev.name);
+	beacon_said = dev.name;
+}
+
+// read_beacons takes in the beacons waiting (0161): each advert heard says
+// where another Aeolus AP is, by one of its radios' BSSIDs. A socket that
+// fails, as when airscan has made its interface again, is opened again at
+// the next look. airscan takes its interface down for a moment each time it
+// scans or lends the radio to a client test, every few minutes: the
+// socket's "Network is down" then is no news, and is not said.
+function read_beacons(at) {
+	for (let i = 0; i < 500; i++) {
+		let f = beacons.recv(2048, socket.MSG_DONTWAIT);
+		if (f == null) {
+			let err = socket.error() ?? '';
+			if (!match(err, /again|temporarily|would block/i)) {
+				if (!match(err, /network is down/i)) {
+					note('the scan radio\'s beacons cannot be read: %s', err);
+					beacon_said = null;
+				}
+				beacons.close();
+				beacons = null;
+				beacon_dev = null;
+			}
+			return;
+		}
+		let a = rrm.beacon_advert(f);
+		if (!a || a.advert.ap == cfg.ap)
+			continue;
+		let tail = substr(a.bssid, 3), was = airborne[tail];
+		let t = { ap: a.advert.ap, address: a.advert.address, port: a.advert.port, at: at };
+		airborne[tail] = t;
+		if (was?.ap != t.ap)
+			log('%s heard on the scan radio, at %s', t.ap, t.address);
+	}
+}
+
+// listen opens the socket hellos come in on, at the management address.
+function listen() {
+	if (sock) {
+		sock.close();
+		sock = null;
+	}
+	if (!address)
+		return;
+	let s = socket.create(socket.AF_INET, socket.SOCK_DGRAM);
+	if (!s || !s.bind({ address: address, port: rrm.PORT })) {
+		note('cannot listen on %s:%d: %s', address, rrm.PORT, socket.error());
+		s?.close();
+		return;
+	}
+	sock = s;
+	log('listening for hellos on %s:%d', address, rrm.PORT);
+}
+
+// hold_off says whether the serving radios keep off scanning (0081): where
+// the AP has a scan radio, and airscan has it in service, lent or not, or a
+// client test that stopped airscan has it (0121). Where neither has had it
+// for SCAN_GONE, as when airscan was stopped for good or keeps failing, they
+// scan, as on an AP without one, and keep off again once it is back (0173).
+// Airscan is given that long from the daemon's start, or from the scan
+// radio's mark appearing, as at boot, when it starts after this. Changed,
+// each radio's visits start afresh.
+function hold_off(at) {
+	let was = listening, answered = false;
+	if (!cfg.on || !cfg.airscan) {
+		scan_alive = null;
+		precheck_ok = false;
+	} else {
+		let st = bus.call('airscan', 'status');
+		answered = type(st?.phy) == 'string' || fs.access('/var/run/aeolus/clienttest/stopped');
+		// Whether its scan radio checks a block for radar for a move (0329).
+		precheck_ok = type(st?.phy) == 'string' && type(st.features) == 'array' && index(st.features, 'precheck') >= 0;
+		if (answered || scan_alive == null)
+			scan_alive = at;
+	}
+	listening = scan_alive != null && at - scan_alive < SCAN_GONE;
+	if (was == null || was == listening)
+		return;
+	for (let name, r in radios) {
+		r.scan = null;
+		r.due = at;
+	}
+	if (cfg.on && cfg.airscan)
+		log(listening ? (answered ? 'the scan radio is in service: the serving radios keep off scanning'
+			: 'the AP has a scan radio: the serving radios keep off scanning, while airscan comes up')
+			: 'the scan radio has not been in service for %d minutes: the serving radios scan, as on an AP without one', SCAN_GONE / 60);
+	else if (cfg.on && was)
+		log('the AP has no scan radio now: the serving radios scan, as on an AP without one');
+}
+
+// The port's dfs-look (0261) moves a 5 GHz radio to a DFS channel after a
+// look of its own: one daemon only moves a radio's channel. Where RRM moves
+// channels, dfs-look is stopped and kept from starting at boot; where RRM
+// does not, one Aeolus stopped is started again, and one it did not stop is
+// left as it is. Looked at a minute apart, and at once where RRM or its
+// moves turn on or off: a sysupgrade puts dfs-look's start at boot back,
+// and RRM stops it again within a minute. The start outside DFS
+// (wifi-scripts' dfs_look_first) is the radio's start, not a move, and is
+// left as it is.
+const DFS_LOOK = '/etc/init.d/dfs-look';
+const DFS_LOOK_OFF = '/etc/aeolus/dfs-look-off';   // Aeolus stopped dfs-look; kept over a sysupgrade
+const MOVER_EVERY = 60;
+let mover = { at: null, wanted: null };
+
+function one_mover(at) {
+	let wanted = cfg.on && cfg.moves;
+	if (wanted === mover.wanted && mover.at != null && at - mover.at < MOVER_EVERY)
+		return;
+	mover.at = at;
+	mover.wanted = wanted;
+	if (!fs.access(DFS_LOOK))
+		return;
+	if (wanted) {
+		if (system(DFS_LOOK + ' running >/dev/null 2>&1') != 0 && system(DFS_LOOK + ' enabled >/dev/null 2>&1') != 0)
+			return;
+		system(DFS_LOOK + ' disable >/dev/null 2>&1; ' + DFS_LOOK + ' stop >/dev/null 2>&1');
+		fs.writefile(DFS_LOOK_OFF, sprintf('%d\n', time()));
+		log("the port's dfs-look is stopped: RRM moves this AP's channels, and only one moves them (0261)");
+	} else if (fs.access(DFS_LOOK_OFF)) {
+		system(DFS_LOOK + ' enable >/dev/null 2>&1; ' + DFS_LOOK + ' start >/dev/null 2>&1');
+		fs.unlink(DFS_LOOK_OFF);
+		log("the port's dfs-look runs again: RRM moves no channels here (0261)");
+	}
+}
+
+function look(at) {
+	let was = cfg.on;
+	cfg = settings();
+	if (cfg.on != was)
+		log(cfg.on ? 'on, as %s' : 'off', cfg.ap);
+	// A test window that began, or ended by the clock or the manager's word.
+	if (still() != stilled) {
+		stilled = still();
+		if (stilled)
+			log('holds still until %s, a test window (0344)%s: no channel moves and no power steps', when_said(cfg.still_until), cfg.still_why ? ', for ' + cfg.still_why : '');
+		else
+			log('the test window is over: it moves as its policy says');
+	}
+	one_mover(at);
+	hold_off(at);
+	if (!cfg.on) {
+		for (let name, r in radios)
+			if (r.claim)
+				end_claim(r, 'withdrawn');
+		// A power it couldn't let go of is tried again, on the radios as
+		// they are now.
+		if (length(keys(held)))
+			look_radios(at);
+		let_go();
+		advertise();
+		if (sock) {
+			sock.close();
+			sock = null;
+		}
+		address = null;
+		heard = {};
+		nbrs = {};
+		chosen = {};
+		picks = {};
+		rates = {};
+		radios = {};   // and their survey counts, which would be stale when it is on again
+		looked = false;
+		swept = 0;
+		airborne = {};
+		listen_beacons();
+		away = {};
+		dfs_read = {};
+		shut = {};
+		return;
+	}
+	let a = management();
+	if (a != address || !sock) {
+		address = a;
+		listen();
+	}
+	look_radios(at);
+	advertise();
+	listen_beacons();
+}
+
+// survey reads a radio's survey of one frequency. For its own channel the
+// counts run on; for another, both lab APs' drivers keep only the last
+// visit's.
+function survey(r, f) {
+	for (let x in nl.request(nl.const.NL80211_CMD_GET_SURVEY, nl.const.NLM_F_DUMP, { dev: r.bss }) ?? [])
+		if (x.survey_info?.frequency == f)
+			return x.survey_info;
+	return null;
+}
+
+// load reads how busy a radio's own channel has been since it was last
+// read: all told, for whether to visit elsewhere now; and with this AP's
+// own sending taken out, where the driver says what that was, for the
+// channel's rating. Null the first time.
+function load(r) {
+	let s = survey(r, rrm.freq(r.band, r.channel));
+	let was = r.survey;
+	// A survey without a busy count says nothing of how busy the channel is.
+	r.survey = s?.time && s.busy != null ? { time: s.time, busy: s.busy, tx: s.time_tx ?? 0 } : null;
+	if (!was || !r.survey || r.survey.time <= was.time)
+		return null;
+	// The counts are whole numbers, which ucode divides to a whole number.
+	let t = 1.0 * (r.survey.time - was.time), b = r.survey.busy - was.busy;
+	return { all: b / t, others: (b - (r.survey.tx - was.tx)) / t, noise: s.noise };
+}
+
+// watch reads how busy a radio's own channel has been since it was last
+// read, and notes interference: others kept it busy, read after read. It
+// reads the radio's own counts, and sends nothing.
+function watch(r) {
+	let l = load(r);
+	if (l) {
+		r.hot_n = l.others > rrm.SUDDEN ? (r.hot_n ?? 0) + 1 : 0;
+		r.hot_sum = r.hot_n ? (r.hot_sum ?? 0) + l.others : 0;
+		r.hot = r.hot_n >= HOT ? r.hot_sum / r.hot_n : null;
+	}
+	return l;
+}
+
+// fold takes one look at a channel into its ratings: how busy others kept
+// it, 0 to 1, its noise, and the signals of the other networks there; and
+// the share the scan radio's spectral sweep found energy there (0245),
+// where it has one: the channel is as busy as the busier of the two says.
+// Its noise is kept, to be said, and counts for nothing in its cost (0246):
+// the readings a radio gives are not alike enough to weigh one channel
+// against another by them. So is its floor, the sweep's level set against
+// the radio's own noise floor (0247), where there is one.
+function fold(band, ch, busy, noise, networks, at, energy, floor) {
+	if (!(type(energy) in ['int', 'double']))
+		energy = null;
+	if (busy == null && energy == null)
+		return;   // the driver said nothing of the look
+	busy = min(1, max(0, max(busy ?? 0, energy ?? 0)));
+	// A driver may give 0 for a noise floor it didn't measure, as the R7800's
+	// does on its own 5 GHz channel.
+	if (!(type(noise) in ['int', 'double']) || noise < -127 || noise > -20)
+		noise = null;
+	let c = rrm.cost(busy, null, networks);
+	// One only remembered, past RATED_FOR (0332), starts anew: a visit now
+	// is not blended with what the channel was like hours ago.
+	if (rates[band + ' ' + ch] && at - rates[band + ' ' + ch].at > RATED_FOR)
+		delete rates[band + ' ' + ch];
+	let rt = rates[band + ' ' + ch] ??= { band: band, channel: ch, visits: 0 };
+	rt.cost = rrm.blend(rt.cost, c, rrm.LASTING);
+	rt.now = rrm.blend(rt.now, c, rrm.NOW);
+	rt.busy = busy;
+	rt.energy = energy;
+	rt.floor = type(floor) in ['int', 'double'] && floor >= -127 && floor <= -20 ? floor : null;
+	rt.noise = noise;
+	rt.networks = length(networks);
+	rt.signals = networks;
+	rt.visits++;
+	rt.at = at;
+}
+
+// rate_own rates a radio's own channels by its own counts alone, where it
+// can't scan (0120): how busy others kept them over OWN_EVERY, their noise,
+// and the other networks last heard there, which it can't hear again.
+function rate_own(r, l, at) {
+	r.own ??= { sum: 0, n: 0, since: at };
+	r.own.sum += l.others;
+	r.own.n++;
+	if (at - r.own.since < OWN_EVERY)
+		return;
+	for (let c in rrm.covers(r.band, r.channel, r.width))
+		fold(r.band, c, r.own.sum / r.own.n, l.noise, rates[r.band + ' ' + c]?.signals ?? [], at);
+	r.own = null;
+}
+
+// visit listens on a radio's next channel. Off its own, it goes only while
+// its channel isn't busy, or once it put that off PUT_OFF times. It only
+// listens: without a probe, a visit stays long enough to hear a beacon.
+function visit(r, at) {
+	if (!length(r.list))
+		return;
+	let l = watch(r);
+	if (l && blind(r))
+		rate_own(r, l, at);
+	let f = r.list[r.next % length(r.list)];
+	let own = rrm.freq(r.band, r.channel);
+	if (f != own && l && l.all > BUSY && r.put_off < PUT_OFF) {
+		r.put_off++;
+		f = own;
+	} else {
+		r.next++;
+		r.put_off = 0;
+	}
+	nl.request(nl.const.NL80211_CMD_TRIGGER_SCAN, 0, { dev: r.bss, scan_frequencies: [ f ], scan_flags: SCAN_FLAG_AP });
+	let err = nl.error();
+	if (err) {
+		// Once, a scan already running or the radio restarting: the next visit
+		// tries again. Visit after visit, the radio doesn't scan at all. On a
+		// channel shared with radar (DFS), Linux keeps an AP there listening
+		// for radar and refuses every scan (2026-10-06, the office AP on 108):
+		// its ratings on that band age until it leaves.
+		r.refused = (r.refused ?? 0) + 1;
+		if (r.refused >= DEAF_AFTER && !r.deaf) {
+			r.deaf = { why: rrm.radar(r.band, r.channel) ? 'dfs' : 'refused', since: at };
+			if (r.deaf.why == 'dfs' && blind(r))
+				log('%s: on DFS channel %d the radio cannot scan, as it must keep listening for radar; it rates its own channel by its own counts, and steps off when that grows worse', r.bss, r.channel);
+			else if (r.deaf.why == 'dfs')
+				note('%s: on DFS channel %d the radio cannot scan, as it must keep listening for radar; its %s ratings age until it leaves', r.bss, r.channel, r.band);
+			else
+				note('%s: the radio refuses every scan (%s); its %s ratings age until it scans again', r.bss, err, r.band);
+		}
+		return;
+	}
+	if (r.deaf)
+		log('%s: the radio scans again, on channel %d', r.bss, r.channel);
+	r.refused = 0;
+	r.deaf = null;
+	r.scan = { freq: f, started: at, load: f == own ? l : null };
+}
+
+// channel is a frequency's channel number, as a whole number: the report
+// says so.
+function channel(band, f) {
+	if (band == '2g')
+		return f == 2484 ? 14 : int((f - 2407) / 5);
+	return int((f - (band == '5g' ? 5000 : 5950)) / 5);
+}
+
+// rate folds a visit into its channel's ratings. On its own channel, how
+// busy others kept it comes from the survey's counts since the last visit;
+// elsewhere, from the visit's own.
+function rate(r, sc, networks, at) {
+	let busy = null, noise = null;
+	if (sc.load) {
+		busy = sc.load.others;
+		noise = sc.load.noise;
+	} else {
+		let s = survey(r, sc.freq);
+		if (s?.time && s.busy != null) {
+			// Less its own sending: on its own channel, at the first visit, the
+			// counts run from the radio's start. Elsewhere there is none.
+			busy = (s.busy - (s.time_tx ?? 0)) / (1.0 * s.time);
+			noise = s.noise;
+		}
+	}
+	fold(r.band, channel(r.band, sc.freq), busy, noise, networks, at);
+}
+
+// channel_of is a frequency's channel, as Linux numbers it: 6 GHz's
+// channel 2 sits below its channel 1, and 4.9 GHz counts from 4 GHz.
+function channel_of(f) {
+	if (f == 2484)
+		return 14;
+	if (f < 2484)
+		return int((f - 2407) / 5);
+	if (f >= 4910 && f <= 4980)
+		return int((f - 4000) / 5);
+	if (f < 5925)
+		return int((f - 5000) / 5);
+	if (f == 5935)
+		return 2;
+	return int((f - 5950) / 5);
+}
+
+// other keeps a network heard that carries no Aeolus advert (0105): its
+// BSSID, SSID, band, channel and signal, for an hour, so the manager can
+// tell one that takes the SSID of one of Aeolus's networks.
+function other(b, band, at) {
+	if (!match(b.bssid ?? '', /^[0-9a-f]{2}(:[0-9a-f]{2}){5}$/))
+		return;
+	let ssid = null;
+	for (let e in b.beacon_ies ?? [])
+		if (e.type == 0) {
+			ssid = rrm.printable(e.data);
+			break;
+		}
+	// What the manager would refuse, it never hears: one network it can't
+	// take would cost the AP its whole report.
+	let channel = channel_of(b.frequency), signal = dbm(b.signal_mbm / 100);
+	if (ssid && channel >= 1 && channel <= 233 && signal != null)
+		others[b.bssid] = { ssid: ssid, band: band, channel: channel, signal: signal, at: at };
+}
+
+// aeolus_radio says whether a BSSID is another of the networks of a radio
+// whose advert was heard: a radio makes its BSSIDs from one MAC, changing
+// only the first byte (30:86:2d:ef:2f:d0, 32:86:..., 36:86:..., C-360,
+// 2026-10-10), and only one of them carries the advert.
+function aeolus_radio(bssid, at) {
+	let seen = aeolus_bss[substr(bssid, 3)];
+	return seen != null && at - seen <= OTHERS_FOR;
+}
+
+// others_listed is the networks heard in the last hour, the strongest
+// first; older ones are forgotten.
+function others_listed(at) {
+	let out = [], old = [];
+	for (let bssid, o in others) {
+		if (at - o.at > OTHERS_FOR) {
+			push(old, bssid);
+			continue;
+		}
+		if (aeolus_radio(bssid, at))
+			continue;
+		push(out, { bssid: bssid, ssid: o.ssid, band: o.band, channel: o.channel, signal: o.signal, ago: max(0, int(at - o.at)) });
+	}
+	for (let bssid in old)
+		delete others[bssid];
+	for (let k in keys(aeolus_bss))
+		if (at - aeolus_bss[k] > OTHERS_FOR)
+			delete aeolus_bss[k];
+	return slice(sort(out, (x, y) => y.signal - x.signal), 0, OTHERS_MAX);
+}
+
+// flat keeps every ath10k-ct radio saying what it hears as it hears it
+// (0184): the scan radio's levels, and a serving radio's, of its scans and
+// of its clients. Left to itself, the driver adds 8 dB on 2.4 GHz and 12 dB
+// on 5 GHz to every beacon, and up to as much to every other frame, to match
+// OFDM peak power, which no other radio here does: a C-260 heard its
+// neighbours 11 to 21 dB louder than they heard it. A reboot or a driver
+// reload puts it back, so it is seen to at each look, whether RRM is on or
+// not. Where it turned one off, what was heard before is not taken in, and
+// each neighbour's level starts again from the next.
+const PEAK = '/sys/kernel/debug/ieee80211/phy*/ath10k/ofdm_peak_power_rssi';
+function flat(at) {
+	let turned = false;
+	for (let path in fs.glob(PEAK) ?? []) {
+		let phy = match(path, /\/(phy[0-9]+)\//)?.[1];
+		if (!phy || trim(fs.readfile(path) ?? '0') == '0')
+			continue;
+		if (fs.writefile(path, '0') == null) {
+			note('cannot turn off ofdm_peak_power_rssi on %s: %s', phy, fs.error());
+			continue;
+		}
+		log('%s no longer adds 8 to 12 dB to what it hears (ofdm_peak_power_rssi off)', phy);
+		turned = true;
+	}
+	if (!turned)
+		return;
+	flat_at = time();
+	flat_mono = at;
+	for (let ap, h in heard)
+		for (let band, hb in h.bands)
+			hb.fresh = true;
+}
+
+// heard_on reads what a visit heard: other Aeolus APs' adverts, and the
+// other networks there, which go into the channel's rating. On 2.4 GHz, a
+// network up to three channels away counts too, 6 dB weaker for each
+// channel between.
+function heard_on(r, at) {
+	let sc = r.scan;
+	r.scan = null;
+	// Begun before a radio's levels were set right (0184): not taken in.
+	if (sc.started < flat_mono)
+		return;
+	let within = (at - sc.started) * 1000 + 500;
+	let networks = [];
+	for (let x in nl.request(nl.const.NL80211_CMD_GET_SCAN, nl.const.NLM_F_DUMP, { dev: r.bss }) ?? []) {
+		let b = x.bss;
+		if (!b?.frequency || (b.seen_ms_ago ?? within + 1) > within)
+			continue;
+		let d = b.frequency - sc.freq;
+		if (d < 0)
+			d = -d;
+		if (d > (r.band == '2g' ? 15 : 0))
+			continue;
+		// Beacons only: both lab APs' drivers answer probes from a template
+		// that misses the element's changes, without it once it is put on, or
+		// with it once it is taken off.
+		let a = null;
+		for (let e in b.beacon_ies ?? []) {
+			a = e.type == 221 ? rrm.read_advert(e.data) : null;
+			if (a)
+				break;
+		}
+		if (!a) {
+			push(networks, b.signal_mbm / 100 - 6 * d / 5);
+			if (!d)
+				other(b, r.band, at);
+			continue;
+		}
+		if (match(b.bssid ?? '', /^[0-9a-f]{2}(:[0-9a-f]{2}){5}$/))
+			aeolus_bss[substr(b.bssid, 3)] = at;
+		if (a.ap == cfg.ap || d)
+			continue;
+		let h = heard[a.ap] ??= { bands: {} };
+		h.address = a.address;
+		h.port = a.port;
+		let hb = h.bands[rrm.band_of(b.frequency)] ??= {};
+		hb.signal = hb.fresh ? b.signal_mbm / 100 : rrm.smooth(hb.signal, b.signal_mbm / 100);
+		delete hb.fresh;
+		hb.at = at;
+	}
+	rate(r, sc, networks, at);
+}
+
+// signals are how strongly each AP is heard now, by band.
+function signals(at) {
+	let out = {};
+	for (let ap, h in heard)
+		for (let band, hb in h.bands)
+			if (at - hb.at <= HEARD_FOR)
+				(out[ap] ??= {})[band] = hb.signal;
+	return out;
+}
+
+// state is a neighbour's: up when hellos go both ways, one-way when its
+// come but don't list this AP, down when they stopped, and heard when it is
+// only heard in the air.
+function state(n, at) {
+	if (n?.at == null)
+		return 'heard';
+	if (at - n.at > rrm.DEAD)
+		return 'down';
+	return index(n.msg?.sees ?? [], cfg.ap) >= 0 ? 'up' : 'one-way';
+}
+
+// scan_dev is the scan radio's interface, by the phy airscan says it has.
+function scan_dev() {
+	let phy = bus.call('airscan', 'status')?.phy;
+	if (type(phy) != 'string' || !match(phy, /^[a-z0-9]+$/))
+		return null;
+	for (let ifn in fs.lsdir('/sys/class/net') ?? [])
+		if (read(`/sys/class/net/${ifn}/phy80211/name`) == phy)
+			return ifn;
+	return null;
+}
+
+// sweep takes in what the scan radio heard in its last look (0116), where
+// the AP has one and its serving radios never scan (0081): airscan's list
+// of the networks in the air, and that radio's survey of each channel, which
+// are read, not asked for. Each look is taken in once.
+//
+// A neighbour's radio is known by the BSSID its hellos carry, so an AP is
+// heard here once its hellos come: it hears this AP's advert and sends them.
+// A look is gone through again for a neighbour whose hellos began after it
+// was taken in, so that one need not wait for the next look, minutes away.
+// The other networks go to the manager (0105) and into the channels'
+// ratings. A channel's busy share and noise are the scan radio's; this AP's
+// own channels', its serving radios' own counts, where they have them, as
+// the scan radio hears this AP's own sending as someone else's.
+function sweep(at) {
+	let b = bus.call('airscan', 'bss');
+	let wall = time();
+	if (type(b?.list) != 'array' || type(b.time) != 'int' || wall - b.time > SWEEP_OLD) {
+		if (!unheard)
+			note('the scan radio says nothing new: airscan %s; the neighbours\' signals and the ratings age until it does',
+				b == null ? 'does not answer' : 'last looked over ' + SWEEP_OLD + ' s ago');
+		unheard = true;
+		return;
+	}
+	if (unheard)
+		log('the scan radio is heard from again');
+	unheard = false;
+	// A look from before its levels were set right (0184) is not taken in.
+	if (b.time < flat_at)
+		return;
+	let again = b.time == swept;
+	if (!swept)
+		log('listening through the scan radio: %d networks in its last look', length(b.list));
+	swept = b.time;
+	let when = at - max(0, wall - b.time);
+	let theirs = {};
+	for (let ap, n in nbrs)
+		if (state(n, at) in ['up', 'one-way'])
+			for (let x in (type(n.msg.radios) == 'array' ? n.msg.radios : []))
+				if (x?.band in ['2g', '5g', '6g'] && type(x.bssid) == 'string' && match(x.bssid, /^[0-9a-f]{2}(:[0-9a-f]{2}){5}$/))
+					theirs[substr(x.bssid, 3)] = { ap: ap, band: x.band };
+	// And the radios whose adverts the scan radio heard (0161), which may not
+	// have said hello yet: their band is airscan's.
+	let said = {}, gone = [];
+	for (let tail, a in airborne) {
+		if (at - a.at > HEARD_FOR) {
+			push(gone, tail);
+			continue;
+		}
+		theirs[tail] ??= { ap: a.ap, band: null };
+		said[a.ap] = a;
+	}
+	for (let tail in gone)
+		delete airborne[tail];
+	let s = rrm.swept(b.list, theirs);
+	for (let k, signal in s.aps) {
+		let p = split(k, ' '), n = nbrs[p[0]], a = said[p[0]];
+		let h = heard[p[0]] ??= { bands: {} };
+		h.address = n?.address ?? a?.address;
+		h.port = n?.port ?? a?.port;
+		let hb = h.bands[p[1]] ??= {};
+		// Once for each look: the same reading again would count twice.
+		if (hb.look == b.time)
+			continue;
+		hb.signal = hb.fresh ? signal : rrm.smooth(hb.signal, signal);
+		delete hb.fresh;
+		hb.at = when;
+		hb.look = b.time;
+	}
+	for (let tail in s.tails)
+		aeolus_bss[tail] = when;
+	// The rest of a look, the other networks and the ratings, is taken in
+	// once.
+	if (again)
+		return;
+	for (let o in s.others)
+		others[o.bssid] = { ssid: o.ssid, band: o.band, channel: o.channel, signal: dbm(o.signal), at: when };
+	let sv = {}, dev = scan_dev();
+	if (dev)
+		for (let x in nl.request(nl.const.NL80211_CMD_GET_SURVEY, nl.const.NLM_F_DUMP, { dev: dev }) ?? [])
+			if (x.survey_info?.frequency)
+				sv[x.survey_info.frequency] = x.survey_info;
+	// The scan radio's last spectral sweep of each band (0245): the energy
+	// on each channel that no survey counts, not on a radio's own channels,
+	// where the sweep hears this AP's own sending; and each channel's noise
+	// level (0247).
+	let energy = {}, level = {};
+	for (let name, r in radios)
+		if (!energy[r.band]) {
+			let sp = bus.call('airscan', 'spectrum', { band: r.band });
+			energy[r.band] = rrm.energy_of(sp, r.band, time(), SPECTRUM_FOR);
+			level[r.band] = rrm.floor_of(sp, r.band, time(), SPECTRUM_FOR);
+		}
+
+	for (let name, r in radios) {
+		let mine = rrm.covers(r.band, r.channel, r.width);
+		// The sweep's levels are the scan radio's own: set against the noise
+		// floor this radio measures on its own channel, each is that
+		// channel's floor (0247). With no reading of its own, none.
+		let lv = level[r.band], own = r.load && at - r.load.at <= 3 * VISIT_EVERY ? r.load.noise : null;
+		let shift = type(own) in ['int', 'double'] && own >= -127 && own <= -20 && lv['' + r.channel] != null ? own - lv['' + r.channel] : null;
+		for (let f in r.list) {
+			let ch = channel(r.band, f), busy = null, noise = null;
+			if (f == rrm.freq(r.band, r.channel) && r.load && at - r.load.at <= 3 * VISIT_EVERY) {
+				busy = r.load.others;
+				noise = r.load.noise;
+			} else if (sv[f]?.time && sv[f].busy != null) {
+				busy = (sv[f].busy - (sv[f].time_tx ?? 0)) / (1.0 * sv[f].time);
+				noise = sv[f].noise;
+			}
+			fold(r.band, ch, busy, noise, rrm.around(s.networks, r.band, ch), when, index(mine, ch) < 0 ? energy[r.band]['' + ch] : null,
+				shift != null && lv['' + ch] != null ? lv['' + ch] + shift : null);
+		}
+	}
+}
+
+// tell_probed says to every other Aeolus AP this one knows, by its hellos
+// or in the air, how strongly it hears the clients it does not serve, by
+// their probes (0289), as aeolus-steer keeps them: not to its neighbours
+// alone, as a client's best AP may be one this AP is not among the
+// nearest of. One message, fitted to a frame; none where there is nothing
+// to say.
+function tell_probed(where) {
+	let file = null;
+	try {
+		file = json(read(PROBES) ?? 'null');
+	} catch (e) {
+	}
+	let m = probed.message(cfg.ap, time(), seq + 1, probed.mine(file, time()), rrm.HELLO_MAX);
+	if (!m)
+		return;
+	seq++;
+	let pkt = rrm.seal(cfg.key, m);
+	for (let ap in uniq([...keys(nbrs), ...keys(heard)]))
+		if (ap != cfg.ap && where(ap)?.address)
+			sock.send(pkt, 0, { address: where(ap).address, port: where(ap).port ?? rrm.PORT });
+}
+
+// tell_shares says to every other Aeolus AP this one knows what its clients
+// said they can use as they joined here (0299), as aeolus-steer keeps it
+// where community sharing is on: one message, fitted to a frame; none where
+// there is nothing to say, as where community sharing is off.
+function tell_shares(where) {
+	let file = null;
+	try {
+		file = json(read(SHARES) ?? 'null');
+	} catch (e) {
+	}
+	let m = community.message(cfg.ap, time(), seq + 1, community.mine(file, time()), rrm.HELLO_MAX);
+	if (!m)
+		return;
+	seq++;
+	let pkt = rrm.seal(cfg.key, m);
+	for (let ap in uniq([...keys(nbrs), ...keys(heard)]))
+		if (ap != cfg.ap && where(ap)?.address)
+			sock.send(pkt, 0, { address: where(ap).address, port: where(ap).port ?? rrm.PORT });
+}
+
+// hellos sends this round's hello to each neighbour: the three heard most
+// strongly on each band, or as many as power control looks for where that
+// is more (0077), and those whose hellos come.
+function hellos(at) {
+	let sig = signals(at);
+	chosen = {};
+	picks = rrm.choose(sig, rrm.NEIGHBOURS);
+	for (let band, list in picks)
+		for (let ap in list)
+			chosen[ap] = true;
+	let to = {};
+	for (let ap in keys(chosen))
+		to[ap] = true;
+	// Power control needs how each neighbour it looks for hears this AP,
+	// which comes in their hellos; those come back once this AP sends.
+	if (cfg.apc && cfg.wanted > rrm.NEIGHBOURS)
+		for (let band, list in rrm.choose(sig, cfg.wanted))
+			for (let ap in list)
+				to[ap] = true;
+	for (let ap, n in nbrs)
+		if (n.at != null && at - n.at <= rrm.DEAD)
+			to[ap] = true;
+	if (!sock || !length(keys(to)))
+		return;
+	let mine = [];
+	for (let ap, bands in sig)
+		for (let band, s in bands)
+			if (dbm(s) != null)
+				push(mine, { ap: ap, band: band, signal: dbm(s) });
+	// What the last minute came to on each radio (0207), for the
+	// neighbours to go by.
+	let ld = null;
+	try {
+		ld = json(read(LOAD) ?? 'null');
+	} catch (e) {
+	}
+	let t = time();
+	let msg = {
+		v: 1, t: 'hello', ap: cfg.ap, at: time(), seq: ++seq,
+		// A radio's claim: where it is about to move, and its own channel's
+		// rating, for the tie-break.
+		// Its BSSID too: an AP that listens through a scan radio knows the
+		// radio's networks by it (0116).
+		radios: map(values(radios), r => r.claim
+			? { band: r.band, channel: r.channel, width: r.width, bssid: r.bssid, to: r.claim.to, cost: r.claim.cost, load: rrm.load_said(ld, r.band, t) }
+			: { band: r.band, channel: r.channel, width: r.width, bssid: r.bssid, load: rrm.load_said(ld, r.band, t) }),
+		heard: slice(sort(mine, (a, b) => b.signal - a.signal), 0, 24),
+		sees: filter(keys(nbrs), ap => nbrs[ap].at != null && at - nbrs[ap].at <= rrm.DEAD),
+		// The clients it hears by probe and does not serve (0206), for
+		// its neighbours' power control.
+		hears: cfg.apc ? hears : null,
+	};
+	let pkt = rrm.seal(cfg.key, rrm.fit(msg));
+	// Where its signed hellos come from, while they come: an address heard
+	// in the air may be an old one.
+	let where = (ap) => {
+		let n = nbrs[ap];
+		return n?.at != null && at - n.at <= rrm.DEAD ? n : heard[ap] ?? n;
+	};
+	for (let ap in keys(to))
+		if (where(ap)?.address)
+			sock.send(pkt, 0, { address: where(ap).address, port: where(ap).port ?? rrm.PORT });
+	tell_probed(where);
+	tell_shares(where);
+}
+
+// write_probed writes what the other APs said of the clients they hear by
+// probe (0289), for aeolus-steer, and lets go of what no longer holds.
+function write_probed() {
+	let t = time();
+	for (let ap, w in probed_by)
+		if (t - w.at > probed.FRESH)
+			delete probed_by[ap];
+	store(NEAR_PROBES, sprintf('%J\n', probed.near(probed_by, t)));
+}
+
+// write_shares writes what the other APs said their clients can use (0299),
+// for aeolus-steer, and lets go of what no longer holds.
+function write_shares() {
+	let t = time();
+	for (let ap, w in shares_by)
+		if (t - w.at > community.FRESH)
+			delete shares_by[ap];
+	store(NEAR_SHARES, sprintf('%J\n', community.near(shares_by, t)));
+}
+
+// receive reads the hellos waiting: signed with the key, from another AP,
+// and newer than its last. It reads up to 8 KB of each, though a hello
+// is fitted to one frame (0206): one from an older agent may be larger.
+function receive(at) {
+	let from = {}, pkt, took_probed = false, took_shares = false;
+	while ((pkt = sock.recv(8192, socket.MSG_DONTWAIT, from)) != null) {
+		let m = rrm.open(cfg.key, pkt);
+		if (!m || m.ap == cfg.ap)
+			continue;
+		// Clients another AP let on (0226), each message once, to be let go
+		// of here, where they are still held.
+		if (m.t == 'here') {
+			let macs = letgo.here_macs(m);
+			if (length(macs) && length(heres) < 64 && rrm.fresh(here_last[m.ap], m, time())) {
+				here_last[m.ap] = { at: m.at, seq: m.seq };
+				push(heres, { ap: m.ap, macs: macs });
+			}
+			from = {};
+			continue;
+		}
+		// How strongly another AP hears the clients it does not serve
+		// (0289), each message once, for aeolus-steer.
+		if (m.t == 'probed') {
+			if (rrm.fresh(probed_last[m.ap], m, time())) {
+				probed_last[m.ap] = { at: m.at, seq: m.seq };
+				probed_by[m.ap] = { at: time(), clients: probed.taken(m) };
+				took_probed = true;
+			}
+			from = {};
+			continue;
+		}
+		// What another AP's clients said they can use (0299), each message
+		// once, for aeolus-steer, which takes it in where community sharing
+		// is on.
+		if (m.t == 'community') {
+			if (rrm.fresh(shares_last[m.ap], m, time())) {
+				shares_last[m.ap] = { at: m.at, seq: m.seq };
+				shares_by[m.ap] = { at: time(), clients: community.taken(m) };
+				took_shares = true;
+			}
+			from = {};
+			continue;
+		}
+		if (m.t != 'hello')
+			continue;
+		let n = nbrs[m.ap] ??= {};
+		if (!rrm.fresh(n.last, m, time()))
+			continue;
+		n.last = { at: m.at, seq: m.seq };
+		n.address = from.address;
+		n.port = from.port;
+		n.at = at;
+		n.msg = m;
+		from = {};
+	}
+	if (took_probed)
+		write_probed();
+	if (took_shares)
+		write_shares();
+}
+
+// changes logs neighbours coming up and going down, and forgets those down
+// long enough, and APs no longer heard in the air.
+function changes(at) {
+	for (let ap in keys(heard)) {
+		let h = heard[ap];
+		for (let b in keys(h.bands))
+			if (at - h.bands[b].at > HEARD_FOR)
+				delete h.bands[b];
+		if (!length(h.bands))
+			delete heard[ap];
+	}
+	for (let ap, n in nbrs) {
+		let s = state(n, at);
+		if (s != n.state) {
+			if (s == 'up' || n.state == 'up')
+				log('neighbour %s at %s: %s, was %s', ap, n.address, s, n.state ?? 'new');
+			n.state = s;
+		}
+		if (s == 'down' && at - n.at > FORGET)
+			delete nbrs[ap];
+	}
+}
+
+// listing is what the agent reports of another AP: on each band, how
+// strongly each hears the other, and its channel and width, as its hellos
+// say. What a neighbour says is checked, so a bad one can't spoil the
+// report.
+function listing(ap, at) {
+	let h = heard[ap], n = nbrs[ap], m = n?.msg;
+	let bands = {};
+	let band = (b) => bands[b] ??= { band: b, signal: null, their_signal: null, channel: null, width: null, bssid: null, load: null };
+	for (let b, hb in h?.bands ?? {})
+		if (at - hb.at <= HEARD_FOR)
+			band(b).signal = dbm(hb.signal);
+	if (state(n, at) in ['up', 'one-way']) {
+		for (let x in (type(m.heard) == 'array' ? m.heard : []))
+			if (x?.ap == cfg.ap && x.band in ['2g', '5g', '6g'])
+				band(x.band).their_signal = dbm(x.signal);
+		for (let x in (type(m.radios) == 'array' ? m.radios : []))
+			if (x?.band in ['2g', '5g', '6g']) {
+				band(x.band).channel = type(x.channel) == 'int' && x.channel >= 0 && x.channel <= 233 ? x.channel : null;
+				band(x.band).width = x.width in [20, 40, 80, 160, 320] ? x.width : null;
+				// Its BSSID and how busy it is (0207), for steering to go by.
+				band(x.band).bssid = type(x.bssid) == 'string' && match(x.bssid, /^[0-9a-f]{2}(:[0-9a-f]{2}){5}$/) ? x.bssid : null;
+				band(x.band).load = rrm.load_heard(x.load);
+			}
+	}
+	return {
+		ap: ap, address: h?.address ?? n?.address ?? '', state: state(n, at), chosen: !!chosen[ap],
+		hello_ago: n?.at != null ? int(at - n.at) : null,
+		bands: slice(sort(values(bands), (a, b) => a.band < b.band ? -1 : 1), 0, 3),
+	};
+}
+
+// near is, on each band, the neighbours that count there: those among the
+// three this AP hears best there, and those whose hellos say they hear it
+// there.
+function near(at) {
+	let out = {};
+	for (let band, list in picks)
+		for (let ap in list)
+			(out[band] ??= {})[ap] = true;
+	for (let ap, n in nbrs)
+		if (state(n, at) in ['up', 'one-way'])
+			for (let x in (type(n.msg.heard) == 'array' ? n.msg.heard : []))
+				if (x?.ap == cfg.ap && x.band in ['2g', '5g', '6g'])
+					(out[x.band] ??= {})[ap] = true;
+	return out;
+}
+
+// blotted is, by '<band> <channel>', the neighbours that count on the band
+// using each channel, or claiming it for a move. Their channels, claims and
+// widths are their hellos'.
+function blotted(at) {
+	let out = {};
+	for (let band, aps in near(at))
+		for (let ap in keys(aps)) {
+			let n = nbrs[ap];
+			if (!(state(n, at) in ['up', 'one-way']))
+				continue;
+			for (let x in (type(n.msg.radios) == 'array' ? n.msg.radios : []))
+				if (x?.band == band)
+					for (let ch in [x.channel, x.to])
+						if (type(ch) == 'int' && ch > 0 && ch <= 233)
+							for (let c in rrm.covers(band, ch, x.width))
+								push(out[band + ' ' + c] ??= [], ap);
+		}
+	return out;
+}
+
+// claims are the moves the neighbours that count on a band have claimed
+// there: { ap, to, cost }.
+function claims(at, band) {
+	let out = [];
+	for (let ap in keys(near(at)[band] ?? {})) {
+		let n = nbrs[ap];
+		if (!(state(n, at) in ['up', 'one-way']))
+			continue;
+		for (let x in (type(n.msg.radios) == 'array' ? n.msg.radios : []))
+			if (x?.band == band && type(x.to) == 'int' && x.to > 0 && x.to <= 233)
+				push(out, { ap: ap, to: x.to, cost: type(x.cost) == 'int' ? x.cost : 0 });
+	}
+	return out;
+}
+
+// close is, on a band, how near each neighbour is by signal: the stronger
+// of how this AP hears it and how its hellos say it hears this AP.
+function close(band) {
+	let out = {};
+	for (let ap, h in heard)
+		if (h.bands[band]?.signal != null)
+			out[ap] = h.bands[band].signal;
+	for (let ap, n in nbrs)
+		for (let x in (type(n.msg?.heard) == 'array' ? n.msg.heard : []))
+			if (x?.ap == cfg.ap && x.band == band && dbm(x.signal) != null)
+				out[ap] = max(out[ap] ?? -200, dbm(x.signal));
+	return out;
+}
+
+// targets are the blocks a radio may move to, from its band's ratings: at
+// its width, wholly in its set where it has one (0075), and none shared with
+// radar, as a move there would first have to listen for radar, off the air.
+// Each is blotted out by whoever uses any of its channels (used, blotted's).
+// near_own says a block on r's band comes nearer than the policy's apart
+// MHz to one of this AP's own radios on the other of 5 and 6 GHz (0327):
+// there one would deafen the other.
+function near_own(r, members) {
+	for (let name, o in radios)
+		if (o.channel != null && rrm.too_near(r.band, members, o.band, rrm.covers(o.band, o.channel, o.width), cfg.apart))
+			return true;
+	return false;
+}
+
+// They are at the width the radio starts at: a radio widened (0329) steps
+// back to one, by an announced switch, as none at its wider width is
+// outside DFS on 5 GHz.
+function targets(r, list, used) {
+	let width = r.base ?? r.width;
+	return map(filter(rrm.blocks(list, r.band, width, used), x =>
+		!length(filter(x.members, c => rrm.radar(r.band, c) || (r.allowed && index(r.allowed, c) < 0))) && !near_own(r, x.members)),
+		x => ({ ...x, width: width }));
+}
+
+// far_targets are the blocks with channels shared with radar that a radio
+// may go to (0120), where the AP looks first: at its width, wholly in its
+// set where it has one, each channel looked at rrm.DFS_LOOKS times, none
+// closed for radar found there or with a long radar check, and none the
+// radio left, or did not get to, within a day.
+function far_targets(r, list, at, used) {
+	// A radio that starts narrower than it is set goes to a DFS block only
+	// by being widened (wide_targets).
+	if (!r.radar_ok || (r.wide && r.width < r.wide))
+		return [];
+	let all = filter(rrm.blocks(list, r.band, r.width, used), x =>
+		length(filter(x.members, c => rrm.radar(r.band, c))) > 0 && index(x.members, r.channel) < 0 &&
+		!length(filter(x.members, c => r.allowed && index(r.allowed, c) < 0)) && x.visits >= rrm.DFS_LOOKS && !near_own(r, x.members));
+	if (!length(all))
+		return [];
+	let states = dfs_now(r, at), wall = time();
+	return filter(all, x => rrm.clear(r.band, x.members, states) && !rrm.barred(shut, r.band, x.members, wall));
+}
+
+// wide_targets are the blocks a radio that starts narrower than it is set
+// may be widened to (0329): as far_targets has them, at the width it is set
+// to, its own channel's block among them. Each says its width.
+function wide_targets(r, list, at, used) {
+	if (!r.wide || !r.radar_ok || r.width >= r.wide)
+		return [];
+	let all = filter(rrm.blocks(list, r.band, r.wide, used), x =>
+		length(filter(x.members, c => rrm.radar(r.band, c))) > 0 &&
+		!length(filter(x.members, c => r.allowed && index(r.allowed, c) < 0)) && x.visits >= rrm.DFS_LOOKS && !near_own(r, x.members));
+	if (!length(all))
+		return [];
+	let states = dfs_now(r, at), wall = time();
+	return map(filter(all, x => rrm.clear(r.band, x.members, states) && !rrm.barred(shut, r.band, x.members, wall)), x => ({ ...x, width: r.wide }));
+}
+
+// home is the one block a radio that can't scan knows to go to (0120):
+// where it would have gone without a radar check when it left, rated as it
+// was then, and used by whoever uses it now (blot is blotted's). A radio
+// that does not know where it came from has rrm.fallback's, unrated.
+function home(r, blot) {
+	let a = away[r.band];
+	// At the width it came from: a radio widened (0329) narrows again.
+	let width = a?.home_width ?? r.base ?? r.width;
+	let ch = a?.home ?? rrm.fallback(r.band, width, r.allowed);
+	if (ch == null)
+		return [];
+	let members = rrm.covers(r.band, ch, width), by = [];
+	for (let c in members)
+		for (let ap in blot[r.band + ' ' + c] ?? [])
+			push(by, ap);
+	let cost = a?.home == ch ? a.cost ?? 0 : 0;
+	return [{ channel: ch, cost: cost, now: cost, blotted_by: uniq(sort(by)), members: members, visits: 0, width: width }];
+}
+
+// table is the channels rated, as the agent reports them, with whether one
+// of this AP's radios is on each, who blots it out, and which is the best on
+// each band: where its radio would move (rrm.best_of). Those not visited for
+// RATED_FOR are stale, remembered for REMEMBER (0332): said, as what the AP
+// last knew of them, and never best, nor moved by.
+function table(at) {
+	let blot = blotted(at), list = [];
+	for (let k in keys(rates)) {
+		let rt = rates[k];
+		if (at - rt.at > RATED_FOR + REMEMBER) {
+			delete rates[k];
+			continue;
+		}
+		let own = false;
+		for (let name, r in radios)
+			if (r.band == rt.band && index(rrm.covers(r.band, r.channel, r.width), rt.channel) >= 0)
+				own = true;
+		let x = {
+			band: rt.band, channel: rt.channel, cost: int(rt.cost + 0.5), now: int(rt.now + 0.5),
+			busy: int(rt.busy * 100 + 0.5), noise: dbm(rt.noise), networks: rt.networks, visits: rt.visits,
+			ago: int(at - rt.at), own: own, blotted_by: slice(uniq(sort(blot[k] ?? [])), 0, 8), best: false,
+		};
+		// The spectral sweep's share, where it said one (0245), and the
+		// channel's floor (0247).
+		if (rt.energy != null)
+			x.energy = int(rt.energy * 100 + 0.5);
+		if (rt.floor != null)
+			x.floor = dbm(rt.floor);
+		if (at - rt.at > RATED_FOR)
+			x.stale = true;
+		push(list, x);
+	}
+	for (let name, r in radios) {
+		let these = filter(list, x => x.band == r.band && !x.stale);
+		let b = rrm.best_of([...targets(r, these, blot), ...far_targets(r, these, at, blot)], close(r.band));
+		for (let x in these)
+			x.best = x.channel == b?.channel;
+	}
+	return list;
+}
+
+// complete says whether every channel a radio visits has been rated lately:
+// until then it doesn't know where it could go. One only remembered (0332)
+// is not.
+function complete(r, at) {
+	for (let f in r.list) {
+		let rt = rates[r.band + ' ' + channel(r.band, f)];
+		if (!rt || at - rt.at > RATED_FOR)
+			return false;
+	}
+	return true;
+}
+
+// cooling says whether a radio on band moved, or failed to, within COOL.
+function cooling(band) {
+	let wall = time();
+	for (let m in moves)
+		if (m.band == band && m.state in ['moved', 'checking', 'failed'] && wall - m.at < COOL)
+			return true;
+	return false;
+}
+
+// claim announces a radio's move in its hellos. radar says it is to a
+// channel shared with radar, which costs a radar check (0120).
+function claim(r, at, to, why, cost, start, radar, width) {
+	let m = { band: r.band, from: r.channel, to: to, why: why, state: 'announced', at: time() };
+	record(m);
+	r.claim = { to: to, cost: int(cost + 0.5), start: start, radar: radar == true, since: at, move: m, width: width ?? r.width, tries: 0 };
+	log('%s: claims channel %d, to move from %d (%s)%s%s', r.band, to, r.channel, why, radar ? ', after a radar check' : '',
+		(width ?? r.width) != r.width ? sprintf(', at %d MHz from %d', width, r.width) : '');
+}
+
+// hostapd_ctl sends one of hostapd's networks a command on its control
+// socket, and returns its answer: null where none comes within a second,
+// false where the command could not be sent. hostapd answers to the asking
+// socket's own path, as its own user, which must be able to write there.
+function hostapd_ctl(bss, ask) {
+	let k = socket.create(socket.AF_UNIX, socket.SOCK_DGRAM);
+	if (!k)
+		return false;
+	fs.unlink(CTL_SOCKET);
+	let answer = false;
+	if (k.bind({ path: CTL_SOCKET }) && fs.chmod(CTL_SOCKET, 0o666) && k.connect({ path: HOSTAPD_CTL + bss }) && k.send(ask) != null) {
+		socket.poll(1000, [k, socket.POLLIN]);
+		answer = k.recv(8192, socket.MSG_DONTWAIT);
+	}
+	k.close();
+	fs.unlink(CTL_SOCKET);
+	return answer;
+}
+
+// release_roamed lets go of the clients other APs said they let on (0226),
+// on each of this AP's networks that still holds one: removed from hostapd
+// and the radio, with nothing sent in the air, so a client that comes back
+// is let on as any is. One that came back here since is left be.
+function release_roamed() {
+	let list = heres;
+	heres = [];
+	if (!length(list))
+		return;
+	let bsses = filter(fs.lsdir('/var/run/hostapd') ?? [], b => b != 'global' && match(b, /^[A-Za-z0-9._-]+$/));
+	for (let h in list)
+		for (let mac in h.macs)
+			for (let bss in bsses) {
+				if (!letgo.held(hostapd_ctl(bss, 'STA ' + mac), mac))
+					continue;
+				let said = hostapd_ctl(bss, `DEAUTHENTICATE ${mac} tx=0`);
+				if (trim(said || '') == 'OK') {
+					// No frame goes to it: its leaving here is said to be this.
+					sentoff.note('rrm', mac, bss, 'moved');
+					log('let go of %s on %s: %s let it on', mac, bss, h.ap);
+				}
+				else
+					note('could not let go of %s on %s: hostapd said %s', mac, bss, said == null ? 'nothing' : said);
+			}
+}
+
+// switch_to moves a radio to channel to, by hostapd's channel switch
+// announcement on one of its networks, which moves them all.
+//
+// To a channel shared with radar (radar true, 0120) the announcement can't
+// be made, as the radio must first listen there. hostapd's own CHAN_SWITCH
+// command, on its control socket, does it: it starts the radio's networks
+// again on that channel, and they send nothing until the radar check is
+// done, which follow sees through. OpenWrt's ubus switch_chan, forced,
+// starts them again too, but where the channel is automatic hostapd then
+// picks one anew, outside DFS: the C-360 went from 36 back to 36,
+// 2026-10-10. back is the block the radio would have gone to otherwise:
+// where it steps off to later.
+// stations are a radio's clients now (0265), each by MAC with when it
+// associated, as the driver says of each of its networks.
+function stations(r) {
+	let out = {};
+	for (let ifname in r?.ifaces ?? (r?.bss ? [r.bss] : []))
+		for (let st in nl.request(nl.const.NL80211_CMD_GET_STATION, nl.const.NLM_F_DUMP, { dev: ifname }) ?? []) {
+			let mac = lc(st.mac ?? '');
+			if (mac && st.sta_info?.connected_time != null)
+				out[mac] = st.sta_info.assoc_at_boottime;
+		}
+	return out;
+}
+
+// followers counts what came of each move for the clients its radio had
+// (0265), FOLLOW_AFTER after it was made: after a radar check, once that is
+// done. A move that failed is not counted, nor one whose radar check said
+// nothing for ten minutes.
+function followers(at) {
+	let still = [];
+	for (let w in after_moves) {
+		if (w.move.state == 'failed' || (w.at == null && w.move.state != 'moved' && time() - w.move.at > 600))
+			continue;
+		if (w.at == null && w.move.state == 'moved')
+			w.at = at;
+		if (w.at == null || at - w.at < FOLLOW_AFTER) {
+			push(still, w);
+			continue;
+		}
+		let c = rrm.followed(w.before, stations(radios[w.radio]));
+		w.move.clients = c;
+		if (c.clients)
+			log('%s: of the %d clients it had when it moved from channel %d to %d, %d followed, %d joined again and %d are gone (0265)',
+				w.move.band, c.clients, w.move.from, w.move.to, c.kept, c.back, c.gone);
+	}
+	after_moves = still;
+}
+
+// width is the width it moves at: a radio widened (0329) goes wider, and
+// one stepping back narrows again. Unless said, the radio's own. pre says
+// the scan radio has checked the block for radar and holds it (0329): the
+// move is then an announced switch, with no minute off the air.
+function switch_to(r, to, at, radar, back, width, pre) {
+	width ??= r.width;
+	let args = rrm.switch_args(r.band, to, width, r.mode, ANNOUNCE);
+	let before = stations(r);
+	let err = 'its width does not fit there';
+	if (args && radar && !pre) {
+		let answer = hostapd_ctl(r.bss, rrm.chan_switch(args));
+		err = answer === false ? 'hostapd\'s control socket cannot be reached'
+			: match(answer ?? '', /^FAIL/) ? 'hostapd refuses the switch' : null;
+	} else if (args) {
+		bus.call(`hostapd.${r.bss}`, 'switch_chan', args);
+		err = bus.error();
+	}
+	if (err) {
+		note('%s: cannot move from channel %d to %d: %s', r.band, r.channel, to, err);
+		end_claim(r, 'failed');
+		return;
+	}
+	let m = r.claim.move;
+	push(after_moves, { radio: r.name, move: m, before: before, at: radar && !pre ? null : at });
+	if (radar && !pre) {
+		end_claim(r, 'checking');
+		let known = back && !rrm.radar(r.band, back.channel);
+		away[r.band] = {
+			radio: r.name, to: to, width: width, home: known ? back.channel : null, cost: known ? back.cost : null,
+			home_width: known ? back.width ?? r.width : null, since: at, checking: true, move: m,
+		};
+		log('%s: listening for radar on channel %d before it sends there; its clients are off it for about a minute', r.band, to);
+	} else {
+		end_claim(r, 'moved');
+		// A DFS block left for a reason is left alone for a day (0120).
+		if (m.why != 'start')
+			rrm.bar(shut, r.band, rrm.covers(r.band, m.from, r.width), time());
+		if (pre) {
+			// On a DFS block the scan radio checked (0329): where it came
+			// from is kept, as after a radar check of its own (0120).
+			let known = back && !rrm.radar(r.band, back.channel);
+			away[r.band] = {
+				radio: r.name, to: to, width: width, home: known ? back.channel : null, cost: known ? back.cost : null,
+				home_width: known ? back.width ?? r.width : null, since: at, checking: false, move: m,
+			};
+			log('%s: on channel %d at %d MHz, which the scan radio checked for radar: no minute off the air', r.band, to, width);
+		} else
+			delete away[r.band];
+	}
+	r.far = null;
+	r.widen = null;
+	r.moved = at;
+	r.channel = to;
+	r.width = width;
+	r.list = rrm.visits(r.band, to, r.dfs, r.allowed, r.width);
+	calm(r);
+}
+
+// follow sees a radio through its radar check (0120). hostapd says when the
+// radio is up on the channel: the move is then made. One not there
+// CHECK_FOR after it was asked did not get there: radar was found while it
+// listened and hostapd took it elsewhere, or its networks did not start
+// again. Those are then started by netifd, outside DFS as at any start.
+// Either way the block is left alone for a day (rrm.bar).
+function follow(at) {
+	for (let band in keys(away)) {
+		let a = away[band];
+		if (!a.checking)
+			continue;
+		let r = filter(values(radios), x => x.band == band)[0];
+		let st = r ? bus.call(`hostapd.${r.bss}`, 'get_status') : null;
+		let there = st?.status == 'ENABLED' && st.freq == rrm.freq(band, a.to);
+		if (!there && at - a.since < CHECK_FOR)
+			continue;
+		// Its networks were started again: the element goes on its beacons
+		// again, whether it was kept or not.
+		if (r)
+			delete adverts[r.bss];
+		if (there) {
+			a.checking = false;
+			a.move.state = 'moved';
+			a.move.at = time();
+			log('%s: the radar check on channel %d is done, and the radio is there', band, a.to);
+			continue;
+		}
+		a.move.state = 'failed';
+		a.move.at = time();
+		rrm.bar(shut, band, rrm.covers(band, a.to, a.width), time());
+		delete away[band];
+		if (st?.status == 'ENABLED') {
+			note('%s: the radar check did not end on channel %d: the radio is on %J; channel %d is left alone for a day', band, a.to, st.channel, a.to);
+			continue;
+		}
+		note('%s: %d s after it went to channel %d for its radar check the radio is not up (%s); its Wi-Fi is started again', band, CHECK_FOR, a.to,
+			st?.status ?? 'hostapd does not answer');
+		bus.call('network.wireless', 'down', { device: a.radio });
+		bus.call('network.wireless', 'up', { device: a.radio });
+	}
+}
+
+// pre_start asks airscan to check the block of a radio's claim c for radar
+// on the scan radio (0329), while the radio serves on, and hold it once
+// checked: back is where the radio would go otherwise, kept for where it
+// steps off to. It says started, busy (the scan radio is lent, or checks
+// another: ask again) or no.
+function pre_start(r, c, at, back) {
+	let args = rrm.switch_args(r.band, c.to, c.width ?? r.width, r.mode, ANNOUNCE);
+	if (!args)
+		return 'no';
+	let id = sprintf('rrm-%s-%d', r.band, ++pre_seq);
+	let a = bus.call('airscan', 'precheck', { freq: args.freq, center_freq1: args.center_freq1, width: args.bandwidth, hold: PRE_HOLD, id: id });
+	if (a?.started == true) {
+		c.pre = { id: id, since: at, cac: type(a.cac_ms) == 'int' ? a.cac_ms / 1000.0 : 60, back: back };
+		log('%s: the scan radio listens for radar on channel %d at %d MHz first; the radio serves on meanwhile', r.band, c.to, args.bandwidth);
+		return 'started';
+	}
+	if (a?.started == false)
+		return 'busy';
+	note('%s: the scan radio cannot check channel %d for radar: %s', r.band, c.to, a?.error ?? bus.error() ?? 'airscan does not answer');
+	return 'no';
+}
+
+// pre_end tells airscan a precheck is no longer wanted.
+function pre_end(c) {
+	if (c?.pre)
+		bus.call('airscan', 'precheck_done', { id: c.pre.id });
+}
+
+// pre_follow sees a radio's claim c through the scan radio's check (0329):
+// once airscan says the block is checked and held, the radio moves there by
+// an announced switch. One that found radar, ended without the block, or
+// did not say in time, fails: a block with radar found is left alone for a
+// day, as are the channels Linux closed.
+function pre_follow(r, c, at) {
+	let st = bus.call('airscan', 'status')?.precheck;
+	let mine = st?.id == c.pre.id;
+	if (mine && st.state == 'available' && st.held == true) {
+		if (r.scan)
+			return; // a visit still listening (B164): the next hello
+		switch_to(r, c.to, at, true, c.pre.back, c.width, true);
+		pre_end(c);
+		return;
+	}
+	if (mine && st.state == 'cac' && at - c.pre.since < c.pre.cac + PRE_LATE)
+		return;
+	if (!mine && at - c.pre.since < 5)
+		return;
+	pre_end(c);
+	let members = rrm.covers(r.band, c.to, c.width ?? r.width);
+	let radar = mine && st.state == 'radar' || !rrm.clear(r.band, members, dfs_now(r, at, true));
+	if (radar)
+		rrm.bar(shut, r.band, members, time());
+	note('%s: the scan radio\'s check of channel %d %s', r.band, c.to,
+		radar ? 'found radar: the block is left alone for a day' : sprintf('ended without it (%s)', mine ? st.state : 'no longer under way'));
+	end_claim(r, 'failed');
+}
+
+// decide moves the radios that should (0073). A move is claimed in hellos
+// first, and made HOLD later, unless a neighbour's claim at the same time
+// goes first, or it is no longer worth it. Planned moves wait for their
+// reason to hold STEADY, and for the window.
+//
+// Where the AP looks before it uses a DFS channel (0120), a move to one
+// costs a radar check, a minute off the air. It is made only to a block
+// that is clearly the best (rrm.wanted), and only soon after the radio
+// started, or in the window once its reason has held STEADY. A radio there
+// that can't scan knows its own channel, by its own counts, and one other
+// place, where it came from: it steps off to that when its own grows worse
+// or a neighbour takes it, in the window, or at once when interference
+// fills it. From there it looks at every channel again.
+function decide(at, list) {
+	let lt = localtime(), windowed = rrm.in_window(cfg.window, lt.hour * 60 + lt.min);
+	let blot = null, held = still();
+	for (let name, r in radios) {
+		let others = claims(at, r.band);
+		if (length(others))
+			claimed[r.band] = at;
+		// Held still in a test window (0344): nothing planned, and a claim
+		// withdrawn, its radar check let go of with it.
+		if (!cfg.moves || r.pinned || held) {
+			if (r.claim && held)
+				pre_end(r.claim);
+			if (r.claim)
+				end_claim(r, 'withdrawn');
+			r.plan = null;
+			r.far = null;
+			continue;
+		}
+		// While its radar check runs, a radio is not there to move.
+		if (away[r.band]?.checking)
+			continue;
+		let cl = close(r.band), these = filter(list, x => x.band == r.band);
+		blot ??= blotted(at);
+		let cur = filter(rrm.blocks(these, r.band, r.width, blot), x => index(x.members, r.channel) >= 0)[0];
+		let dark = blind(r);
+		let to = dark ? home(r, blot) : targets(r, these, blot);
+		let far = dark ? [] : far_targets(r, these, at, blot);
+		let wide = dark ? [] : wide_targets(r, these, at, blot);
+		let c = r.claim;
+		if (c) {
+			// Two claims at once: the tie-break says which goes first.
+			for (let o in others)
+				if (!rrm.first({ ap: cfg.ap, cost: c.cost }, o)) {
+					pre_end(c);
+					end_claim(r, 'yielded', o.ap);
+					break;
+				}
+			if (!r.claim || at - c.since < HOLD)
+				continue;
+			// The scan radio checks the block for radar (0329).
+			if (c.pre) {
+				pre_follow(r, c, at);
+				continue;
+			}
+			let plain = rrm.best_of(to, cl);
+			let wid = c.move?.why == 'wide';
+			let t = filter(wid ? wide : c.radar ? far : to, x => x.channel == c.to)[0];
+			// Moving off its own 5 GHz (0327) stands while it is still too
+			// near and the block it claimed still keeps apart. Widening
+			// (0329) stands while the block is still one it may widen to.
+			let own = c.move?.why == 'own';
+			if (!(wid ? t && rrm.widen(cur, [t], cl, cfg.margin) :
+			    own ? t && near_own(r, cur?.members ?? [r.channel]) :
+			    c.radar ? rrm.radar_reason(cur, plain, t, cl, cfg.margin) : rrm.reason(cur, t, cl, cfg.margin, r.hot, c.start))) {
+				end_claim(r, 'withdrawn');
+				continue;
+			}
+			let back = wid ? cur : plain ?? cur;
+			// Where the scan radio can check the block for radar (0329), it
+			// does, and the radio moves without a minute off the air; one
+			// lent or checking another is asked again, a few hellos on.
+			if (c.radar && precheck_ok && listening) {
+				let p = pre_start(r, c, at, back);
+				if (p == 'started')
+					continue;
+				if (p == 'busy') {
+					if (++c.tries < PRE_TRIES)
+						continue;
+					note('%s: the scan radio stayed busy: the move to channel %d is left', r.band, c.to);
+					end_claim(r, 'withdrawn');
+					continue;
+				}
+			}
+			// A visit made before the claim may still be listening off
+			// the channel (B164): the move waits for the next hello.
+			if (r.scan)
+				continue;
+			switch_to(r, c.to, at, c.radar, back, c.width);
+			continue;
+		}
+		if (at - began < WARM_UP || !cur || (!dark && !complete(r, at))) {
+			r.plan = null;
+			r.far = null;
+			continue;
+		}
+		let start = !dark && r.started != null && at - r.started < START;
+		// Its 6 GHz too near its own 5 GHz (0327), as after a start on a
+		// channel the radio chose itself: it moves at once, in or out of the
+		// window, to the best block that keeps apart. A 5 GHz radio is kept
+		// apart by where it may go (targets), and is not moved for it.
+		if (r.band == '6g' && !dark && near_own(r, cur.members)) {
+			let t = rrm.best_of(to, cl);
+			if (t && !cooling(r.band) && !length(others) && at - (claimed[r.band] ?? -SETTLE) >= SETTLE)
+				claim(r, at, t.channel, 'own', cur.cost, start, false);
+			continue;
+		}
+		// A planned move does not go back where the radio left lately
+		// (0264). A radio stepping off a DFS channel goes home all the same.
+		let wall = time();
+		let w = rrm.wanted(cur, to, far, cl, cfg.margin, r.hot, start, dark ? null : x => rrm.left_lately(moves, r.band, x.members, wall));
+		// A radio widened (0329) narrows again only for interference or a
+		// neighbour: any narrower block rates better than its wider one,
+		// which it was set to.
+		let widened = r.wide != null && r.width > r.base;
+		if (widened && w.plain?.why in ['better', 'start'])
+			w.plain = null;
+		// One that starts narrower is widened, where it may be.
+		let wd = !widened && r.wide ? rrm.widen(cur, wide, cl, cfg.margin) : null;
+		let plan_w = wd ? 'wide ' + wd.to.channel : null;
+		if (!plan_w)
+			r.widen = null;
+		else if (r.widen?.move != plan_w)
+			r.widen = { move: plan_w, since: at };
+		// The wait is for this move: another target, or another reason,
+		// starts it again. The move that costs a radar check waits apart.
+		let plan = w.plain ? w.plain.why + ' ' + w.plain.to.channel : null;
+		if (!plan)
+			r.plan = null;
+		else if (r.plan?.move != plan)
+			r.plan = { move: plan, since: at };
+		plan = w.far ? w.far.why + ' ' + w.far.to.channel : null;
+		if (!plan)
+			r.far = null;
+		else if (r.far?.move != plan)
+			r.far = { move: plan, since: at };
+		// The move that costs a radar check goes first where it may be made:
+		// at once while the radio has just started, in the window otherwise.
+		let m = null;
+		if (w.far && ((r.started != null && at - r.started < DFS_START) || (windowed && at - r.far.since >= STEADY)))
+			m = { to: w.far.to, why: w.far.why, radar: true };
+		else if (w.plain && !(w.plain.why in ['shared', 'better'] && !start && (at - r.plan.since < STEADY || !windowed)))
+			m = { to: w.plain.to, why: w.plain.why, radar: false };
+		// Widening (0329) costs a radar check, a minute off the air: in the
+		// window alone, once it has held STEADY. Where the scan radio checks
+		// the block instead, the radio stays on the air, and it is widened
+		// also soon after it starts, as soon as it has looked.
+		else if (wd && ((windowed && at - r.widen.since >= STEADY) ||
+		    (precheck_ok && listening && r.started != null && at - r.started < DFS_START)))
+			m = { to: wd.to, why: 'wide', radar: true };
+		if (!m)
+			continue;
+		// One move at a time among neighbours: none while one of theirs is
+		// claimed, or just after.
+		if (cooling(r.band) || length(others) || at - (claimed[r.band] ?? -SETTLE) < SETTLE)
+			continue;
+		claim(r, at, m.to.channel, m.why, cur.cost, start, m.radar, m.to.width);
+	}
+}
+
+// heard_by is how strongly the neighbours whose hellos come hear this AP on
+// band, in dBm, as their hellos say.
+function heard_by(band, at) {
+	let out = [];
+	for (let ap, n in nbrs)
+		if (state(n, at) in ['up', 'one-way'])
+			for (let x in (type(n.msg.heard) == 'array' ? n.msg.heard : []))
+				if (x?.ap == cfg.ap && x.band == band && dbm(x.signal) != null) {
+					push(out, dbm(x.signal));
+					break;
+				}
+	return out;
+}
+
+// ceiling lets a radio's power go back to what it is configured to, and
+// reads it: the most power control holds it at. It is what the radio says,
+// which may be more than it can send (0077).
+function ceiling(r) {
+	if (!set_power(r.phy, null))
+		return null;
+	let p = bus.call('iwinfo', 'info', { device: r.bss })?.txpower;
+	return type(p) == 'int' && p > 0 && p <= 40 ? p : null;
+}
+
+// clients_look takes in, once a minute, what power control listens to of
+// each radio's clients (0206): from the driver, each connected client's
+// signal, time connected, when it associated, what was sent to it, and what
+// of that was tried again or lost; from usteer, the probe requests it sent
+// while connected. Kept CLIENT_SAMPLES looks back, each with how many left or
+// came back since the look before. And the clients this AP hears by probe
+// but does not serve, which its hellos say to its neighbours.
+function clients_look(at) {
+	try {
+		heard_said = json(read(HEARD) ?? '{}') ?? {};
+	} catch (e) {
+		heard_said = {};
+	}
+	own_macs = [];
+	for (let f in fs.glob('/sys/class/net/*/address') ?? []) {
+		let m = lc(trim(read(f) ?? ''));
+		if (match(m, /^[0-9a-f]{2}(:[0-9a-f]{2}){5}$/) && m != '00:00:00:00:00:00')
+			push(own_macs, m);
+	}
+	let served = {}, bandof = {};
+	for (let name, r in radios) {
+		let cur = {};
+		for (let ifname in r.ifaces ?? [r.bss]) {
+			bandof[ifname] = r.band;
+			for (let st in nl.request(nl.const.NL80211_CMD_GET_STATION, nl.const.NLM_F_DUMP, { dev: ifname }) ?? []) {
+				let mac = lc(st.mac ?? ''), x = st.sta_info ?? {};
+				if (!mac || x.connected_time == null)
+					continue;
+				served[mac] = true;
+				cur[mac] = {
+					signal: x.signal_avg ?? x.signal, connected: x.connected_time, assoc: x.assoc_at_boottime,
+					// What was tried again or lost: the larger of the two, a
+					// frame lost having been tried again first, and mt76
+					// saying one count as both (2026-10-22).
+					packets: x.tx_packets ?? 0, failed: max(x.tx_retries ?? 0, x.tx_failed ?? 0), probes: null,
+				};
+			}
+		}
+		// What usteer counted of each one's probe requests on this radio.
+		for (let mac, c in cur) {
+			let nodes = bus.call('usteer', 'get_client_info', { address: mac })?.nodes;
+			let n = 0, any = false;
+			for (let node, v in (type(nodes) == 'object' ? nodes : {}))
+				if (index(r.ifaces ?? [], replace(node, /^hostapd\./, '')) >= 0 && type(v?.stats?.probe?.requests) == 'int') {
+					n += v.stats.probe.requests;
+					any = true;
+				}
+			c.probes = any ? n : null;
+		}
+		let prev = r.samples?.[length(r.samples) - 1], left = 0;
+		for (let mac, x in prev?.clients ?? {})
+			if (!cur[mac] || (cur[mac].assoc != null && x.assoc != null && cur[mac].assoc != x.assoc))
+				left++;
+		r.samples ??= [];
+		push(r.samples, { at: at, clients: cur, left: prev ? left : 0 });
+		if (length(r.samples) > CLIENT_SAMPLES)
+			r.samples = slice(r.samples, length(r.samples) - CLIENT_SAMPLES);
+	}
+	// What it hears and does not serve, for its neighbours: by usteer, the
+	// strongest of each, its band by the interface it was heard on.
+	let best = {};
+	for (let mac, nodes in bus.call('usteer', 'get_clients') ?? {}) {
+		if (served[mac] || !match(mac, /^[0-9a-f]{2}(:[0-9a-f]{2}){5}$/))
+			continue;
+		for (let node, v in (type(nodes) == 'object' ? nodes : {})) {
+			let band = bandof[replace(node, /^hostapd\./, '')];
+			if (!band || v?.connected || type(v?.signal) != 'int' || v.signal >= 0)
+				continue;
+			if (!best[mac] || v.signal > best[mac][2])
+				best[mac] = [mac, band, v.signal];
+		}
+	}
+	hears = slice(sort(values(best), (a, b) => b[2] - a[2]), 0, rrm.HEARS_MAX);
+}
+
+// client_window is what a radio's clients did between two times (0206),
+// from its looks: each client's probe requests, those that left or came
+// back, and what was sent to them and what of it was tried again or lost.
+// Null where the looks do not reach back that far.
+function client_window(r, from, to) {
+	let a = null, b = null, left = 0;
+	for (let x in r.samples ?? []) {
+		if (x.at <= from)
+			a = x;
+		if (x.at <= to)
+			b = x;
+		if (x.at > from && x.at <= to)
+			left += x.left;
+	}
+	if (!a || !b || a === b)
+		return null;
+	let w = { probes: {}, left: left, packets: 0, failed: 0 };
+	for (let mac, y in b.clients) {
+		let x = a.clients[mac];
+		if (!x || x.assoc != y.assoc)
+			continue;
+		if (x.probes != null && y.probes != null && y.probes >= x.probes)
+			w.probes[mac] = y.probes - x.probes;
+		// Where both grew: not a count started again, or gone below zero
+		// (0272).
+		let p = grew_by(x.packets, y.packets), f = grew_by(x.failed, y.failed);
+		if (p != null && f != null) {
+			w.packets += p;
+			w.failed += f;
+		}
+	}
+	return w;
+}
+
+// heard_elsewhere is how strongly the neighbours hear each client they hear
+// by probe, the best of them, as their hellos say (0206).
+function heard_elsewhere(at) {
+	let out = {};
+	for (let ap, n in nbrs)
+		if (state(n, at) in ['up', 'one-way'])
+			for (let x in (type(n.msg?.hears) == 'array' ? n.msg.hears : []))
+				if (type(x) == 'array' && type(x[0]) == 'string' && type(x[2]) == 'int' && (out[x[0]] == null || x[2] > out[x[0]]))
+					out[x[0]] = x[2];
+	return out;
+}
+
+// tell_live hands news to aeolus-live, which sends it to the manager at
+// once (0207). Without it, the next report says the same.
+function tell_live(kind, e) {
+	let k = socket.create(socket.AF_UNIX, socket.SOCK_DGRAM);
+	if (!k)
+		return;
+	if (k.connect({ path: '/var/run/aeolus/live.sock' }))
+		k.send(sprintf('%J', { t: 'news', kind: kind, ...e }), socket.MSG_DONTWAIT);
+	k.close();
+}
+
+// apc_event keeps one of power control's steps for the report (0206):
+// from and to in dBm, why, and what the clients did where they had a say.
+// It goes to the manager at once too (0207).
+function apc_event(band, from, to, why, d) {
+	let e = {
+		at: time(), band: band, from: from, to: to, why: why,
+		scanning: d?.scanning, left: d?.left, ratio: d?.ratio,
+	};
+	push(apc_events, e);
+	tell_live('apc', e);
+	if (length(apc_events) > EVENTS_KEPT)
+		apc_events = slice(apc_events, length(apc_events) - EVENTS_KEPT);
+}
+
+// apc holds each radio's power where the neighbours it looks for hear it at
+// the target (0077). It takes a radio over after the warm-up, at the power
+// the last run held it at, or its ceiling; holds it again whenever its
+// network is made anew, as netifd puts its power back then; and steps it at
+// most every APC_EVERY. A radio whose power is set, or that shares its
+// wiphy with another, it leaves alone; off, it lets them all go.
+function apc(at) {
+	if (!cfg.apc)
+		let_go();
+	// Held still in a test window (0344): each power stays where it is.
+	if (!cfg.apc || at - began < WARM_UP || still())
+		return;
+	let phys = {};
+	for (let name, r in radios)
+		if (r.phy)
+			phys[r.phy] = (phys[r.phy] ?? 0) + 1;
+	let elsewhere = cfg.clients != 'ignore' ? heard_elsewhere(at) : {};
+	for (let name, r in radios) {
+		let h = held[name];
+		if (h && h.band != r.band)
+			h = held[name] = null;
+		if (!r.phy || phys[r.phy] != 1 || r.power_set) {
+			if (h?.power != null && !r.power_set && r.phy == h.phy && r.index == h.index)
+				set_power(h.phy, null);
+			delete held[name];
+			continue;
+		}
+		if (!h || h.index != r.index || (h.power == null && at - h.at >= APC_EVERY)) {
+			let top = ceiling(r);
+			let was = h?.power ?? (kept[name]?.band == r.band ? kept[name].power : null);
+			delete kept[name];
+			// Held again after its network was made anew, it keeps its last step.
+			let again = h?.power != null;
+			h = held[name] = {
+				band: r.band, phy: r.phy, index: r.index, power: null, ceiling: top, at: again ? h.at : at,
+				step: again ? h.step : 0, why: again ? h.why : 'new', count: h?.count, weakest: h?.weakest, stepped: h?.stepped,
+			};
+			if (top == null) {
+				h.why = 'failed';
+				note('%s: power control cannot read the radio\'s power', r.band);
+				continue;
+			}
+			let p = max(min(type(was) == 'int' ? was : top, top), min(rrm.APC_FLOOR, top));
+			if (!set_power(r.phy, p)) {
+				h.why = 'failed';
+				note('%s: power control cannot set the radio\'s power', r.band);
+				continue;
+			}
+			h.power = p;
+			log('%s: power control holds it at %d dBm, of %d', r.band, p, top);
+			continue;
+		}
+		if (h.power == null)
+			continue;
+		// Its clients (0206): the lonely ones, the floor they set where they
+		// are guarded, and a step back still held.
+		let last = r.samples?.[length(r.samples) - 1], cls = [];
+		for (let mac, c in last?.clients ?? {})
+			push(cls, { mac: mac, signal: c.signal, connected: c.connected,
+				// What it said it hears of the AP, at the power now (802.11k).
+				heard: heard_said[mac]?.band == r.band ? measure.hears(heard_said[mac], time(), h.power, null) : null });
+		h.lonely = cfg.clients != 'ignore' ? rrm.lonely(cls, elsewhere, h.power, cfg.client_floor, own_macs) : [];
+		h.floor = cfg.clients == 'guard' ? rrm.client_floor(h.lonely, h.ceiling) : null;
+		if (h.hold && (cfg.clients != 'guard' || at >= h.hold.until))
+			h.hold = null;
+		let least = max(h.floor ?? 0, h.hold?.power ?? 0);
+		// Below what its clients need: up to it at once.
+		if (least > h.power && h.ceiling != null && min(least, h.ceiling) > h.power) {
+			let p = min(least, h.ceiling), why = h.floor != null && h.floor >= (h.hold?.power ?? 0) ? 'guard' : 'hold';
+			if (set_power(r.phy, p)) {
+				apc_event(r.band, h.power, p, why, null);
+				log('%s: power +%d dB to %d dBm: %s', r.band, p - h.power, p, why == 'guard'
+					? sprintf('a client only this AP reaches, %s, needs it', h.lonely[0]?.mac ?? '?') : 'held after its clients took a step badly');
+				h.step = p - h.power;
+				h.power = p;
+				h.why = why;
+				h.stepped = time();
+				h.at = at;
+			}
+			continue;
+		}
+		// A step down, watched: did its clients take it badly? Every minute
+		// from WATCH_FIRST on, as each look at its clients comes, it is the
+		// time since the step against as long before it; at APC_EVERY the
+		// watch ends (0206, 0207). Clients that scan, leave or need tries
+		// at once say so within two minutes, not ten.
+		let w = h.watch;
+		if (w && at - w.at >= WATCH_FIRST && last && last.at > (w.looked ?? 0)) {
+			w.looked = last.at;
+			let span = min(at - w.at, APC_EVERY);
+			if (at - w.at >= APC_EVERY)
+				h.watch = null;
+			let before = client_window(r, w.at - span, w.at), after = client_window(r, w.at, w.at + span), other = null;
+			for (let n2, r2 in radios) {
+				let h2 = held[n2];
+				if (r2 === r || (h2?.step_at != null && h2.step_at >= w.at - span))
+					continue;
+				let ob = client_window(r2, w.at - span, w.at), oa = client_window(r2, w.at, w.at + span);
+				if (ob && oa) {
+					other = { before: ob, after: oa };
+					break;
+				}
+			}
+			let d = before && after ? rrm.distress(before, after, other) : null;
+			if (d?.distress) {
+				h.watch = null;
+				h.distress = { ago_at: at, at: time(), why: d.why, scanning: d.scanning, left: d.left, ratio: d.ratio, acted: false, after: int(span) };
+				let p = min(h.power + rrm.APC_STEP, h.ceiling ?? h.power);
+				if (cfg.clients == 'guard' && p > h.power && set_power(r.phy, p)) {
+					apc_event(r.band, h.power, p, 'distress', d);
+					log('%s: power +%d dB back to %d dBm: its clients took the step badly (%s, %d min after), held %d h', r.band, p - h.power, p, d.why, int(span / 60), cfg.hold);
+					h.step = p - h.power;
+					h.power = p;
+					h.why = 'distress';
+					h.stepped = time();
+					h.step_at = at;
+					h.hold = { power: p, until: at + cfg.hold * 3600 };
+					h.distress.acted = true;
+				} else {
+					apc_event(r.band, h.power, h.power, 'distress-seen', d);
+					note('%s: its clients took the step to %d dBm badly (%s): power control is not told to guard them', r.band, h.power, d.why);
+				}
+				h.at = at;
+				continue;
+			}
+		}
+		if (at - h.at < APC_EVERY)
+			continue;
+		let s = rrm.power_step(heard_by(r.band, at), cfg.wanted, cfg.target, h.power, h.ceiling);
+		h.at = at;
+		h.count = s.count;
+		h.weakest = s.weakest;
+		h.why = s.why;
+		h.step = 0;
+		// No lower than its clients need (0206).
+		if (s.step < 0 && h.power + s.step < least) {
+			s.step = least - h.power;
+			if (s.step >= 0) {
+				s.step = 0;
+				h.why = h.floor != null && h.floor >= (h.hold?.power ?? 0) ? 'guard' : 'hold';
+			}
+		}
+		if (!s.step)
+			continue;
+		if (!set_power(r.phy, h.power + s.step)) {
+			note('%s: power control cannot set the radio\'s power', r.band);
+			continue;
+		}
+		apc_event(r.band, h.power, h.power + s.step, s.why, null);
+		h.power += s.step;
+		h.step = s.step;
+		h.stepped = time();
+		h.step_at = at;
+		// A step down is watched: its clients' next minutes against as many
+		// before (0206, 0207).
+		if (s.step < 0 && cfg.clients != 'ignore')
+			h.watch = { at: at };
+		log('%s: power %s%d dB to %d dBm: %d of %d neighbours hear it, the weakest at %s', r.band, s.step > 0 ? '+' : '', s.step, h.power,
+			s.count, cfg.wanted, s.weakest ?? 'none');
+	}
+	// A radio that went down keeps what it was held at for when it is back.
+}
+
+// powers is what the agent reports of power control (0077): each radio it
+// holds, its power and ceiling, how many of the neighbours it looks for
+// hear it and the weakest of them, and its last step and why.
+function powers() {
+	let out = [];
+	for (let name in sort(keys(held))) {
+		let h = held[name];
+		if (!radios[name])
+			continue;
+		push(out, {
+			radio: name, band: h.band, power: h.power, ceiling: h.ceiling, wanted: cfg.wanted, target: cfg.target,
+			count: h.count, weakest: h.weakest, step: h.step, why: h.why,
+			ago: h.stepped != null ? max(0, time() - h.stepped) : null,
+			// Its clients (0206).
+			clients: cfg.clients, client_floor: cfg.client_floor, floor: h.floor,
+			hold: h.hold ? { power: h.hold.power, left: max(0, int(h.hold.until - now())) } : null,
+			lonely: slice(h.lonely ?? [], 0, 8), distress: h.distress ? { at: h.distress.at, why: h.distress.why, scanning: h.distress.scanning,
+				left: h.distress.left, ratio: h.distress.ratio, acted: h.distress.acted, after: h.distress.after } : null,
+		});
+	}
+	return slice(out, 0, 4);
+}
+
+function write(at) {
+	if (!cfg.on) {
+		store(out, sprintf('%J', { at: time(), on: false }));
+		return;
+	}
+	let aps = {};
+	for (let ap, h in heard)
+		for (let b, hb in h.bands)
+			if (at - hb.at <= HEARD_FOR)
+				aps[ap] = true;
+	for (let ap in keys(nbrs))
+		aps[ap] = true;
+	let list = map(keys(aps), ap => listing(ap, at));
+	list = sort(list, (a, b) => (b.chosen - a.chosen) || (a.ap < b.ap ? -1 : 1));
+	let advertised = [];
+	for (let name, r in radios)
+		if (adverts[r.bss])
+			push(advertised, r.band);
+	// Those rated lately first, then those remembered (0332), so the
+	// remembered never crowd out the rest.
+	let by_channel = (a, b) => a.band < b.band ? -1 : a.band > b.band ? 1 : a.channel - b.channel;
+	let all = table(at);
+	let rated = [...sort(filter(all, x => !x.stale), by_channel), ...sort(filter(all, x => x.stale), by_channel)];
+	// The radios that can't scan: their band, channel, why (dfs or
+	// refused) and for how long. One whose channel isn't known just now, as
+	// while its Wi-Fi restarts or it waits out a radar check, is left out
+	// until it is: the manager refuses a whole report over a channel 0
+	// (OfficeOpenWrt, 2026-10-10, after a Wi-Fi change).
+	let deaf = [];
+	for (let name, r in radios)
+		if (r.deaf && r.channel >= 1 && r.channel <= 233) {
+			let d = { band: r.band, channel: r.channel, why: r.deaf.why, ago: max(0, int(at - r.deaf.since)) };
+			// Where it steps off to, on an AP that looks before it uses a
+			// DFS channel (0120).
+			let h = blind(r) ? away[r.band]?.home ?? rrm.fallback(r.band, r.width, r.allowed) : null;
+			if (h != null)
+				d.home = h;
+			push(deaf, d);
+		}
+	// For the daemon's next run: the radios on a DFS channel they went to,
+	// and where each came from. The agent does not report it.
+	let stays = {};
+	for (let band, a in away)
+		if (!a.checking)
+			stays[band] = { to: a.to, width: a.width, home: a.home, home_width: a.home_width, cost: a.cost, ago: max(0, int(at - a.since)) };
+	// And the DFS channels shut to its radios, until each opens again.
+	let wall = time();
+	for (let k in keys(shut))
+		if (shut[k] <= wall)
+			delete shut[k];
+	// What each radio would move to, and for how long its reason has held
+	// (0338): a planned move waits for that to hold STEADY, and for the
+	// window; one that costs a radar check waits apart, as widening does.
+	let plans = [];
+	for (let name, r in radios)
+		for (let k in ['plan', 'far', 'widen']) {
+			let m = match(r[k]?.move ?? '', /^([a-z]+) ([0-9]+)$/);
+			if (m && r.channel >= 1 && r.channel <= 233)
+				push(plans, { band: r.band, from: r.channel, to: int(m[2]), why: m[1], radar: k != 'plan', ago: max(0, int(at - r[k].since)) });
+		}
+	// How it listens (0173): through the scan radio while it is in service,
+	// else by the serving radios; and whether the AP has a scan radio out of
+	// service, as one airscan gave up on.
+	let said = {
+		at: time(), on: true, address: address ?? '', advertised: slice(uniq(sort(advertised)), 0, 3),
+		neighbours: slice(list, 0, LISTED), ratings: slice(rated, 0, RATED), moves: moves, apc: powers(), apc_events: apc_events,
+		cannot_scan: deaf, others: others_listed(at), away: stays, barred: shut,
+		listens: listening ? 'scan-radio' : 'serving', plans: slice(plans, 0, 12),
+		// How long it has run, so a manager tells its starting afresh from
+		// its neighbours going (0338).
+		up: max(0, int(at - began)),
+	};
+	if (cfg.airscan && !listening)
+		said.scan_out = true;
+	// Whether its scan radio checks a DFS block for radar before a move, so
+	// it moves with no minute off the air (0329). For a look on the AP; the
+	// agent does not report it.
+	if (listening && precheck_ok)
+		said.precheck = true;
+	store(out, sprintf('%J', said));
+}
+
+// restore reads back what the daemon's last run found, as when the agent
+// was updated: the ratings the channels earned, the moves made, so a radio
+// that just moved stays put, and the power each radio was held at (0077).
+// A move it had claimed is withdrawn.
+function restore(at) {
+	let r = null;
+	try {
+		r = json(read(out) ?? 'null');
+	} catch (e) {
+	}
+	if (r?.on != true || type(r.at) != 'int')
+		return;
+	let wall = time();
+	for (let x in (type(r.ratings) == 'array' ? r.ratings : [])) {
+		if (!(x?.band in ['2g', '5g', '6g']) || type(x.channel) != 'int' || type(x.ago) != 'int' ||
+		    !(type(x.cost) in ['int', 'double']) || !(type(x.now) in ['int', 'double']))
+			continue;
+		let ago = wall - r.at + x.ago;
+		if (ago < 0 || ago > RATED_FOR + REMEMBER)
+			continue;
+		rates[x.band + ' ' + x.channel] = {
+			band: x.band, channel: x.channel, cost: x.cost, now: x.now, busy: (x.busy ?? 0) / 100.0,
+			noise: x.noise, networks: x.networks ?? 0, visits: x.visits ?? 1, at: at - ago,
+		};
+	}
+	for (let m in (type(r.moves) == 'array' ? r.moves : []))
+		if (m?.band in ['2g', '5g', '6g'] && type(m.from) == 'int' && type(m.to) == 'int' && type(m.at) == 'int' &&
+		    m.why in WHYS && m.state in STATES) {
+			if (m.state == 'announced') {
+				m.state = 'withdrawn';
+				m.at = wall;
+			}
+			// A radar check that was running is taken to have ended well:
+			// the radio is found where it is.
+			if (m.state == 'checking')
+				m.state = 'moved';
+			record(m);
+		}
+	// The DFS channels shut to its radios (0120), each until it opens again.
+	for (let k, until in (type(r.barred) == 'object' ? r.barred : {}))
+		if (match(k, /^5g [0-9]{2,3}$/) && type(until) == 'int' && until > wall && until <= wall + rrm.BARRED_FOR)
+			shut[k] = until;
+	// Where a radio on a DFS channel came from (0120).
+	for (let band, a in (type(r.away) == 'object' ? r.away : {}))
+		if (band == '5g' && type(a?.to) == 'int' && type(a.ago) == 'int' && a.ago >= 0)
+			away[band] = {
+				to: a.to, home: type(a.home) == 'int' ? a.home : null, cost: type(a.cost) in ['int', 'double'] ? a.cost : null,
+				// The widths it went at and came from (0329).
+				width: a.width in [20, 40, 80, 160] ? a.width : null, home_width: a.home_width in [20, 40, 80, 160] ? a.home_width : null,
+				since: at - (wall - r.at + a.ago), checking: false,
+			};
+	for (let x in (type(r.apc) == 'array' ? r.apc : []))
+		if (type(x?.radio) == 'string' && x.band in ['2g', '5g', '6g'] && type(x.power) == 'int' && x.power > 0 && x.power <= 40)
+			kept[x.radio] = { band: x.band, power: x.power };
+}
+
+// stop takes the element off the beacons, so no AP keeps taking this one
+// for a neighbour after it stops. The power control holds, it keeps, for the
+// next run: netifd puts it back when a radio starts again.
+function stop() {
+	cfg = { on: false };
+	advertise();
+	exit(0);
+}
+
+function main() {
+	signal('SIGTERM', stop);
+	signal('SIGINT', stop);
+	fs.mkdir('/var/run/aeolus');
+	began = now();
+	restore(began);
+	let next_look = 0, next_hello = 0, next_write = 0, next_sweep = 0, next_collect = 0, next_clients = 0;
+	// The agent sends a SIGHUP when it has applied a config, so a change is
+	// taken up at once.
+	signal('SIGHUP', () => { next_look = 0; });
+	while (true) {
+		let at = now();
+		// ucode -S runs with the garbage collector off: what refers to
+		// itself, as a function kept in what it makes does, would never be
+		// freed. It is run here, at the top of the loop, where nothing is
+		// half made, and never started with gc('start'): started, it may run
+		// inside a function filter() or map() calls and free the array being
+		// made, which then comes back null (airscan, 2026-10-16).
+		if (at >= next_collect) {
+			gc('collect');
+			next_collect = at + COLLECT_EVERY;
+		}
+		if (at >= next_look) {
+			flat(at);
+			look(at);
+			next_look = at + LOOK_EVERY;
+		}
+		if (cfg.on) {
+			if (listening) {
+				// With a scan radio in service, the serving radios never scan
+				// (0081, 0173): each only reads its own channel's counts, and
+				// what the scan radio heard is taken in (0116).
+				for (let name, r in radios)
+					if (at >= r.due) {
+						let l = watch(r);
+						if (l)
+							r.load = { others: l.others, noise: l.noise, at: at };
+						r.scan = null;
+						r.deaf = null;
+						r.due = at + VISIT_EVERY;
+					}
+				if (at >= next_sweep) {
+					sweep(at);
+					next_sweep = at + SWEEP_EVERY;
+				}
+			} else
+				// A radio that claims a channel makes no visit until the claim
+				// ends: Linux refuses a channel switch while the radio scans,
+				// and hostapd says only that it is not supported (porting's
+				// B164, TestW318 2026-11-07).
+				for (let name, r in radios)
+					if (r.scan && at >= r.scan.started + VISIT_WAIT)
+						heard_on(r, at);
+					else if (!r.scan && at >= r.due) {
+						if (!r.claim)
+							visit(r, at);
+						r.due = at + VISIT_EVERY;
+					}
+			// The clients power control listens to (0206).
+			if (cfg.apc && at >= next_clients) {
+				clients_look(at);
+				next_clients = at + CLIENTS_EVERY;
+			}
+			// A claim goes out in the hello that follows it.
+			if (at >= next_hello) {
+				changes(at);
+				follow(at);
+				followers(at);
+				decide(at, filter(table(at), x => !x.stale));
+				apc(at);
+				hellos(at);
+				next_hello = at + rrm.HELLO_EVERY;
+			}
+		}
+		if (at >= next_write) {
+			write(at);
+			next_write = at + WRITE_EVERY;
+		}
+		let due = min(next_look, next_write);
+		if (cfg.on) {
+			due = min(due, next_hello);
+			if (listening)
+				due = min(due, next_sweep);
+			for (let name, r in radios)
+				due = min(due, r.scan ? r.scan.started + VISIT_WAIT : r.due);
+		}
+		let wait = max(10, min(1000, int((due - now()) * 1000)));
+		if (!sock) {
+			sleep(wait);
+			continue;
+		}
+		// The hellos, and the scan radio's beacons where they are read (0161).
+		let watched = [[sock, socket.POLLIN]];
+		if (beacons)
+			push(watched, [beacons, socket.POLLIN]);
+		for (let x in socket.poll(wait, ...watched) ?? [])
+			if (x[1] & (socket.POLLIN | socket.POLLERR)) {
+				if (beacons && x[0] == beacons)
+					read_beacons(now());
+				else
+					receive(now());
+			}
+		if (cfg.on)
+			release_roamed();
+	}
+}
+
+main();

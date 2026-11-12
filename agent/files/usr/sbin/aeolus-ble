@@ -1,0 +1,965 @@
+#!/usr/bin/ucode -S
+// aeolus-ble: lends the AP's Bluetooth LE radio to Home Assistant (0156).
+//
+// Home Assistant hears Bluetooth devices through the radios it is given,
+// near or far. One far away it reaches by ESPHome's native API, as it does
+// an ESP32 set up as a Bluetooth proxy. This daemon is such a proxy on the
+// AP: it keeps the AP's Bluetooth controller listening, and hands every
+// advertisement it hears, as it was heard and how strongly, to whichever
+// Home Assistant has connected. Home Assistant then has the AP for one
+// more place it hears from: its sensors, its beacons, where a device is.
+//
+// Left to itself it only listens: it asks nothing of what it hears, and
+// sends nothing on the air. Home Assistant can ask it to scan actively, for
+// a while or for good, as it does of any proxy: then the controller asks
+// each device it hears for the rest of what it would say, its scan
+// response, which some devices keep their name or their readings in. It
+// makes no connection to any device.
+//
+// It is idle until Aeolus turns it on (aeolus.aeolus_ble, which the agent
+// renders from system.ble_proxy), and on an AP with no Bluetooth
+// controller it stays so.
+//
+// The controller is read with the tools the AP has: hcitool starts it
+// scanning, with every advertisement reported, not each device once;
+// hcidump, or btmon where BlueZ (5.87) has no hcidump (0281), says each
+// thing the controller is told and says, as bytes. A reader beside the
+// daemon takes what it says and passes on
+// each whole packet from the controller, and each time the controller is
+// told to scan or to stop.
+//
+// The radio is shared. The AP's own survey of what is near (airscan) scans
+// for some seconds every few minutes, each device told once: the daemon
+// sees its scan begin, lets it finish, hands on what it hears meanwhile,
+// and takes the radio back as it ends. Scanning that stops for any other
+// reason, or a controller gone quiet, is started again.
+//
+// It listens for Home Assistant on TCP port 6053, unencrypted and with no
+// password: whoever can reach the port hears what the radio hears. In Home
+// Assistant it is added under ESPHome, by the AP's address.
+//
+// How it does is in /var/run/aeolus/ble.json, for the agent's report.
+//
+//	aeolus-ble [-p <port>] [-n <name>] [-i <controller>] [-d <directory>] [-b <directory>] [-f] [-r <file of hcidump's lines, or btmon's btsnoop>] [-v]
+//
+// The controller is the lowest-numbered the kernel lists, looked for again
+// each time it is read anew: one has come up as hci1, and a controller that
+// is reset may come back under another number. -i names one instead.
+//
+// The other options are for trying it out. -f has it run whatever Aeolus
+// says; -r plays a file of hcidump's raw output, or btmon's btsnoop, over and over in place of a
+// controller, on an AP that has none; -b is where the kernel lists the
+// Bluetooth controllers, for one that is made up.
+
+'use strict';
+
+import * as fs from 'fs';
+import * as uloop from 'uloop';
+import * as socket from 'socket';
+import { cursor } from 'uci';
+import { openlog, syslog, LOG_PID, LOG_DAEMON, LOG_INFO, LOG_WARNING } from 'log';
+import * as esp from 'aeolus.esphome';
+import * as btad from 'aeolus.btad';
+
+let port = 6053, name = null, given = null, hci = 'hci0', replay = null, forced = false, wordy = false, dir = '/var/run/aeolus';
+let controllers = '/sys/class/bluetooth';
+for (let i = 0; i < length(ARGV); i++) {
+	if (ARGV[i] == '-p')
+		port = int(ARGV[++i]);
+	else if (ARGV[i] == '-n')
+		name = ARGV[++i];
+	else if (ARGV[i] == '-i')
+		given = ARGV[++i];
+	else if (ARGV[i] == '-r')
+		replay = ARGV[++i];
+	else if (ARGV[i] == '-d')
+		dir = rtrim(ARGV[++i], '/');
+	else if (ARGV[i] == '-b')
+		controllers = rtrim(ARGV[++i], '/');
+	else if (ARGV[i] == '-f')
+		forced = true;
+	else if (ARGV[i] == '-v')
+		wordy = true;
+}
+if (given != null && !match(given, /^hci[0-9]+$/))
+	given = null;
+if (given)
+	hci = given;
+
+const SAID = dir + '/ble.json';   // how it does, for the agent: { at, radio, scanning, mode, port, name, clients, heard, sent, devices }
+const DEVICES = dir + '/ble-devices.json';   // the devices heard, for the agent's report (0157): { at, devices }
+const SCAN_PID = dir + '/ble-scan.pid';   // hcitool, while it has the controller scan
+const DUMP_PID = dir + '/ble-dump.pid';   // hcidump or btmon, while it is read
+const AGENT_JSON = '/etc/aeolus/agent.json';   // the agent this AP runs, for what the proxy says its version is
+const CLIENTS = 4;        // Home Assistants connected at once, at the most
+const FLUSH = 100;        // ms advertisements wait to go together
+const HELD = 200;         // advertisements held for clients; past that, the oldest go
+const QUIET = 30;         // seconds without an advertisement before scanning is started again
+const RETRY = 5;          // seconds before scanning the controller would not start is tried again
+const READ_MAX = 600;     // seconds, at the most, before a controller that is not read is tried again
+const READ_OK = 60;       // seconds a reader runs for the controller to count as read
+const TOLD_EVERY = 1800;  // seconds between two notes that the controller still is not read
+const FDS = 768;          // descriptors the daemon may hold before it starts anew
+const NO_ACTIVE = 300;    // seconds it only listens after the controller would not scan actively
+const HOLD = 60;          // seconds another's scan is let run before the radio is taken back regardless
+const SILENT = 60;        // seconds a client may say nothing before it is asked whether it is there: one that is sent a steady stream says nothing of itself
+const ANSWER = 30;        // seconds it has to answer that
+const INPUT = 65536;      // bytes of an unfinished message a client may send
+const SEEN_FOR = 300;     // seconds a device counts as heard, for the count of them
+const LOOK = 5;           // seconds between two looks at whether Aeolus has it on
+const COLLECT_EVERY = 60; // seconds between two runs of the garbage collector
+const ADDR_WAIT = 45;     // seconds a controller with no address yet is given one before Home Assistant is listened for (0277)
+// What a controller says before it has an address of its own, which is none
+// (0277): all zeros, as a C-360's before B68, and a CSR chip's default
+// before its PS keys are loaded, as the C-260's.
+const NO_ADDRESS = ['00:00:00:00:00:00', '00:02:5B:00:A5:A5'];
+
+openlog('aeolus-ble', LOG_PID, LOG_DAEMON);
+
+function log(fmt, ...args) {
+	syslog(LOG_INFO, fmt, ...args);
+}
+
+function note(fmt, ...args) {
+	syslog(LOG_WARNING, fmt, ...args);
+}
+
+function slurp(path) {
+	let v = fs.readfile(path);
+	return v == null ? null : trim(v);
+}
+
+function store(path, data) {
+	let tmp = path + '.new';
+	if (fs.writefile(tmp, data) == null)
+		return false;
+	return fs.rename(tmp, path);
+}
+
+// after runs fn once, ms from now. ucode's uloop keeps a timer that has gone
+// off until it is cancelled, and with it all its function holds, so one that
+// is let go off is cancelled as it does: in its function, this is the timer.
+function after(ms, fn) {
+	return uloop.timer(ms, function() {
+		this.cancel();
+		fn();
+	});
+}
+
+// collect runs the garbage collector, and again a minute on. ucode -S runs
+// with it off, and what refers to itself, as a client's handle does through
+// its function, would never be freed. It is run from a timer of its own,
+// where nothing is half made, and never started with gc('start'): started,
+// it may run inside a function filter() or map() calls and free the array
+// being made, which then comes back null (airscan, 2026-10-16).
+function collect() {
+	gc('collect');
+	after(COLLECT_EVERY * 1000, collect);
+}
+
+// controller is the Bluetooth controller to read: the one named with -i, or
+// the lowest-numbered the kernel lists; null where there is none.
+function controller() {
+	if (given)
+		return fs.access(`${controllers}/${given}`) ? given : null;
+	let found = filter(fs.lsdir(controllers) ?? [], n => match(n, /^hci[0-9]+$/));
+	if (!length(found))
+		return null;
+	return sort(found, (a, b) => int(substr(a, 3)) - int(substr(b, 3)))[0];
+}
+
+// controller_address is the controller's own address: the public one
+// hcitool says it has (the C-260's is its label's MAC less 2; a C-360's
+// from port B68, written some seconds into its boot), or, where the kernel
+// says it, a static one, as an LE-only controller with none of its own has
+// (a C-360's before B68 says 00:00:00:00:00:00, and has neither). null
+// where it says none, or one of NO_ADDRESS.
+function controller_address() {
+	let ble = null;
+	let real = (m) => m && index(NO_ADDRESS, uc(m[1])) < 0;
+	let p = replay ? null : fs.popen(`hcitool dev 2>/dev/null`, 'r');
+	if (p) {
+		let m = match(p.read('all') ?? '', regexp(`${hci}[ \t]+([0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5})`));
+		p.close();
+		if (real(m))
+			ble = uc(m[1]);
+	}
+	for (let f in ble ? [] : ['identity', 'static_address', 'random_address']) {
+		let m = match(slurp(`/sys/kernel/debug/bluetooth/${hci}/${f}`) ?? '', /([0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5})/);
+		if (real(m)) {
+			ble = uc(m[1]);
+			break;
+		}
+	}
+	return ble;
+}
+
+// whoami is what this proxy says it is: named for the AP, by the MAC of
+// its first Ethernet port, which is the one on its label.
+function whoami() {
+	let host = slurp('/proc/sys/kernel/hostname') ?? 'ap';
+	let mac = uc(slurp('/sys/class/net/eth0/address') ?? slurp('/sys/class/net/br-lan/address') ?? '02:00:00:00:00:00');
+	let ble = controller_address();
+	let version = '';
+	try {
+		version = json(slurp(AGENT_JSON) ?? 'null')?.version ?? '';
+	} catch (e) {
+	}
+	let short = lc(replace(name ?? host, /[^A-Za-z0-9-]+/g, '-'));
+	return {
+		name: short + '-ble', friendly: (name ?? host) + ' Bluetooth', mac: mac, ble_mac: ble ?? mac,
+		model: slurp('/tmp/sysinfo/model') ?? 'OpenWrt AP', version: version,
+	};
+}
+
+let who = null;
+let srv = null, srv_handle = null, on = false;
+let clients = {};         // by its socket's number: { sock, handle, peer, buf, out, subscribed, active, heard_at, asked_at }
+let pending = [];         // advertisements heard and not yet handed on
+let scanning = false, last_advert = 0, stopping = false, looked = 0, missing = false;
+let counts = { heard: 0, sent: 0 };
+let devices = {};         // by MAC: when it was last heard
+let table = {};           // the devices heard, what each said and how strongly (0157)
+let listed = 0;           // when the table was last written out
+// The reader: the task while it runs, since when, and when the controller is
+// to be read again where it is not; how long it waited last, the longest
+// wait yet noted and when, and whether the reader has failed since it last
+// read the controller.
+let reader = null, read_since = 0, read_at = 0, read_wait = 0, told_wait = 0, told_at = 0, failing = false;
+let fds_looked = 0;       // when the daemon last counted its descriptors
+let addr_looked = 0;      // when the daemon last read the controller's address (0273)
+let addr_wait_from = 0;   // since when it has waited for the controller to have an address (0277)
+// The scan: hcitool while it runs, when it was started, when it was asked
+// to stop, how many stops the controller is yet to be told that are this
+// daemon's own and until when they are looked for, when the scan is to be
+// started again, and since when another has the controller scanning.
+let scan = null, started = 0, asked = 0, own_stops = 0, asked_off = 0, rearm = 0, theirs = 0;
+// How it scans, passive or active; whether it is being started anew to scan
+// the other way; whether the controller was given an address to ask from;
+// and until when it is taken not to scan actively at all.
+let mode = 'passive', switching = false, gave_address = false, no_active = 0;
+
+// later says whether what a socket said of a send or a read is only that
+// there is nothing for it just now.
+function later(why) {
+	return match(why ?? '', /again|temporarily|would block/i) != null;
+}
+
+// drop lets a client go.
+function drop(c, why) {
+	if (!clients[c.id])
+		return;
+	delete clients[c.id];
+	c.handle?.delete();
+	c.sock.close();
+	log('%s is gone: %s', c.peer, why);
+}
+
+// give sends a client bytes, keeping what its socket will not take yet. A
+// client that does not take what it is sent is let go.
+function give(c, bytes) {
+	c.out += bytes;
+	if (!length(c.out))
+		return;
+	let n = c.sock.send(c.out, socket.MSG_DONTWAIT | socket.MSG_NOSIGNAL);
+	if (n == null) {
+		if (!later(socket.error()))
+			return drop(c, 'cannot be sent to: ' + socket.error());
+		n = 0;
+	}
+	c.out = substr(c.out, n);
+	if (length(c.out) > 262144)
+		drop(c, 'does not take what it is sent');
+}
+
+// wants_active says whether a client has asked for an active scan.
+function wants_active() {
+	return length(filter(values(clients), c => c.active)) > 0;
+}
+
+// announce tells each client that takes advertisements whether the radio
+// is scanning, and how.
+function announce() {
+	for (let c in values(clients))
+		if (c.subscribed)
+			give(c, esp.scanner_state(scanning, mode == 'active'));
+}
+
+// say_scanning notes whether the radio is scanning, and tells the clients.
+function say_scanning(is) {
+	scanning = is;
+	announce();
+}
+
+// own_address is an address for the controller to ask from, where it has
+// none: the AP's own MAC made a static random address, as the bytes hcitool
+// is given, the last first.
+function own_address() {
+	let b = map(split(who.mac, ':'), x => hex(x));
+	b[0] = b[0] | 0xc0;
+	return join(' ', map(reverse(b), x => sprintf('%02x', x)));
+}
+
+// start_scan has the controller scan, with every advertisement reported,
+// not each device once: only listening, or, where a client asked for it,
+// actively, asking each device it hears for the rest of what it would say.
+// hcitool scans until it is stopped, and writes a line for each
+// advertisement, which nobody reads. Where the controller will not, as
+// while another's scan runs, hcitool ends at once, and it is tried again.
+function start_scan() {
+	if (replay || !on || scan)
+		return;
+	started = time();
+	rearm = asked = 0;
+	switching = false;
+	let active = wants_active() && started >= no_active;
+	mode = active ? 'active' : 'passive';
+	let mine = null;
+	mine = scan = uloop.process('/bin/sh', ['-c', `echo $$ > '${SCAN_PID}'; exec hcitool -i ${hci} lescan ${active ? '--privacy' : '--passive'} --duplicates >/dev/null 2>&1`],
+		{ PATH: getenv('PATH') ?? '/usr/sbin:/usr/bin:/sbin:/bin' }, (code) => {
+		if (scan != mine)
+			return;
+		scan = null;
+		let now = time();
+		if (wordy)
+			log('hcitool ended with %d', code);
+		if (!on || stopping)
+			return;
+		// Stopped to scan the other way: started at once.
+		if (switching && !theirs)
+			return start_scan();
+		// An active scan the controller would not begin: it asks from its
+		// random address, and has none where nothing has given it one. It
+		// is given one, once; refused again, the daemon only listens for
+		// some minutes.
+		if (active && !asked && !theirs && now - started <= 2) {
+			if (!gave_address) {
+				gave_address = true;
+				system(`hcitool -i ${hci} cmd 0x08 0x0005 ${own_address()} >/dev/null 2>&1`);
+			} else {
+				no_active = now + NO_ACTIVE;
+				note('the controller will not scan actively: it only listens for the next %d minutes', NO_ACTIVE / 60);
+			}
+			return start_scan();
+		}
+		// Stopped to be started again, it is at once; ended by itself, the
+		// controller would not scan, and is given a moment.
+		if (!rearm)
+			rearm = now + (asked ? 1 : RETRY);
+	});
+	announce();
+}
+
+// end_scan stops hcitool: as it wants to be stopped, so that it tells the
+// controller to stop too; or, where the controller's scan is no longer
+// this daemon's to stop, outright, so that it tells the controller
+// nothing.
+function end_scan(outright) {
+	let pid = scan?.pid();
+	if (!pid)
+		return;
+	asked = time();
+	// Stopped as it wants to be, hcitool tells the controller to stop, once.
+	if (!outright) {
+		own_stops++;
+		asked_off = asked + 3;
+	}
+	system(`kill -${outright ? 'KILL' : 'INT'} ${pid} 2>/dev/null`);
+}
+
+// retune has the controller scan the way the clients now want. It says
+// whether the scan is being started anew for that; where it cannot be just
+// now, as while another's scan runs, the next start is the way they want.
+function retune() {
+	if (!on || replay || !scan || theirs || asked)
+		return false;
+	if ((mode == 'active') == (wants_active() && time() >= no_active))
+		return false;
+	switching = true;
+	end_scan(false);
+	return true;
+}
+
+// on_client takes what a client has sent, and answers each whole message.
+function on_client(c) {
+	let got = c.sock.recv(4096, socket.MSG_DONTWAIT);
+	if (got == null) {
+		if (later(socket.error()))
+			return;
+		return drop(c, 'its connection failed: ' + socket.error());
+	}
+	if (!length(got))
+		return drop(c, 'it closed the connection');
+	c.heard_at = time();
+	c.asked_at = 0;
+	let whole = esp.frames(c.buf + got);
+	if (whole.bad || length(whole.rest) > INPUT)
+		return drop(c, 'what it sent is no message of the API: a client that wants encryption, or not one at all');
+	c.buf = whole.rest;
+	for (let m in whole.frames) {
+		let a = esp.answer(m, who, scanning, mode == 'active');
+		if (wordy)
+			log('%s: message %d, %d bytes', c.peer, m.kind, length(m.payload));
+		if (a.send)
+			give(c, a.send);
+		if (!clients[c.id])
+			return;
+		if (a.subscribe != null && a.subscribe != c.subscribed) {
+			c.subscribed = a.subscribe;
+			log('%s %s', c.peer, a.subscribe ? 'takes the advertisements from here on' : 'takes no more advertisements');
+		}
+		if (a.active != null) {
+			if (a.active != c.active)
+				log('%s asks for %s', c.peer, a.active ? 'an active scan' : 'a scan that only listens');
+			c.active = a.active;
+			// Said at once where nothing changes; else as the scan starts
+			// anew.
+			if (!retune())
+				give(c, esp.scanner_state(scanning, mode == 'active'));
+			if (!clients[c.id])
+				return;
+		}
+		if (a.close)
+			return drop(c, 'it said goodbye');
+	}
+}
+
+// on_listen lets a client in.
+function on_listen() {
+	let sock = srv?.accept({}, socket.SOCK_CLOEXEC);
+	if (!sock)
+		return;
+	let peer = sock.peername();
+	let from = peer ? `${peer.address}:${peer.port}` : 'a client';
+	if (length(keys(clients)) >= CLIENTS) {
+		sock.close();
+		return note('%s is turned away: %d are connected already', from, CLIENTS);
+	}
+	let c = { id: '' + sock.fileno(), sock: sock, peer: from, buf: '', out: '', subscribed: false, active: false, heard_at: time(), asked_at: 0 };
+	c.handle = uloop.handle(sock, () => on_client(c), uloop.ULOOP_READ);
+	clients[c.id] = c;
+	log('%s has connected', from);
+}
+
+// flush hands on what was heard since the last, to each client that takes
+// advertisements.
+function flush() {
+	if (length(pending)) {
+		let takers = filter(values(clients), c => c.subscribed);
+		if (length(takers)) {
+			let bytes = esp.raw_adverts(pending);
+			for (let c in takers)
+				give(c, bytes);
+			counts.sent += length(pending);
+		}
+		pending = [];
+	}
+	after(FLUSH, flush);
+}
+
+// heard takes one packet from the controller, as hcidump wrote it (and
+// read_btsnoop writes btmon's).
+function heard(text) {
+	let list = esp.adverts(esp.hci_bytes(text));
+	if (!length(list))
+		return;
+	let t = time();
+	last_advert = t;
+	if (!scanning)
+		say_scanning(true);
+	for (let a in list) {
+		counts.heard++;
+		devices[a.mac] = t;
+		btad.note(table, a, t);
+		push(pending, a);
+	}
+	if (length(pending) > HELD)
+		pending = slice(pending, length(pending) - HELD);
+}
+
+// running is the PID a file names, where a program of that name still runs
+// under it: one this daemon, or one before it, started.
+function running(file, what) {
+	let pid = int(slurp(file) ?? '');
+	if (!(pid > 1) || index(fs.readfile(`/proc/${pid}/cmdline`) ?? '', what) < 0)
+		return 0;
+	return pid;
+}
+
+// told passes on what the controller is told, as hcidump wrote it with its
+// H4 byte first ("01 0C 20 ..."): of that, only to scan or to stop (LE Set
+// Scan Enable), and whether each device is to be told once. It says
+// whether the daemon is still there to be told.
+function told(pipe, text) {
+	let m = match(text, /^01 0C 20 02 (0[01]) (0[01])/);
+	return !m || pipe.send({ scan: m[1] == '01', once: m[2] == '01' });
+}
+
+// read_hcidump reads hcidump's raw lines: ">" a packet from the controller,
+// its first line and those that carry it on, "<" what it is told.
+function read_hcidump(p, pipe) {
+	let packet = null, line;
+	while ((line = p.read('line')) != null && length(line)) {
+		let first = substr(line, 0, 1);
+		if (first == '<') {
+			packet = null;
+			if (!told(pipe, trim(substr(line, 1))))
+				break;
+			continue;
+		}
+		if (first == '>')
+			packet = substr(line, 1);
+		else if (packet != null && match(line, /^[ \t]+[0-9A-Fa-f]{2}/))
+			packet += line;
+		else
+			continue;
+		// A packet is whole once what it says its length is has come: an
+		// event's is its third byte.
+		let b = split(trim(packet), /[ \t\n]+/);
+		if (length(b) >= 3 && length(b) >= 3 + hex(b[2])) {
+			// The daemon gone, there is no one to read for.
+			if (!pipe.send({ p: packet }))
+				break;
+			packet = null;
+		}
+	}
+	return 'hcidump ended';
+}
+
+// read_btsnoop reads btmon's btsnoop (0281): a record at a time, its header
+// and then its data, each read for just its length, so that no read waits
+// for more than the controller has said. Events go on as hcidump wrote
+// them, and commands to told.
+function read_btsnoop(p, pipe) {
+	if (!esp.btsnoop_stream(p.read(esp.BTSNOOP_HEAD)))
+		return 'btmon wrote no btsnoop';
+	while (true) {
+		let r = esp.btsnoop_record(p.read(esp.BTSNOOP_RECORD));
+		if (!r)
+			break;
+		let data = r.len ? p.read(r.len) : '';
+		if (length(data ?? '') != r.len)
+			break;
+		let text = esp.hci_text(r.kind, data);
+		if (text == null)
+			continue;
+		if (substr(text, 0, 2) == '01' ? !told(pipe, text) : !pipe.send({ p: text }))
+			break;
+	}
+	return 'btmon ended';
+}
+
+// The tools that read the controller, the first the AP has (0281): BlueZ's
+// hcidump, to 5.86, and its btmon, which 5.87 has in its place. A file
+// played with -r is read as hcidump's lines, or as btsnoop where it starts
+// as btsnoop does, over and over: its head once, its records again.
+const DUMPERS = [
+	{ name: 'hcidump', bin: '/usr/bin/hcidump', read: read_hcidump,
+		cmd: (h) => `exec hcidump -i ${h} -R 2>/dev/null`,
+		replay: (f) => `while cat '${f}' && sleep 1; do :; done` },
+	{ name: 'btmon', bin: '/usr/bin/btmon', read: read_btsnoop,
+		cmd: (h) => `exec btmon -i ${h} -w /dev/fd/3 3>&1 1>/dev/null 2>/dev/null`,
+		replay: (f) => `head -c ${esp.BTSNOOP_HEAD} '${f}'; while tail -c +${esp.BTSNOOP_HEAD + 1} '${f}' && sleep 1; do :; done` },
+];
+
+function dumper_of() {
+	if (replay)
+		return DUMPERS[esp.btsnoop_stream(fs.readfile(replay, esp.BTSNOOP_HEAD)) ? 1 : 0];
+	for (let d in DUMPERS)
+		if (fs.access(d.bin, 'x'))
+			return d;
+	return null;
+}
+let dumper = null;
+
+// dump_running is the PID of a dumper a reader started, this daemon's or
+// one before it, that still runs.
+function dump_running() {
+	for (let d in DUMPERS) {
+		let pid = running(DUMP_PID, d.name);
+		if (pid)
+			return pid;
+	}
+	return 0;
+}
+
+// The reader: a task beside the daemon that reads the controller with a
+// dumper, which would hold the daemon up, and passes on each whole packet
+// from the controller, and each time the controller is told to scan or to
+// stop. It is a copy of the daemon made as it starts: it lets go of the
+// daemon's sockets, and is stopped as any program is, not as the daemon
+// has itself stopped.
+function read_controller(pipe) {
+	signal('SIGTERM', 'default');
+	signal('SIGINT', 'default');
+	srv?.close();
+	for (let c in values(clients))
+		c.sock.close();
+	if (!dumper)
+		return 'no tool to read the controller with (hcidump or btmon)';
+	let cmd = replay ? dumper.replay(replay) : `echo $$ > '${DUMP_PID}'; ${dumper.cmd(hci)}`;
+	let p = fs.popen(cmd, 'r');
+	if (!p)
+		return `cannot run ${dumper.name}`;
+	let why = dumper.read(p, pipe);
+	p.close();
+	return why;
+}
+
+// scan_told takes what the controller was told: to scan, by whom, or to
+// stop.
+function scan_told(is, once) {
+	let t = time();
+	if (is) {
+		// A scan that tells each device once is not this daemon's.
+		if (once) {
+			theirs = t;
+			rearm = 0;
+			if (wordy)
+				log('another scan has the controller: it is let finish');
+		}
+		return;
+	}
+	if (theirs) {
+		// Theirs is over: the radio is taken back.
+		theirs = 0;
+		rearm = t + 1;
+		return;
+	}
+	// One of this daemon's own, as its hcitool goes.
+	if (own_stops > 0 && t <= asked_off) {
+		own_stops--;
+		return;
+	}
+	own_stops = 0;
+	if (scan && !asked) {
+		// This daemon's scan, stopped by another: what follows is theirs,
+		// and hcitool must not stop that as it goes.
+		switching = false;
+		end_scan(true);
+		if (wordy)
+			log('the scan was stopped by another on the AP');
+	}
+}
+
+// reader_failed has the controller read again later: soon at first, then
+// less often while it keeps failing, up to READ_MAX. It is said as the wait
+// grows and then every half hour, not each time: a controller under another
+// number once had it said every 5 seconds, which pushed the boot's lines
+// out of the log.
+function reader_failed(why) {
+	let t = time();
+	// A reader that ran a while had the controller: the next try is soon.
+	if (read_since && t - read_since >= READ_OK)
+		read_wait = told_wait = 0;
+	read_since = 0;
+	read_wait = read_wait ? min(read_wait * 2, READ_MAX) : RETRY;
+	read_at = t + read_wait;
+	failing = true;
+	if (read_wait > told_wait || t - told_at >= TOLD_EVERY) {
+		note('the controller is not read (%s); read again in %d seconds', why, read_wait);
+		told_wait = read_wait;
+		told_at = t;
+	}
+}
+
+function start_reader() {
+	if (!on || reader || stopping)
+		return;
+	read_at = 0;
+	if (!replay) {
+		// The controller, which may be back under another number.
+		let h = controller();
+		if (!h)
+			return reader_failed(given ? `there is no ${given}` : 'there is no controller');
+		if (h != hci) {
+			log('the controller is %s now, not %s', h, hci);
+			hci = h;
+			who = whoami();
+			// hcitool scans by the number it was given.
+			end_scan(true);
+		}
+		// A dumper left running by a reader before, which ended unseen.
+		let pid = dump_running();
+		if (pid)
+			system(`kill ${pid} 2>/dev/null`);
+		else
+			fs.unlink(DUMP_PID);
+	}
+	read_since = time();
+	let mine = null;
+	mine = reader = uloop.task(read_controller, (msg) => {
+		if (type(msg) == 'object') {
+			if (msg.p != null) {
+				if (failing) {
+					failing = false;
+					log('the controller %s is read again', hci);
+				}
+				heard(msg.p);
+			} else if (msg.scan != null)
+				scan_told(msg.scan, msg.once);
+			return;
+		}
+		// It has ended: hcidump did, or the daemon stopped it.
+		if (reader != mine)
+			return;
+		reader = null;
+		if (on && !stopping)
+			reader_failed(msg ?? 'the reader stopped');
+	});
+	if (!reader)
+		reader_failed('no reader could be started: ' + (uloop.error() ?? 'unknown'));
+}
+
+// open begins: the port Home Assistant connects to, the reader, the scan.
+function open() {
+	let h = replay ? hci : controller();
+	if (!h) {
+		if (!missing)
+			note('Aeolus has the Bluetooth radio lent, and this AP has %s', given ? `no controller ${given}` : 'no Bluetooth controller');
+		missing = true;
+		store(SAID, sprintf('%J\n', { at: time(), radio: false }));
+		return;
+	}
+	hci = h;
+	missing = false;
+	// The tool it is read with, as the AP has one now (0281).
+	dumper = dumper_of();
+	// A controller with no address of its own yet is given ADDR_WAIT to
+	// have one (0277): at boot this daemon can start before the port's
+	// Bluetooth setup writes it, a C-360's some seconds in (B68), a C-260's
+	// with its PS keys. Begun before, it said the AP's own MAC or the
+	// chip's default to Home Assistant for a minute, and HA kept that
+	// source besides the real one. Past the wait it begins on the AP's MAC,
+	// and 0273's look each minute takes a real one that comes later.
+	if (!replay && !controller_address()) {
+		// By the clock that only goes on: at boot NTP sets the time, minutes
+		// on, and a wait by the time of day ended there (C360-AP on -105,
+		// 2026-11-01: a second before B68 wrote the address).
+		let t = clock(true)[0];
+		if (!addr_wait_from) {
+			addr_wait_from = t;
+			log('the controller %s has no address of its own yet: Home Assistant is listened for once it has, or in %d seconds', hci, ADDR_WAIT);
+		}
+		if (t - addr_wait_from < ADDR_WAIT)
+			return;
+	}
+	addr_wait_from = 0;
+	if (!replay) {
+		// What a daemon before this one left running, where it did not end
+		// as it should have.
+		let pid = running(SCAN_PID, 'hcitool');
+		if (pid)
+			system(`kill -INT ${pid} 2>/dev/null`);
+		pid = dump_running();
+		if (pid)
+			system(`kill ${pid} 2>/dev/null`);
+	}
+	// Its sockets are not to pass to the programs it starts: hcitool
+	// holding a client's would keep the connection open after the daemon
+	// had let the client go, and Home Assistant would not know to come
+	// back.
+	srv = socket.create(socket.AF_INET, socket.SOCK_STREAM | socket.SOCK_CLOEXEC);
+	if (!srv || !srv.setopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1) || !srv.bind({ address: '0.0.0.0', port: port }) || !srv.listen(CLIENTS)) {
+		note('cannot listen on port %d: %s', port, socket.error());
+		srv?.close();
+		srv = null;
+		return;
+	}
+	srv_handle = uloop.handle(srv, on_listen, uloop.ULOOP_READ);
+	on = true;
+	who = whoami();
+	counts = { heard: 0, sent: 0 };
+	last_advert = theirs = rearm = no_active = own_stops = 0;
+	read_since = read_at = read_wait = told_wait = 0;
+	mode = 'passive';
+	switching = gave_address = failing = false;
+	log('%s (%s, Bluetooth %s, %s) listens for Home Assistant on port %d', who.name, who.mac, who.ble_mac, hci, port);
+	start_reader();
+	start_scan();
+}
+
+// shut ends it: the clients told and let go, the port closed, the radio
+// left as it was found.
+function shut(why) {
+	if (!on)
+		return;
+	on = false;
+	for (let c in values(clients)) {
+		c.sock.send(esp.frame(5), socket.MSG_DONTWAIT | socket.MSG_NOSIGNAL);
+		drop(c, why);
+	}
+	srv_handle?.delete();
+	srv?.close();
+	srv = srv_handle = null;
+	// A scan left running with no hcitool to stop it is told to stop;
+	// another's is left to them.
+	if (!replay && !scan && !theirs && time() - last_advert <= 3)
+		system(`hcitool -i ${hci} cmd 0x08 0x000c 00 00 >/dev/null 2>&1`);
+	end_scan(theirs != 0);
+	scan = null;
+	reader?.kill();
+	reader = null;
+	read_at = 0;
+	// The dumper would stay until the controller next said something.
+	let pid = replay ? 0 : dump_running();
+	if (pid)
+		system(`kill ${pid} 2>/dev/null`);
+	scanning = false;
+	pending = [];
+	devices = {};
+	table = {};
+	fs.unlink(SAID);
+	fs.unlink(DEVICES);
+	log('no longer lent: %s', why);
+}
+
+// wanted says whether Aeolus has the radio lent.
+function wanted() {
+	return forced || replay != null || cursor().get('aeolus', 'aeolus_ble', 'enabled') == '1';
+}
+
+// look_after keeps the controller scanning.
+function look_after(t) {
+	// Another's scan that never ended, or whose end was not seen.
+	if (theirs && t - theirs > HOLD)
+		theirs = 0;
+	if (theirs)
+		return;
+	if (scan) {
+		// hcitool that would not go when asked.
+		if (asked) {
+			if (t - asked > 8)
+				end_scan(true);
+		} else if (t - last_advert > QUIET && t - started > QUIET) {
+			// A controller that says nothing, or whose scan stopped unseen.
+			if (scanning) {
+				say_scanning(false);
+				note('nothing heard for %d seconds: scanning is started again', QUIET);
+			}
+			end_scan(false);
+		}
+		return;
+	}
+	if (!rearm)
+		rearm = t + RETRY;
+	if (t < rearm)
+		return;
+	// Advertisements that come with no hcitool are a scan left running:
+	// nothing is to be started.
+	if (t - last_advert <= 3)
+		rearm = t + RETRY;
+	else
+		start_scan();
+}
+
+// tick looks after the scanning and the clients once a second, and says how
+// it does.
+function tick() {
+	let t = time();
+	if (stopping) {
+		shut('the daemon is stopping');
+		return uloop.end();
+	}
+	if (t - looked >= LOOK) {
+		looked = t;
+		let want = wanted();
+		if (want && !on)
+			open();
+		else if (!want && on)
+			shut('Aeolus has turned it off');
+		else if (!want && missing) {
+			missing = false;
+			fs.unlink(SAID);
+		}
+	}
+	// ucode's uloop before af8a3830 keeps a descriptor of each task that has
+	// ended, the reader's among them: past FDS the daemon starts anew,
+	// before it can open nothing more.
+	if (t - fds_looked >= 60) {
+		fds_looked = t;
+		let n = length(fs.lsdir('/proc/self/fd') ?? []);
+		if (n > FDS) {
+			note('%d descriptors held: the daemon starts anew', n);
+			stopping = true;
+			return after(1, tick);
+		}
+	}
+	// The controller's address, read again each minute (0273): a C-360
+	// writes its public one some seconds into its boot (B68), and this
+	// daemon may have started before, on the address it had or on the AP's
+	// own. Home Assistant reads it from what the proxy says it is, which it
+	// asks only as it connects: the clients are let go, to connect again.
+	// An address read as none changes nothing.
+	if (on && !replay && who && t - addr_looked >= 60) {
+		addr_looked = t;
+		let a = controller_address();
+		if (a && a != who.ble_mac) {
+			note('the controller %s is %s now, not %s: Home Assistant connects again to take it', hci, a, who.ble_mac);
+			who = whoami();
+			for (let c in values(clients))
+				drop(c, 'the controller\'s address changed');
+		}
+	}
+	if (on) {
+		// A reader that ended without saying so, as one killed does, and
+		// one that is due again.
+		if (reader?.finished()) {
+			reader = null;
+			reader_failed('the reader ended');
+		}
+		if (!reader && read_at && t >= read_at)
+			start_reader();
+		if (!replay) {
+			look_after(t);
+			// A client that asked for an active scan and has gone, and the
+			// like.
+			retune();
+		}
+		if (scanning && t - last_advert > QUIET)
+			say_scanning(false);
+		// A client that is sent advertisements all the while has no need
+		// to say anything, and Home Assistant then says nothing: one not
+		// heard from for a while is asked whether it is there, as an
+		// ESPHome device asks, and let go only where it does not answer.
+		for (let c in values(clients)) {
+			if (c.asked_at && t - c.asked_at > ANSWER)
+				drop(c, sprintf('it did not answer for %d seconds when asked whether it is there', ANSWER));
+			else if (!c.asked_at && t - c.heard_at > SILENT) {
+				c.asked_at = t;
+				give(c, esp.frame(esp.PING_REQUEST));
+			} else
+				give(c, '');
+		}
+		for (let mac, at in devices)
+			if (t - at > SEEN_FOR)
+				delete devices[mac];
+		// The devices heard, each as it was last heard, for the agent.
+		if (t - listed >= 10) {
+			listed = t;
+			btad.forget(table, t, btad.HEARD_FOR, 512);
+			store(DEVICES, sprintf('%J\n', { at: t, devices: btad.listing(table) }));
+		}
+		store(SAID, sprintf('%J\n', {
+			at: t, radio: true, scanning: scanning, mode: mode, port: port, name: who.name,
+			clients: map(values(clients), c => ({ from: c.peer, subscribed: c.subscribed })),
+			heard: counts.heard, sent: counts.sent, devices: length(keys(devices)),
+		}));
+	}
+	after(1000, tick);
+}
+
+function main() {
+	signal('SIGTERM', () => { stopping = true; });
+	signal('SIGINT', () => { stopping = true; });
+	fs.mkdir(dir);
+	fs.unlink(SAID);
+	fs.unlink(DEVICES);
+	uloop.init();
+	after(COLLECT_EVERY * 1000, collect);
+	after(FLUSH, flush);
+	after(100, tick);
+	uloop.run();
+}
+
+main();

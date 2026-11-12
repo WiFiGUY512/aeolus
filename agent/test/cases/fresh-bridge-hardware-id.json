@@ -1,0 +1,92 @@
+{
+	"about": "An Arista C-360 as a fresh install leaves it, as in fresh-bridge, but its own interface asks for the hardware client id (sendclientid hardware): it sends its MAC, which is the bridge's on br-lan.1 too, so the renderer moves it to VLAN 1 of the bridge and gives it no client id of its own (0288).",
+	"current": "c360-fresh-current.json",
+	"facts": {
+		"uplink": "eth0",
+		"radios": {
+			"radio0": {
+				"htmodes": [
+					"HE20",
+					"HE40",
+					"HE80",
+					"HE160"
+				]
+			},
+			"radio1": {
+				"htmodes": [
+					"HE20",
+					"HE40"
+				]
+			},
+			"radio3": {
+				"htmodes": [
+					"HE20",
+					"HE40",
+					"HE80",
+					"HE160"
+				]
+			}
+		},
+		"management": "lan"
+	},
+	"intent": {
+		"system": {
+			"country": "US",
+			"poll": 60
+		},
+		"rrm": {
+			"enabled": true
+		},
+		"radio": {
+			"2g": {
+				"enabled": true,
+				"channel": 6,
+				"width": 20
+			},
+			"5g": {
+				"enabled": true,
+				"channel": 36,
+				"width": 80
+			},
+			"6g": {
+				"enabled": true,
+				"channel": 37,
+				"width": 80
+			}
+		},
+		"network": {
+			"lab": {
+				"ssid": "Aeolus Lab",
+				"security": "wpa3-sae",
+				"passphrase": "fixture-passphrase-1",
+				"transport": {
+					"primary": {
+						"type": "vlan",
+						"vlan": 20
+					}
+				}
+			}
+		}
+	},
+	"kept": [
+		"wireless.radio2",
+		"wireless.default_radio2",
+		"aeolus.aeolus_rrm"
+	],
+	"gone": [
+		"wireless.aeolus_lab_radio2"
+	],
+	"extra": {
+		"network": {
+			"lan": {
+				".anonymous": false,
+				".type": "interface",
+				".name": "lan",
+				".index": 3,
+				"device": "br-lan",
+				"proto": "dhcp",
+				"sendclientid": "hardware"
+			}
+		}
+	}
+}

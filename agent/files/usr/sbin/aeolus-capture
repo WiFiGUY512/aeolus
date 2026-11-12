@@ -1,0 +1,192 @@
+#!/usr/bin/ucode -S
+// aeolus-capture: begins a capture someone started (0148), at once.
+//
+// A capture is asked for by someone who is about to do the thing they want
+// captured: it has to be running when they do. So it is begun the moment the
+// AP hears of it, on the line it holds open to the manager (0145), by
+// aeolus-live, which runs this; and by the agent, at its poll, where the AP
+// holds no line. Whichever comes first begins it, and the other finds it
+// begun: one at a time is let in.
+//
+// It works out which interfaces to take (aeolus.pcap), starts a tcpdump on
+// each, writing to files in the AP's memory, and says what it did in a line
+// of JSON: { pending, result } where it runs, { ok: false, result } where
+// it could not. The agent sends the files up, and says when it is done.
+//
+//	aeolus-capture <the capture's ID> <a file of what was asked> [when the AP heard of it, in ms by the calendar's clock]
+//
+// With when the AP heard, it says how long the beginning took: what the
+// page shows whoever asked, who is timing something against it.
+
+'use strict';
+
+import * as fs from 'fs';
+import { cursor } from 'uci';
+import { connect } from 'ubus';
+import * as pcap from 'aeolus.pcap';
+import * as wifinames from 'aeolus.wifinames';   // netifd's Wi-Fi status through a radio being set up again (0301)
+import { openlog, syslog, LOG_PID, LOG_DAEMON, LOG_INFO } from 'log';
+
+const DIR = pcap.DIR;
+const LOCK = DIR + '.lock';             // held while one is begun, so that two askings of it begin one
+const LOCK_WAIT = 6000;                 // ms another's beginning is waited for
+const LOCK_OLD = 30;                    // seconds after which a lock is one a run that died left
+const PACKAGES_TOOL = '/usr/libexec/aeolus-packages';
+const ROOM = 4;                         // one may hold a quarter of the memory that is free
+const LEAST = 1048576;                  // and is not taken where that is less than this
+const READY = 1500;                     // ms its tcpdumps are given to be listening
+
+openlog('aeolus-capture', LOG_PID, LOG_DAEMON);
+
+let locked = false;
+
+// say prints what came of it, lets the lock go where it is this run's, and
+// ends.
+function say(out) {
+	print(sprintf('%J\n', out));
+	if (locked)
+		fs.rmdir(LOCK);
+	syslog(LOG_INFO, 'capture: %s', out.result);
+	exit(out.ok === false ? 1 : 0);
+}
+
+function read(path) {
+	let v = fs.readfile(path);
+	return v == null ? null : trim(v);
+}
+
+function store(path, data, mode) {
+	let tmp = path + '.new';
+	if (fs.writefile(tmp, data) == null)
+		return false;
+	fs.chmod(tmp, mode);
+	return fs.rename(tmp, path);
+}
+
+// running is the capture under way, or null.
+function running() {
+	let r = null;
+	try {
+		r = json(read(DIR + '/running') ?? 'null');
+	} catch (e) {
+	}
+	return type(r?.id) == 'int' && type(r.files) == 'array' ? r : null;
+}
+
+// have is the AP as a capture's plan needs it: its networks' Wi-Fi
+// interfaces, its network config, each bridge's ports, and its uplink.
+function have() {
+	let bus = connect(), wifi = {};
+	// Once netifd has finished setting up any radio it is setting up
+	// again, a while at most (0301): until then it lists that radio's
+	// interfaces without names, and the capture would go without them.
+	for (let r, v in wifinames.settle(() => bus?.call('network.wireless', 'status') ?? {}))
+		for (let i in v.interfaces ?? []) {
+			if (!i.ifname || (i.config?.mode ?? 'ap') != 'ap')
+				continue;
+			let nets = i.config?.network ?? [];
+			wifi[i.ifname] = { nets: type(nets) == 'array' ? nets : ['' + nets], band: '' + (v.config?.band ?? ''),
+				ssid: substr(replace('' + (i.config?.ssid ?? ''), /[^ -~]/g, '?'), 0, 32) };
+		}
+	let members = {};
+	for (let n in fs.lsdir('/sys/class/net') ?? []) {
+		let ports = fs.lsdir(`/sys/class/net/${n}/brif`);
+		if (ports)
+			members[n] = ports;
+	}
+	let c = cursor();
+	return { wifi: wifi, network: c.get_all('network') ?? {}, members: members, uplink: c.get('aeolus', 'agent', 'uplink') };
+}
+
+function tcpdump() {
+	return fs.access('/usr/bin/tcpdump') || fs.access('/usr/sbin/tcpdump');
+}
+
+let id = int(ARGV[0]), ask = null;
+try {
+	ask = json(fs.readfile(ARGV[1] ?? '') ?? 'null');
+} catch (e) {
+}
+if (!(id > 0) || type(ask) != 'object') {
+	warn('aeolus-capture <the capture\'s ID> <a file of what was asked>\n');
+	exit(2);
+}
+
+// One at a time: another's beginning is waited for, and what it began is
+// what this one finds.
+for (let waited = 0; !locked; waited += 50) {
+	if (fs.mkdir(LOCK, 0o700)) {
+		locked = true;
+		break;
+	}
+	let at = fs.stat(LOCK)?.mtime;
+	if (at != null && time() - at > LOCK_OLD) {
+		fs.rmdir(LOCK);
+		continue;
+	}
+	if (waited >= LOCK_WAIT)
+		say({ ok: false, result: 'another capture was being begun here, and did not finish beginning' });
+	sleep(50);
+}
+let r = running();
+if (r)
+	say(r.id == id ? { pending: true, result: sprintf('taking %s', join(', ', map(r.files, f => f.name))), begun: true }
+		: { ok: false, result: 'a capture is running here already' });
+
+let made = pcap.plan(ask, have());
+if (made.error)
+	say({ ok: false, result: made.error });
+if (!tcpdump()) {
+	if (fs.access(PACKAGES_TOOL))
+		system(PACKAGES_TOOL + ' get tcpdump-mini >/dev/null 2>&1');
+	if (!tcpdump())
+		say({ ok: false, result: 'tcpdump is not on this AP, and could not be installed (tcpdump-mini)' });
+}
+let seconds = min(max(int(ask.seconds) || 60, 5), 300), snap = max(int(ask.snap) || 0, 0);
+let free = int(match(read('/proc/meminfo') ?? '', /MemAvailable:\s+([0-9]+) kB/)?.[1] ?? '0') * 1024;
+let room = min(int(ask.bytes) || 20971520, int(free / ROOM));
+if (room < LEAST)
+	say({ ok: false, result: 'this AP has too little memory free to take a capture' });
+system(['rm', '-rf', DIR]);
+fs.mkdir(DIR, 0o700);
+let files = [];
+for (let i = 0; i < length(made.files); i++) {
+	let f = made.files[i];
+	push(files, { n: i, name: f.name, side: f.side, note: f.note, sent: 0 });
+}
+// When it began, by the calendar's clock in ms: what the page says of it.
+if (!store(DIR + '/run.sh', pcap.script(DIR, made.files, seconds, room, snap), 0o700)) {
+	system(['rm', '-rf', DIR]);
+	say({ ok: false, result: 'the capture could not be set up in the AP\'s memory' });
+}
+system(`setsid sh ${DIR}/run.sh </dev/null >/dev/null 2>&1 &`);
+// Begun once each tcpdump has its file open, which it has when it is
+// listening, or has given up: looked for every few ms, for a second and a
+// half at the most. How long that was after the AP heard of the capture is
+// said, where it is said when that was.
+for (let waited = 0; waited < READY; waited += 5) {
+	let up = 0;
+	for (let i = 0; i < length(files); i++) {
+		let p = read(`${DIR}/${i}.pid`);
+		if (fs.access(`${DIR}/${i}.pcap`) || (match(p ?? '', /^[0-9]+$/) && !fs.access('/proc/' + p)))
+			up++;
+	}
+	if (up == length(files))
+		break;
+	sleep(5);
+}
+let c = clock();
+let began = c[0] * 1000 + int(c[1] / 1e6), heard = int(ARGV[2] ?? '0');
+let state = { id: id, at: time(), began: began, seconds: seconds, files: files };
+if (heard > 0 && began >= heard && began - heard < 60000)
+	state.took = began - heard;
+if (!store(DIR + '/running', sprintf('%J', state), 0o600)) {
+	for (let n in fs.lsdir(DIR) ?? []) {
+		let p = match(n, /\.pid$/) ? read(DIR + '/' + n) : null;
+		if (match(p ?? '', /^[0-9]+$/))
+			system(['kill', p]);
+	}
+	system(['rm', '-rf', DIR]);
+	say({ ok: false, result: 'the capture could not be set up in the AP\'s memory' });
+}
+say({ pending: true, result: sprintf('taking %s for %d s', join(', ', map(made.files, f => f.name)), seconds) });

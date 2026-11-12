@@ -1,0 +1,32 @@
+C360-AP, lost:
+  { "ago": 259, "driver": "ath11k_pci", "device": "0001:01:00.0", "why": "MHI_CB_EE_RDDM", "lost": true, "failing": false, "radios": [ "radio2" ], "bands": [ ], "scan": true }
+C360-AP, back:
+  { "ago": 259, "driver": "ath11k_pci", "device": "0001:01:00.0", "why": "MHI_CB_EE_RDDM", "lost": false, "failing": false, "radios": [ "radio2" ], "bands": [ ], "scan": true }
+Garage, failing now:
+  { "ago": 30, "driver": "mac80211", "device": "0001:01:00.0", "why": "a hardware restart was asked", "lost": false, "failing": true, "radios": [ "radio2" ], "bands": [ ], "scan": true }
+Garage, quiet 5 min:
+  { "ago": 330, "driver": "mac80211", "device": "0001:01:00.0", "why": "a hardware restart was asked", "lost": false, "failing": false, "radios": [ "radio2" ], "bands": [ ], "scan": true }
+six failed:
+  { "ago": 50, "driver": "ath11k_pci", "device": "0000:01:00.0", "why": "its firmware stopped answering: 6 commands failed", "lost": false, "failing": true, "radios": [ "radio3" ], "bands": [ "6g" ], "scan": false }
+three failed:
+AHB and ath10k:
+  { "ago": 329, "driver": "ath11k", "device": "c000000.wifi", "why": "MHI_CB_EE_RDDM", "lost": false, "failing": false, "radios": [ "radio0", "radio1" ], "bands": [ "5g", "2g" ], "scan": false }
+  { "ago": 29, "driver": "ath10k_pci", "device": "0000:01:00.0", "why": null, "lost": false, "failing": false, "radios": [ "radio3" ], "bands": [ "6g" ], "scan": false }
+phy gone:
+  { "ago": 259, "driver": "ath11k_pci", "device": "0001:01:00.0", "why": "MHI_CB_EE_RDDM", "lost": true, "failing": false, "radios": [ "radio2" ], "bands": [ ], "scan": true }
+rolled out:
+  { "ago": 6259, "driver": "ath11k_pci", "device": "0001:01:00.0", "why": "MHI_CB_EE_RDDM", "lost": true, "failing": false, "radios": [ "radio2" ], "bands": [ ], "scan": true }
+read twice:
+  { "ago": 319, "driver": "ath11k_pci", "device": "0001:01:00.0", "why": "MHI_CB_EE_RDDM", "lost": true, "failing": false, "radios": [ "radio2" ], "bands": [ ], "scan": true }
+a run read in two:
+  { "ago": 20, "driver": "ath11k_pci", "device": "0000:01:00.0", "why": "its firmware stopped answering: 6 commands failed", "lost": false, "failing": true, "radios": [ "radio3" ], "bands": [ "6g" ], "scan": false }
+  kept: [ { "up": 100.0, "last": 115.0, "n": 6, "driver": "ath11k_pci", "device": "0000:01:00.0" } ]
+started again:
+W-318 AHB, back:
+  { "ago": 329, "driver": "remoteproc", "device": "c000000.wifi", "why": "wcnss: fatal error", "lost": false, "failing": false, "radios": [ "radio0", "radio1" ], "bands": [ "5g", "2g" ], "scan": false }
+W-318 AHB, waiting:
+  { "ago": 45, "driver": "remoteproc", "device": "c000000.wifi", "why": "wcnss: fatal error", "lost": false, "failing": true, "radios": [ "radio0", "radio1" ], "bands": [ "5g", "2g" ], "scan": false }
+W-318 AHB, the line alone:
+  { "ago": 5, "driver": "remoteproc", "device": "c000000.wifi", "why": "wcnss: fatal error", "lost": false, "failing": false, "radios": [ "radio0", "radio1" ], "bands": [ "5g", "2g" ], "scan": false }
+W-318 AHB, just restarted:
+  { "ago": 175, "driver": "remoteproc", "device": "c000000.wifi", "why": "wcnss: fatal error", "lost": false, "failing": false, "radios": [ "radio0", "radio1" ], "bands": [ "5g", "2g" ], "scan": false }

@@ -1,0 +1,1141 @@
+/* Aeolus UI (0042), after the mockup: a dark header, a tree on the left, and
+   every value shown with where it comes from. System fonts only: the UI loads
+   nothing from outside the manager. */
+
+:root {
+	--ink: #16191D;
+	--ink-2: #3D4550;
+	--muted: #545B63;
+	--faint: #8A9199;
+	--bg: #F4F5F2;
+	--panel: #FFFFFF;
+	--side: #FBFBF9;
+	--line: #DADDD6;
+	--line-2: #ECEEE9;
+	--accent: #1D6A85;
+	--accent-2: #134C60;
+	--accent-bg: #E3EFF3;
+	--accent-faint: #A5C3CE;
+	--select: #DCEAF0;
+	--lock: #E7E9EC;
+	--lock-ink: #2E353D;
+	--branch: #FBF1DF;
+	--branch-line: #EBCB93;
+	--branch-ink: #6E440C;
+	--ok: #1E7A46;
+	--ok-bg: #E2F3E8;
+	--warn: #8A5A00;
+	--warn-bg: #FBF1DF;
+	--bad: #A3261C;
+	--bad-bg: #FBE6E3;
+	/* What was written in a colour of its own before 0296, a token each so
+	   the dark page can change it. */
+	--line-strong: #C9CEC6;
+	--on-accent: #FFFFFF;
+	--hover: #EEF2EF;
+	--hover-2: #F7F8F5;
+	--branch-strong: #F6E3BF;
+	--bad-ink: #6B1A13;
+	--bad-line: #EDB9B3;
+	--ok-ink: #14532F;
+	--ok-line: #B9DFC7;
+	--chblock-a: #D7E7EE;
+	--chblock-b: #E8E1D2;
+	--map-bg: #E8EEF2;
+	--hatch: rgba(0, 0, 0, 0.08);
+	--hatch-on: rgba(255, 255, 255, 0.45);
+	/* The header: dark on either page, its open tab a pill. */
+	--head: #16191D;
+	--head-ink: #F4F5F2;
+	--head-on: #F4F5F2;
+	--head-on-ink: #16191D;
+	color-scheme: light;
+	/* A chart's series (0294): the reference categorical order, checked for
+	   colour blindness; the first three are the bands' (0166). */
+	--series-1: #2A78D6;
+	--series-2: #EB6834;
+	--series-3: #1BAF7A;
+	--series-4: #EDA100;
+	--series-5: #E87BA4;
+	--series-6: #008300;
+	--series-7: #6250D6;
+	--series-8: #E34948;
+	/* A one-hue scale, from little to much (0294). */
+	--seq-low: #86B6EF;
+	--seq-high: #104281;
+	--sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+	--mono: ui-monospace, "Cascadia Mono", "SF Mono", Menlo, Consolas, monospace;
+}
+
+/* The dark page (0296): theme.js sets data-theme, by what this browser was
+   set to or, where it was not, by the device. Every colour above, stepped
+   for a dark surface; the series are the reference palette's dark column,
+   checked for colour blindness on it. The header and the UCI view are
+   dark on either page. */
+:root[data-theme="dark"] {
+	color-scheme: dark;
+	--ink: #E4E7EB;
+	--ink-2: #C2C8D0;
+	--muted: #9AA3AD;
+	--faint: #6C747D;
+	--bg: #111416;
+	--panel: #1A1E22;
+	--side: #15181B;
+	--line: #30363C;
+	--line-2: #242A2F;
+	--line-strong: #434A52;
+	--accent: #5BB0D0;
+	--accent-2: #8ACBE3;
+	--accent-bg: #16323D;
+	--accent-faint: #2E5D6E;
+	--select: #1B3B48;
+	--on-accent: #0B1A20;
+	--hover: #222830;
+	--hover-2: #1F2429;
+	--lock: #2A3037;
+	--lock-ink: #CFD5DC;
+	--branch: #33291A;
+	--branch-line: #7A5F2C;
+	--branch-ink: #EFC77E;
+	--branch-strong: #4A3A1E;
+	--ok: #4CC38A;
+	--ok-bg: #132A1E;
+	--ok-ink: #A6E6C4;
+	--ok-line: #23573A;
+	--warn: #E3A94B;
+	--warn-bg: #33291A;
+	--bad: #EF7468;
+	--bad-bg: #36191A;
+	--bad-ink: #F6B9B2;
+	--bad-line: #6A2A26;
+	--chblock-a: #1B3440;
+	--chblock-b: #362F22;
+	--map-bg: #1E252B;
+	--hatch: rgba(255, 255, 255, 0.09);
+	--hatch-on: rgba(0, 0, 0, 0.35);
+	--head: #0A0C0E;
+	--head-on: #2A3037;
+	--head-on-ink: #E4E7EB;
+	--series-1: #3987E5;
+	--series-2: #D95926;
+	--series-3: #199E70;
+	--series-4: #C98500;
+	--series-5: #D55181;
+	--series-6: #008300;
+	--series-7: #9085E9;
+	--series-8: #E66767;
+	--seq-low: #1C5CAB;
+	--seq-high: #9EC5F4;
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; }
+body { background: var(--bg); color: var(--ink); font: 15px/1.45 var(--sans); }
+a { color: var(--accent); text-decoration: none; }
+a:hover { color: var(--accent-2); text-decoration: underline; }
+button { font: inherit; }
+code, .mono { font-family: var(--mono); font-size: 14px; }
+.loading { padding: 32px; color: var(--muted); }
+
+/* Frame */
+#app { display: flex; flex-direction: column; min-height: 100%; }
+header.top { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 28px; min-height: 60px; padding: 8px 24px; background: var(--head); color: var(--head-ink); flex-shrink: 0; }
+.brand { display: flex; align-items: baseline; gap: 12px; }
+.brand b { font-size: 18px; letter-spacing: 0.12em; }
+.brand span { font-size: 14px; color: #BFC5CB; }
+.brand .release { font-size: 12px; color: #8E969E; font-family: var(--mono); }
+nav.tabs { display: flex; gap: 4px; }
+nav.tabs a { padding: 8px 14px; border-radius: 8px; color: #C9CED3; font-weight: 500; }
+nav.tabs a:hover { text-decoration: none; color: #FFFFFF; }
+nav.tabs a.on { background: var(--head-on); color: var(--head-on-ink); }
+.spacer { flex-grow: 1; }
+.who { display: flex; align-items: center; gap: 14px; font-size: 14px; color: #BFC5CB; }
+/* The header's Find (0284). */
+form.find input { height: 34px; width: 18em; max-width: 30vw; padding: 0 10px; border: 1px solid #3D4550; border-radius: 8px; background: #2E353D; color: #F4F5F2; font: inherit; font-size: 14px; }
+form.find input::placeholder { color: #AEB4BA; }
+.who button { border: 1px solid #3D4550; background: none; color: #E4E7EA; border-radius: 8px; padding: 5px 10px; cursor: pointer; }
+/* Light, dark or as the device is (0296): on the header's dark ground on
+   either page. */
+.who select.themepick { height: 30px; border: 1px solid #3D4550; background: #2E353D; color: #E4E7EA; font-size: 13px; color-scheme: dark; }
+.body { display: flex; flex-grow: 1; min-height: 0; }
+aside.tree { width: 290px; flex-shrink: 0; padding: 18px 10px; border-right: 1px solid var(--line); background: var(--side); overflow: auto; }
+main { flex-grow: 1; min-width: 0; padding: 26px 34px 48px; display: flex; flex-direction: column; gap: 18px; overflow: auto; }
+main.wide { max-width: none; }
+
+/* Tree */
+.tree-apart { margin-bottom: 14px; padding-bottom: 10px; border-bottom: 1px solid var(--line); }
+.tree-title { padding: 0 10px 10px; font-size: 12px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+.tree a { display: flex; align-items: center; gap: 8px; min-height: 36px; padding: 0 10px 0 calc(10px + var(--depth, 0) * 16px); border-radius: 8px; color: var(--ink); }
+.tree a:hover { background: var(--hover); text-decoration: none; }
+.tree a.on { background: var(--select); font-weight: 600; }
+.tree a.branch { color: var(--branch-ink); }
+.tree a.branch.on { background: var(--branch-strong); }
+.tree a .name { flex-grow: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tree svg { flex-shrink: 0; }
+/* A folder's switch for its APs in the tree, at the row's right end. */
+.tree .treerow { position: relative; }
+.tree .treerow > a { padding-right: 64px; }
+.tree .aptoggle { position: absolute; right: 8px; top: 50%; transform: translateY(-50%); display: inline-flex; align-items: center; gap: 4px; height: 22px; padding: 0 7px; border-radius: 999px; border: 1px solid var(--line); background: var(--panel); color: var(--muted); font-size: 12px; cursor: pointer; }
+.tree .aptoggle[aria-pressed="true"] { background: var(--accent-bg); border-color: transparent; color: var(--accent); }
+.tree .aptoggle:hover { border-color: var(--accent); }
+.tree .aptoggle svg { width: 14px; height: 14px; }
+.dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+.dot.ok { background: var(--ok); }
+.dot.warn { background: #D29A1E; }
+.dot.bad { background: var(--bad); }
+.dot.idle { background: var(--faint); }
+
+/* Page head */
+.crumbs { display: flex; flex-wrap: wrap; gap: 6px; font-size: 14px; color: var(--faint); }
+.head { display: flex; align-items: flex-start; justify-content: space-between; gap: 24px; }
+.head h1 { margin: 2px 0 4px; font-size: 30px; font-weight: 600; letter-spacing: -0.01em; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.sub { color: var(--muted); }
+
+/* Chips */
+.chip { display: inline-flex; align-items: center; gap: 6px; height: 26px; padding: 0 10px; border-radius: 999px; font-size: 12px; font-weight: 500; white-space: nowrap; border: 1px solid transparent; }
+a.chip:hover { text-decoration: none; filter: brightness(0.97); }
+.chip.here { background: var(--accent); color: var(--on-accent); }
+.chip.from { background: var(--panel); border-color: var(--line-strong); color: var(--accent); }
+.chip.locked { background: var(--lock); color: var(--lock-ink); }
+.chip.lockhere { background: var(--lock-ink); color: var(--panel); }
+.chip.baseline { background: var(--branch); border-color: var(--branch-line); color: var(--branch-ink); }
+.chip.template { background: var(--panel); border-color: var(--branch-line); border-style: dashed; color: var(--branch-ink); }
+.chip.break { background: var(--branch-strong); color: var(--branch-ink); font-weight: 600; letter-spacing: 0.04em; }
+.chip.ok { background: var(--ok-bg); color: var(--ok); }
+.chip.warn { background: var(--warn-bg); color: var(--warn); }
+.chip.bad { background: var(--bad-bg); color: var(--bad); }
+/* Kept on one line: a time, a signal, a place (0340). */
+.nowrap { white-space: nowrap; }
+/* Steering that no longer applies, as to a pinned client (0340). */
+.chip.off { background: var(--panel); border-color: var(--line); color: var(--muted); text-decoration: line-through; opacity: 0.7; }
+/* Why clients left (0255): a band a line, its kinds as chips. */
+.leaveband { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 4px 20px; }
+.chip.idle { background: var(--line-2); color: var(--ink-2); }
+
+/* Panels */
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
+.panel > h2 { margin: 0; padding: 14px 20px 10px; font-size: 13px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); display: flex; justify-content: space-between; gap: 12px; }
+.panel > h2 .note { text-transform: none; letter-spacing: 0; font-weight: 400; }
+.panel .empty { padding: 4px 20px 16px; color: var(--muted); }
+/* What is on the APs and not Aeolus's (0137): dull, as nothing in it is Aeolus's to change. */
+.panel.foreign { background: none; border-style: dashed; }
+.panel.foreign table.list td, .panel.foreign table.list td a { color: var(--muted); }
+.panel.foreign table.list td a { text-decoration-color: var(--line); }
+.panel.foreign .chip { margin-left: 6px; }
+.panel.foreign .preview.testform .row { padding-left: 0; padding-right: 0; min-height: 38px; }
+.panel.foreign .preview.testform label.tick { margin-right: 14px; font-family: inherit; }
+.panel.foreign td.rowacts .button + .button { margin-left: 6px; }
+.grid2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; align-items: start; }
+.col { display: flex; flex-direction: column; gap: 18px; min-width: 0; }
+@media (max-width: 1100px) { .grid2 { grid-template-columns: minmax(0, 1fr); } }
+
+.row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; min-height: 46px; padding: 6px 20px; border-top: 1px solid var(--line-2); }
+.row .label { width: 150px; flex-shrink: 0; color: var(--muted); font-size: 14px; }
+.row .value { flex-grow: 1; flex-basis: 8em; min-width: 8em; font-family: var(--mono); font-size: 14px; overflow-wrap: anywhere; }
+.row .value.sealed { color: var(--muted); }
+
+table.list { width: 100%; border-collapse: collapse; font-size: 14px; }
+table.list th { text-align: left; font-size: 13px; font-weight: 600; color: var(--muted); padding: 8px 20px; border-top: 1px solid var(--line-2); }
+table.list td { padding: 10px 20px; border-top: 1px solid var(--line-2); vertical-align: top; }
+table.list td.mono { font-family: var(--mono); }
+table.list th.num, table.list td.num { text-align: right; font-variant-numeric: tabular-nums; }
+/* A right-aligned last column leaves room for the table's column menu. */
+table.list th.num:last-child, table.list td.num:last-child { padding-right: 52px; }
+table.list tr.sel td { background: var(--accent-bg); }
+/* A maker that does not get on with a kind of AP (0193). */
+table.list.compat td { padding: 6px 20px; }
+table.list.compat td.num { text-align: right; }
+table.list.compat tr.warn td { background: var(--warn-bg); }
+.compat-trouble { margin: 4px 0; }
+table.list th.sortable { cursor: pointer; user-select: none; }
+/* A table fitted by whoever looks at it (tables.js): a grip at the right
+   edge of each heading, dragged to make its column wider or narrower; and
+   a small menu on the heading row, to hide or show columns. */
+table.list th { position: relative; }
+table.list .colgrip { position: absolute; top: 0; right: 0; width: 9px; height: 100%; cursor: col-resize; touch-action: none; }
+table.list .colgrip::after { content: ''; position: absolute; top: 20%; bottom: 20%; right: 3px; width: 2px; border-radius: 1px; background: transparent; }
+table.list tr:hover .colgrip::after { background: var(--line); }
+table.list .colgrip:hover::after, table.list.fitting .colgrip::after { background: var(--accent); }
+table.list.fitting { user-select: none; cursor: col-resize; }
+table.list.fitted td, table.list.fitted th { overflow-wrap: anywhere; }
+table.list .colmenu { position: absolute; top: 50%; right: 14px; transform: translateY(-50%); height: 22px; min-width: 26px; padding: 0 6px; border: 1px solid transparent; border-radius: 6px; background: var(--panel); color: var(--muted); font: inherit; font-size: 14px; line-height: 1; cursor: pointer; opacity: 0.35; }
+table.list tr:hover .colmenu, table.list .colmenu:focus-visible, table.list .colmenu.on { opacity: 1; border-color: var(--line); }
+.colpop { position: fixed; z-index: 30; display: flex; flex-direction: column; gap: 8px; min-width: 180px; max-height: 70vh; overflow-y: auto; padding: 12px 14px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); box-shadow: 0 6px 24px rgba(0, 0, 0, 0.14); text-transform: none; letter-spacing: 0; font-weight: 400; font-size: 14px; color: var(--ink); text-align: left; cursor: default; }
+.colpop label { display: flex; align-items: center; gap: 10px; white-space: nowrap; }
+.colpop .button { align-self: flex-start; margin-top: 4px; }
+table.list.clients td { padding: 6px 14px; }
+table.list.clients th { padding: 8px 14px; }
+.filters { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 4px 20px 12px; }
+/* Live Trace (0144): where the client is heard now, and the line of what
+   each AP saw of it, which scrolls by itself and stays at its end. */
+.filters.traceany { padding-top: 10px; border-top: 1px solid var(--line-2); }
+.tracewhere { display: flex; flex-wrap: wrap; gap: 6px; padding: 2px 20px 10px; }
+.tracelog { max-height: 460px; overflow-y: auto; border-top: 1px solid var(--line-2); }
+.tracelog table.list th { position: sticky; top: 0; background: var(--panel); z-index: 1; border-top: 0; }
+.tracelog tr.heardrow td { color: var(--muted); }
+.tracelog tr.movedrow td { border-top: 2px solid var(--accent); }
+.tracelog tr.failed td { color: var(--bad); }
+.tracefoot { display: flex; align-items: center; gap: 18px; padding: 10px 20px 12px; }
+.tracefoot label { display: inline-flex; align-items: center; gap: 8px; font-size: 14px; }
+.filters input[type=search] { height: 34px; padding: 0 10px; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--panel); font: inherit; font-size: 14px; color: var(--ink); min-width: 14em; }
+
+/* Banners and states */
+.banner { display: flex; gap: 14px; align-items: flex-start; padding: 14px 18px; border-radius: 12px; font-size: 14px; }
+.banner.branch { background: var(--branch); border: 1px solid var(--branch-line); color: var(--branch-ink); }
+.banner.problems { background: var(--bad-bg); border: 1px solid var(--bad-line); color: var(--bad-ink); flex-direction: column; gap: 6px; }
+.banner.problems ul { margin: 0; padding-left: 18px; }
+.banner.info { background: var(--panel); border: 1px solid var(--line); color: var(--muted); }
+.error { padding: 16px 18px; border-radius: 12px; background: var(--bad-bg); color: var(--bad-ink); }
+
+.status { display: flex; align-items: center; gap: 18px; padding: 18px 20px; }
+.status .big { font-size: 20px; font-weight: 600; }
+.status .detail { color: var(--muted); font-size: 14px; }
+.kv { display: grid; grid-template-columns: 150px minmax(0, 1fr); gap: 8px 12px; padding: 4px 20px 16px; font-size: 14px; }
+.kv dt { color: var(--muted); }
+.kv dd { margin: 0; font-family: var(--mono); overflow-wrap: anywhere; }
+
+/* Overrides menu */
+.menu { position: relative; flex-shrink: 0; }
+.menu > button { display: flex; align-items: center; gap: 10px; height: 42px; padding: 0 14px 0 16px; border: 1px solid var(--line-strong); border-radius: 10px; background: var(--panel); font-weight: 500; cursor: pointer; }
+.count { min-width: 24px; height: 24px; padding: 0 7px; border-radius: 999px; background: var(--accent); color: var(--on-accent); font-size: 13px; font-weight: 600; display: inline-flex; align-items: center; justify-content: center; }
+.menu .drop { position: absolute; right: 0; top: 100%; margin-top: 6px; width: 440px; max-height: 520px; overflow: auto; padding: 8px; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; box-shadow: 0 16px 40px rgba(22, 25, 29, 0.16); z-index: 20; }
+.menu .drop[hidden] { display: none; }
+.menu .drop h3 { margin: 0; padding: 8px 12px 4px; font-size: 12px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+.menu .drop a { display: block; padding: 8px 12px; border-radius: 8px; color: var(--ink); }
+.menu .drop a:hover { background: var(--hover); text-decoration: none; }
+.menu .drop small { display: block; color: var(--muted); font-size: 13px; }
+
+/* History */
+details { border-top: 1px solid var(--line-2); }
+details > summary { list-style: none; cursor: pointer; display: flex; align-items: center; gap: 12px; padding: 10px 20px; font-size: 14px; }
+details > summary::-webkit-details-marker { display: none; }
+details > summary:hover { background: var(--hover-2); }
+details .when { width: 170px; flex-shrink: 0; color: var(--muted); }
+details .grow { flex-grow: 1; min-width: 0; }
+pre.uci { margin: 0; padding: 14px 20px; max-height: 480px; overflow: auto; background: #1E2227; color: #E6E8EA; font: 13px/1.5 var(--mono); }
+details ul.problems { margin: 0; padding: 4px 20px 12px 38px; color: var(--bad-ink); font-size: 14px; }
+
+/* A list that opens by the arrow beside its name: each AP's channels on
+   the Ratings page (Griff, 2026-10-10). */
+details.fold > summary::before { content: ''; width: 7px; height: 7px; flex-shrink: 0; margin: 0 4px 0 2px; border-right: 2px solid var(--muted); border-bottom: 2px solid var(--muted); transform: rotate(-45deg); transition: transform 0.12s; }
+details.fold[open] > summary::before { transform: rotate(45deg); }
+/* The name a line is of. It is not the top bar's .who, whose pale colour is
+   for a dark ground: here it is ink. */
+details.fold > summary .who { display: inline; font-weight: 600; min-width: 150px; font-size: inherit; color: var(--ink); }
+details .when.short { width: 84px; }
+/* Where the line is narrow the oldest marks go: none is made thinner. */
+.marks.inline { display: inline-flex; gap: 2px; min-width: 0; overflow: hidden; justify-content: flex-end; margin-right: 6px; }
+.marks.inline .mark { flex: none; width: 5px; height: 14px; border-radius: 1px; background: var(--line); }
+.marks.inline .mark.ok { background: var(--ok, #2e8b57); }
+.marks.inline .mark.bad { background: var(--bad, #c0392b); }
+/* The APs that test, a line each; and how a round is going. */
+table.testers td { padding: 7px 20px 7px 0; }
+table.testers td:first-child { padding-left: 20px; font-weight: 600; width: 190px; }
+.roundline { padding: 0 20px 12px; margin: 0; }
+/* An AP's state in a line; and the two halves of what is seldom asked. */
+.status { flex-wrap: wrap; row-gap: 6px; }
+.status .grow { flex: 1 1 240px; }
+/* A report from a while ago: its tiles are paler, and say when. */
+.tilesnote { margin: 0 0 6px; }
+.tiles.stale .tile { opacity: 0.6; }
+.tile .tbig { white-space: nowrap; }
+.tile .tsub { overflow-wrap: anywhere; }
+/* A list whose last cell may run long, as what came of an action. */
+table.list.wraps td { white-space: normal; overflow-wrap: anywhere; }
+table.list.wraps .chip { white-space: normal; height: auto; }
+.grid2.inpanel { padding: 0 0 12px; margin: 0; }
+/* A panel that is a log: closed until asked for. */
+details.logpanel > summary { list-style: none; cursor: pointer; display: flex; padding: 0; }
+details.logpanel > summary::-webkit-details-marker { display: none; }
+details.logpanel > summary h2 { flex: 1; margin: 0; padding: 14px 20px 10px; font-size: 13px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); display: flex; justify-content: flex-start; align-items: center; gap: 12px; }
+details.logpanel > summary h2 .note { text-transform: none; letter-spacing: 0; font-weight: 400; margin-left: auto; }
+details.logpanel > summary h2::before { content: ''; width: 7px; height: 7px; flex-shrink: 0; align-self: center; margin: 0 2px 0 2px; border-right: 2px solid var(--muted); border-bottom: 2px solid var(--muted); transform: rotate(-45deg); transition: transform 0.12s; }
+details.logpanel[open] > summary h2::before { transform: rotate(45deg); }
+/* Panels inside one, as a folder's settings in a fold, are not boxes in a box. */
+details.logpanel > .grid2 { padding: 0 0 6px; gap: 0 18px; }
+details.logpanel > .grid2 .panel { border: 0; border-radius: 0; background: none; }
+details.logpanel > .banner { margin: 0 20px 16px; }
+details.fold > summary .who .note { font-weight: 400; color: var(--muted); margin-left: 6px; }
+/* A heading with buttons: they sit level with it, and wrap below it where the page is narrow. */
+.panel > h2.withcontrols { align-items: center; flex-wrap: wrap; }
+.panel > h2.withcontrols .controls { flex-wrap: wrap; justify-content: flex-end; }
+.panel > h2 .segmented { flex-shrink: 0; }
+details.fold > summary a { flex-shrink: 0; font-size: 13px; }
+details.fold > table.list { margin-bottom: 8px; }
+.panel > details.fold:first-of-type { border-top: 0; }
+
+/* A client's connections (0118): each attempt a line that opens, its stages
+   in a row, then its steps. */
+.subhead { margin: 0; padding: 14px 20px 8px; font-size: 13px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); display: flex; justify-content: space-between; gap: 12px; border-top: 1px solid var(--line-2); }
+.subhead .note { text-transform: none; letter-spacing: 0; font-weight: 400; }
+.attempt { padding: 2px 20px 6px 38px; }
+/* The way online, a point at a time (0130): drawn as a tunnel's path is. */
+.way { container-type: inline-size; margin: 4px 0 12px; }
+.way .path .hop .main, .way .path .hop .sub { white-space: nowrap; }
+.way > .sub { margin-top: 6px; }
+/* A point's parts under it (0133): the four messages of the key handshake. */
+.way .path .hop .parts { display: inline-flex; flex-wrap: wrap; gap: 4px; margin: 2px 0 1px; }
+.way .path .hop .part { font-family: var(--mono); font-size: 11px; line-height: 16px; padding: 0 5px; border: 1px solid var(--line); border-radius: 4px; color: var(--muted); white-space: nowrap; }
+.way .path .hop .part b { font-weight: 600; margin-right: 1px; }
+.way .path .hop .partsmore { display: block; }
+.way .path .hop .part.ok { border-color: var(--ok); color: var(--ink); }
+.way .path .hop .part.warn { border-color: var(--warn); color: var(--ink); }
+.way .path .hop .part.bad { border-color: var(--bad); background: var(--bad-bg); color: var(--bad-ink); }
+@container (min-width: 520px) {
+	.way .path .hop { padding: 3px 8px 4px; }
+	.way .path .leg { width: 12px; margin: 0 8px 0 1px; }
+}
+.attempt .why { margin: 0 0 10px; font-size: 14px; }
+.attempt .why.bad { color: var(--bad-ink); font-weight: 600; }
+.attempt table.steps { margin: 0 0 8px; }
+.attempt table.steps td, .attempt table.steps th { padding: 6px 16px 6px 0; }
+.attempt table.steps td:first-child, .attempt table.steps td:nth-child(2) { white-space: nowrap; }
+.attempt table.steps tr.failed td { background: var(--bad-bg); }
+.attemptlinks { padding: 0 20px 10px 38px; margin: 0; }
+/* A window that floats over the page (0149): a client's Live Trace, watched
+   while the page under it is worked on. Moved by its heading, sized by its
+   corner. */
+.float { position: fixed; display: flex; flex-direction: column; min-width: 420px; min-height: 200px; max-width: calc(100vw - 16px); max-height: calc(100vh - 16px); resize: both; overflow: hidden; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; box-shadow: 0 14px 44px rgba(0, 0, 0, 0.28); }
+.float > .floatbody { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.float .panel { flex: 1; min-height: 0; display: flex; flex-direction: column; margin: 0; border: 0; border-radius: 0; box-shadow: none; background: none; overflow: auto; }
+.float .panel > h2 { cursor: move; user-select: none; touch-action: none; flex-shrink: 0; }
+.float .panel.trace { overflow: hidden; }
+.float .tracelog { flex: 1; min-height: 60px; max-height: none; }
+.float .tracewhere, .float .tracefoot { flex-shrink: 0; }
+/* A table with more columns than its panel is wide is scrolled across. */
+.widetable { overflow-x: auto; }
+/* The list of clients scrolls in a box no taller than the window leaves
+   it, so that its scrollbar across is always in sight (Griff, 2026-10-15:
+   "you cant slide right until you get to the bottom"). Its headings and
+   each client's name stay where they are while it scrolls. */
+.widetable.clientsbox { max-height: max(320px, calc(100vh - 300px)); overflow: auto; }
+.widetable.scrollbox { max-height: max(360px, calc(100vh - 320px)); overflow: auto; }
+/* A client's Activity (0337): a window about 20 lines tall, its scroll bar
+   always there down its side. */
+.widetable.scrollbox.attemptsbox { max-height: min(640px, max(320px, calc(100vh - 240px))); overflow-y: scroll; overflow-x: auto; }
+.scrollbox table thead th, .scrollbox table tr:first-child th { position: sticky; top: 0; z-index: 2; background: var(--panel); }
+.clientsbox table.list.clients tr:first-child th { position: sticky; top: 0; z-index: 2; background: var(--panel); }
+.clientsbox table.list.clients td:first-child, .clientsbox table.list.clients th:first-child { position: sticky; left: 0; z-index: 1; background: var(--panel); }
+.clientsbox table.list.clients tr:first-child th:first-child { z-index: 3; }
+/* A client's own buttons in one line, small ("The buttons take up too much
+   space"). */
+table.list.clients .rowbuttons { flex-wrap: nowrap; gap: 4px; }
+table.list.clients .rowbuttons .button.small { padding: 2px 7px; font-size: 12px; white-space: nowrap; }
+/* What a client asks for most, in the list of clients (0154). */
+td.asks { font-size: 13px; line-height: 1.35; }
+/* A client's lookups (0154): the domains it asks for most, a bar each, and
+   the names under them. */
+.float .panel.lookups { overflow: auto; }
+/* The packet viewer (0341): the list over the tree and the bytes. */
+.float .panel.packets { overflow: hidden; }
+.packets > h2 input[type=search] { width: 260px; font-size: 13px; }
+.packets > h2 .grow { flex: 1; }
+.pktlist { flex: 1 1 45%; min-height: 110px; overflow: auto; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); outline: none; }
+table.pkts { width: 100%; }
+table.pkts td, table.pkts th { white-space: nowrap; padding-top: 2px; padding-bottom: 2px; font-size: 12px; }
+table.pkts td.mono { font-size: 12px; }
+table.pkts thead th { position: sticky; top: 0; background: var(--panel); z-index: 1; }
+table.pkts tbody tr { cursor: default; }
+table.pkts tr.bad td { background: var(--bad-bg); }
+table.pkts tr.key td { background: var(--branch); }
+table.pkts tr.addr td { background: var(--ok-bg); }
+table.pkts tr.pktcur td { background: var(--select); font-weight: 600; }
+.pktlower { flex: 1 1 55%; min-height: 110px; display: flex; overflow: hidden; }
+.pkttree { flex: 1; min-width: 0; overflow: auto; padding: 6px 10px; font-size: 12px; border-right: 1px solid var(--line); }
+.pktlayer { margin-bottom: 4px; }
+.pktlayer > summary { font-weight: 600; cursor: pointer; }
+.pktlayer .pktfield, .pktlayer .pktsub { margin-left: 16px; }
+.pktsub > summary { list-style-position: outside; }
+.pktsub > summary { font-size: 12px; cursor: pointer; }
+.pktsub > summary .pktfield { display: inline; margin-left: 0; }
+.pktsub .pktfield { margin-left: 16px; }
+.pktfield { cursor: pointer; padding: 0 4px; border-radius: 3px; overflow-wrap: anywhere; }
+.pktfield .k { color: var(--muted); }
+.pktfield.on { background: var(--accent); color: var(--on-accent); }
+.pktfield.on .k { color: inherit; }
+.pkthex { flex: 0 0 auto; overflow: auto; margin: 0; padding: 6px 10px; font-family: var(--mono); font-size: 12px; line-height: 1.45; }
+.pkthex .off { color: var(--muted); }
+.pkthex span.on { background: var(--accent); color: var(--on-accent); }
+.places { display: grid; grid-template-columns: minmax(120px, max-content) 1fr max-content; gap: 5px 10px; align-items: center; padding: 2px 16px 12px; }
+.place { display: contents; }
+.place .pname { font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 280px; }
+.place .pbar { height: 10px; background: var(--line-2); border-radius: 5px; overflow: hidden; }
+.place .pbar span { display: block; height: 100%; background: var(--accent); border-radius: 5px; }
+.place .pnum { font-size: 12px; color: var(--muted); text-align: right; font-variant-numeric: tabular-nums; }
+.panel.lookups .subhead input[type=search] { margin-left: auto; font: inherit; font-size: 13px; padding: 3px 8px; width: 160px; }
+.panel.lookups td .chip { margin-left: 6px; }
+/* A capture someone starts (0148): what to take, in a row that wraps. */
+.captureform { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 26px; padding: 4px 20px 16px; }
+.captureform > label { display: inline-flex; align-items: center; gap: 10px; font-size: 14px; }
+.captureform .lab { color: var(--muted); font-size: 13px; }
+.captureform .of { display: inline-flex; }
+.captureform input.short { width: 90px; }
+.captureform .ticks { margin: 0; display: inline-flex; }
+.panel.capture table.list td .button.small { margin-right: 6px; }
+/* Where an attempt's AP is in Locations (0147), beside its name. */
+details.fold > summary .place { min-width: 150px; flex-shrink: 0; }
+/* An attempt's capture, nested in it: a line that opens to its frames. */
+.attempt details.fold.nested { border: 1px solid var(--line-2); border-radius: 8px; margin: 10px 0 4px; }
+.attempt details.fold.nested > summary { padding: 8px 12px; }
+.capframes { padding: 0 12px 8px 30px; overflow-x: auto; }
+.capframes table.steps td:nth-child(5) { white-space: normal; }
+details.fold > summary .capture { flex-shrink: 0; font-size: 13px; }
+details.fold > summary .capture.busy { color: var(--muted); cursor: default; }
+details.fold > summary .capture.bad { color: var(--bad-ink); }
+/* How a thing tested did over the day (0123): a mark a test, oldest first. */
+.runs { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 2px 0 10px; }
+.runs .marks { display: inline-flex; flex-wrap: wrap; gap: 2px; }
+.runs .mark { width: 8px; height: 16px; border-radius: 2px; background: var(--line); }
+.runs .mark.ok { background: var(--ok, #2e8b57); }
+.runs .mark.bad { background: var(--bad, #c0392b); }
+/* A client test (0121): its form, and what it measured, a line each. */
+.testform .row { border-top: 0; }
+.testform .row[hidden] { display: none; }
+.testform .row .value { font-family: inherit; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.testform > .sub { padding: 0 20px 6px; }
+.testform > .actions { padding: 4px 20px 14px; }
+.testfound .row { padding: 4px 0; min-height: 0; border-top: 0; }
+.testfound .row .label { width: 90px; }
+.testfound { margin: 0 0 10px; }
+.attempt .attemptlinks { padding: 0 0 10px; }
+.testother { margin-left: -18px; }
+p.pad { padding: 4px 20px 16px; margin: 0; }
+/* A row of chips under a panel's heading: counts (0157). */
+.chiprow { display: flex; flex-wrap: wrap; gap: 6px; padding: 4px 20px 16px; }
+.chiprow.flush { padding: 6px 0; }
+/* How many of a kind of rotating address over a day, and where and when a device was heard (0158). */
+.spark { display: block; width: 120px; height: 22px; }
+.spark rect { fill: var(--accent); opacity: 0.7; }
+.loadline { width: 160px; height: 26px; }
+.loadline .busy { fill: none; stroke: var(--accent); stroke-width: 1.5; }
+.loadline .peak { fill: none; stroke: var(--accent); stroke-width: 1; opacity: 0.35; }
+.loadline .half { stroke: var(--line-2); stroke-dasharray: 2 3; }
+.radiochips { display: inline-flex; flex-wrap: wrap; gap: 6px; }
+/* A radio's power and noise floor, under its channel on the APs tab. */
+.floor { font-size: 12px; margin-top: 3px; padding-left: 2px; }
+.floor .warn { color: var(--warn); font-weight: 600; }
+.sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+.chip.radio .mono { font-family: var(--mono); font-size: inherit; font-weight: 600; }
+a.chip.radio { text-decoration: none; }
+a.chip.radio:hover, a.chip.radio:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+td.rowacts { text-align: right; white-space: nowrap; }
+td.rowacts .button { margin-left: 6px; opacity: 0.75; }
+td.rowacts .button:hover, td.rowacts .button:focus-visible { opacity: 1; }
+td.rowacts .button:disabled, td.rowacts .button:disabled:hover { opacity: 0.4; cursor: default; }
+
+/* An AP's health (0119): its processor and memory as two lines. */
+td.nowrap { white-space: nowrap; }
+
+/* Changes */
+.change { display: grid; grid-template-columns: 70px 170px 110px minmax(0, 1fr); gap: 12px; padding: 10px 20px; border-top: 1px solid var(--line-2); font-size: 14px; align-items: baseline; }
+.change .seq { font-family: var(--mono); color: var(--muted); }
+.change .what { font-family: var(--mono); overflow-wrap: anywhere; }
+.change .why { color: var(--muted); grid-column: 4; }
+.more { padding: 12px 20px; border-top: 1px solid var(--line-2); }
+.more button, .button { border: 1px solid var(--line-strong); background: var(--panel); border-radius: 8px; padding: 7px 14px; cursor: pointer; color: var(--ink); }
+
+/* Editing (M6 part 2) */
+.controls { display: flex; gap: 8px; align-items: center; margin-left: auto; }
+select { height: 34px; padding: 0 8px; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--panel); font: inherit; font-size: 14px; color: var(--ink); }
+nav.pagetabs { display: flex; flex-wrap: wrap; gap: 2px; border-bottom: 1px solid var(--line); margin: 4px 0 16px; }
+nav.pagetabs a { padding: 10px 16px; color: var(--muted); font-weight: 500; border-bottom: 2px solid transparent; margin-bottom: -1px; }
+nav.pagetabs a:hover { text-decoration: none; color: var(--ink); }
+nav.pagetabs a.on { color: var(--ink); border-bottom-color: var(--accent); }
+nav.subtabs { display: flex; gap: 6px; margin: 0 0 16px; }
+nav.subtabs a { padding: 5px 12px; border-radius: 8px; border: 1px solid var(--line); color: var(--muted); font-size: 14px; }
+nav.subtabs a:hover { text-decoration: none; color: var(--ink); }
+nav.subtabs a.on { background: var(--accent-bg); border-color: var(--accent); color: var(--ink); }
+/* A tab row with the page's band picker at its right (0284): the picker
+   governs every radio number on the page. */
+.tabrow { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 6px 16px; border-bottom: 1px solid var(--line); margin: 4px 0 16px; }
+.tabrow > nav.pagetabs { border-bottom: 0; margin: 0; flex: 1 1 auto; }
+.tabrow > .segmented { margin-bottom: 6px; }
+.tabrow.sub { border-bottom: 0; align-items: center; margin: 0 0 16px; }
+.tabrow.sub > nav.subtabs { margin: 0; flex: 1 1 auto; flex-wrap: wrap; }
+.tabrow.sub > .segmented { margin: 0; }
+.bands { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; align-items: start; }
+.panel.band.none h2 { color: var(--muted); }
+.panel.band .row .label { width: 90px; }
+.chip.band { background: var(--accent-bg); color: var(--ink); }
+.chip.band.none { background: transparent; border: 1px dashed var(--line); color: var(--muted); }
+
+/* A tunnel's path (path.js): hops joined by legs, each coloured by the
+   probes. Down the card like a rail; across where there is room. */
+.pathbox { padding: 8px 20px 10px; border-top: 1px solid var(--line-2); container-type: inline-size; }
+.pathbox > .label { color: var(--muted); font-size: 14px; margin: 2px 0 4px; }
+.pathbox > .label + .path { margin-bottom: 6px; }
+.pathbox .origins { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; margin-top: 6px; }
+.pathbox .origins .origin { display: inline-flex; align-items: center; gap: 6px; margin-right: 8px; }
+.path { display: flex; flex-direction: column; align-items: flex-start; --c: var(--line); }
+.path .hop { display: flex; align-items: baseline; flex-wrap: wrap; column-gap: 8px; position: relative; padding-left: 22px; min-height: 22px; }
+.path .hop::before { content: ''; position: absolute; left: 2px; top: 5px; width: 12px; height: 12px; border-radius: 50%; border: 2px solid var(--c); background: var(--panel); }
+.path .hop.start::before { border-color: var(--faint); }
+.path .hop .top { width: 50px; flex-shrink: 0; font-size: 11px; letter-spacing: 0.05em; text-transform: uppercase; color: var(--muted); }
+.path .hop .main { font-family: var(--mono); font-size: 13px; color: var(--ink); }
+.path .hop .sub { font-size: 12px; color: var(--muted); }
+.path .leg { width: 2px; height: 10px; margin: -2px 0 -2px 9px; background: var(--c); }
+.path .ok { --c: var(--ok); }
+.path .warn { --c: var(--warn); }
+.path .bad { --c: var(--bad); }
+.path .hop.ok::before, .path .hop.warn::before, .path .hop.bad::before { background: var(--c); }
+@container (min-width: 520px) {
+	.path { flex-direction: row; flex-wrap: wrap; align-items: center; row-gap: 8px; }
+	.path .hop { flex-direction: column; align-items: flex-start; padding: 3px 10px 4px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); min-height: 0; }
+	.path .hop.ok, .path .hop.warn, .path .hop.bad { border-color: var(--c); }
+	.path .hop::before { display: none; }
+	.path .hop .top { width: auto; }
+	.path .leg { position: relative; width: 26px; height: 2px; margin: 0 9px 0 2px; }
+	.path .leg::after { content: ''; position: absolute; right: -7px; top: -4px; border-style: solid; border-width: 5px 0 5px 8px; border-color: transparent transparent transparent var(--c); }
+}
+.lead { margin: 0 0 12px; }
+.fieldform { padding: 4px 20px 16px; }
+.fieldform h3 { margin: 14px 0 6px; font-size: 12px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+.fieldform .fields { display: flex; flex-direction: column; gap: 8px; margin: 6px 0 10px; }
+.fieldform details summary { cursor: pointer; color: var(--muted); margin: 10px 0 4px; }
+.fieldform .actions { display: flex; gap: 8px; flex-wrap: wrap; margin: 10px 0; }
+.fieldform .error:empty { display: none; }
+label.field[hidden] { display: none; }
+label.field { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+label.field > .label { width: 170px; flex-shrink: 0; color: var(--muted); font-size: 14px; }
+/* A field's whole description, pointed at; its hint under it; a section's
+   intro under its title (Griff, 2026-10-23). */
+label.field > .label.described { cursor: help; text-decoration: underline dotted var(--line-2); text-underline-offset: 3px; }
+label.field > .hint { flex-basis: 100%; box-sizing: border-box; margin: -4px 0 2px; padding-left: 182px; color: var(--muted); font-size: 12.5px; line-height: 1.4; }
+label.field > .hint > span { display: block; max-width: 560px; }
+.fieldform p.intro { margin: -2px 0 8px; max-width: 740px; color: var(--muted); font-size: 13px; line-height: 1.45; }
+@media (max-width: 640px) { label.field > .hint { padding-left: 0; } }
+label.field textarea { min-width: 320px; padding: 6px 10px; border: 1px solid var(--line-strong); border-radius: 8px; font: inherit; font-family: var(--mono); font-size: 13px; }
+label.field input[type=text], label.field input[type=password], label.field input[type=number] { height: 34px; min-width: 220px; padding: 0 10px; border: 1px solid var(--line-strong); border-radius: 8px; font: inherit; }
+/* Where a tunnel starts (0063): the management VLAN, or a VLAN by number. */
+div.field.start { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+div.field.start > .label { width: 170px; flex-shrink: 0; color: var(--muted); font-size: 14px; }
+div.field.start .choice { display: inline-flex; align-items: center; gap: 6px; }
+div.field.start input[type=number] { height: 34px; width: 110px; padding: 0 10px; border: 1px solid var(--line-strong); border-radius: 8px; font: inherit; }
+/* A tunnel port's VNIs (0058): a row each, with its tunnel, VNI and Remove. */
+.vnis .field { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.vnis .field > .label { width: 90px; flex-shrink: 0; color: var(--muted); font-size: 14px; }
+.vnis .field input { height: 34px; width: 9em; padding: 0 10px; border: 1px solid var(--line-strong); border-radius: 8px; font: inherit; }
+.choices { display: inline-flex; gap: 14px; flex-wrap: wrap; }
+.choices label { display: inline-flex; gap: 5px; align-items: center; }
+.below { margin: 0 0 16px; }
+.button.danger { border-color: var(--bad); color: var(--bad); }
+.segmented { display: inline-flex; border: 1px solid var(--line-strong); border-radius: 8px; overflow: hidden; }
+.segmented button { white-space: nowrap; border: 0; border-left: 1px solid var(--line-strong); background: var(--panel); padding: 5px 10px; font: inherit; font-size: 13px; color: var(--muted); cursor: pointer; }
+.segmented button:first-child { border-left: 0; }
+.segmented button.on { background: var(--accent-bg); color: var(--ink); font-weight: 600; }
+.segmented button:disabled:not(.on) { opacity: 0.45; cursor: default; }
+.button.small { padding: 4px 10px; font-size: 13px; }
+/* A Follow above pressed, to be saved with the page (0204). */
+.button[aria-pressed="true"] { background: var(--accent-bg); border-color: var(--accent); font-weight: 600; }
+/* A pulldown of choices with a field for one's own beside it (0134). */
+.choiceown { display: inline-flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.choiceown input[hidden] { display: none; }
+/* Usage over the last day (0108): traffic bars, down and up stacked, and
+   the most clients at once as a line. */
+.usage { display: block; width: 100%; height: auto; margin-top: 8px; }
+.usage .hit { fill: transparent; }
+.usage g:hover .hit { fill: var(--line-2); }
+.usage .clients { fill: none; stroke: var(--warn); stroke-width: 1.5; }
+.usage .base { stroke: var(--line-2); }
+.usagekey { padding: 0 20px 6px; }
+/* A chart drawn with Plotly (0294): the box it fills; its key, axes and
+   tools are drawn in it, on the page's colours (chart.js). */
+.plot { margin: 0 12px 8px; }
+/* The last few hours, a pulldown ahead of a span's buttons (0294). */
+.segmented select { border: 0; background: var(--panel); padding: 5px 8px; font: inherit; font-size: 13px; color: var(--muted); cursor: pointer; }
+.segmented select.on { background: var(--accent-bg); color: var(--ink); font-weight: 600; }
+.panel > h2 .segmented select { margin-left: 0; text-transform: none; letter-spacing: 0; }
+.clientsnow { display: flex; flex-wrap: wrap; gap: 12px; padding: 4px 20px 10px; }
+.clientsnow .tile { flex: 1 1 200px; }
+/* The Network tab (0141): a tile a step, its line under its number; the
+   segment picked marked in the table under them. */
+.tiles.steptimes { grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 10px; padding: 4px 20px 0; margin-bottom: 4px; }
+.tiles.steptimes .tile { padding: 10px 12px; }
+.panel > h2 select { margin-left: auto; flex-shrink: 0; text-transform: none; letter-spacing: 0; font-weight: 400; }
+table.list tr.picked td { background: var(--accent-bg); }
+table.list td.warnish { color: var(--warn); }
+.usage .axis { font-size: 10px; fill: var(--ink-2); }
+.usageaxis { display: flex; justify-content: space-between; padding: 2px 20px 8px; font-size: 12px; color: var(--muted); }
+/* An AP's connectivity strip (0108): a cell a bucket. */
+.strip svg { vertical-align: middle; }
+.strip .on { fill: var(--ok); }
+.strip .off { fill: var(--bad); }
+.strip .pending { fill: var(--line-2); }
+.swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; vertical-align: -1px; background: var(--accent); }
+/* A row's own buttons, such as a client's Reconnect and Block. */
+.rowbuttons { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
+.rowbuttons:empty { display: none; }
+.edit.flush { padding: 0; }
+.preview ul.becomes { margin: 0; padding-left: 20px; display: flex; flex-direction: column; gap: 4px; }
+/* A revert of several: a tick box each, what is unticked stays (0159). */
+.preview ul.becomes.ticks { list-style: none; padding-left: 0; }
+.preview ul.becomes.ticks label { cursor: pointer; }
+.preview ul.becomes.ticks li.unticked { opacity: 0.6; }
+.button.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); font-weight: 600; }
+.button:disabled { opacity: 0.5; cursor: default; }
+.edit:empty { display: none; }
+.edit { padding: 0 20px 16px; }
+.preview { display: flex; flex-direction: column; gap: 10px; padding: 14px 16px; border: 1px solid var(--accent); border-radius: 10px; background: var(--accent-bg); }
+.preview .actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.preview input.reason { flex-grow: 1; min-width: 260px; height: 36px; padding: 0 10px; border: 1px solid var(--line-strong); border-radius: 8px; font: inherit; }
+.sub.warn { color: var(--warn); }
+.banner.done { background: var(--ok-bg); border: 1px solid var(--ok-line); color: var(--ok-ink); }
+
+/* Sign-in */
+.signin { max-width: 520px; margin: 80px auto; padding: 32px; background: var(--panel); border: 1px solid var(--line); border-radius: 14px; display: flex; flex-direction: column; gap: 16px; }
+.signin h1 { margin: 0; font-size: 24px; }
+.signin p { margin: 0; color: var(--muted); }
+.signin input[type=password], .signin input[type=text] { width: 100%; height: 44px; padding: 0 12px; border: 1px solid var(--line-strong); border-radius: 8px; font: 14px var(--mono); }
+.signin label { display: flex; align-items: center; gap: 8px; font-size: 14px; color: var(--ink-2); }
+.signin button { height: 44px; border: 0; border-radius: 8px; background: var(--accent); color: var(--on-accent); font-weight: 600; cursor: pointer; }
+.signin .error { padding: 10px 12px; }
+.signin ul.gives { margin: 0; padding-left: 20px; color: var(--ink-2); font-size: 14px; display: flex; flex-direction: column; gap: 4px; }
+
+/* Per-user keys (0070). */
+.keys form { margin-top: 10px; }
+.keys form.bulk textarea { display: block; width: 100%; box-sizing: border-box; margin: 6px 0; font-family: var(--mono); font-size: 13px; }
+.keys .handout { margin-top: 10px; padding: 10px 12px; border-radius: 8px; background: var(--warn-bg); }
+.panel.keys form, .panel.keys .handout, .panel.keys > div > .sub, .panel.keys > div > div > .sub { margin-left: 20px; margin-right: 20px; }
+.panel.keys > div:last-child { padding-bottom: 14px; }
+
+/* The channel map (0075): a band's channels, each block of the width one
+   shade, picked a block at a time. */
+.chmap { display: flex; flex-wrap: wrap; gap: 14px; margin: 6px 20px 16px; }
+/* A band in one panel (0087): on/off and name top left, width top right,
+   tick boxes, the map, then channel and power. */
+.bandpanel { margin-bottom: 16px; }
+.bandhead { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.bandhead .radio-on { display: inline-flex; align-items: center; gap: 10px; cursor: pointer; }
+.bandhead .width { margin-left: auto; }
+/* The one on/off control (Griff, 2026-10-11): a slider, whether it is a tick
+   box in a form, set with the form, or a button that asks first, as band
+   steering's does. Several choices take .segmented; picking some of many,
+   tick boxes. */
+.switch { appearance: none; display: inline-block; box-sizing: border-box; width: 34px; height: 20px; margin: 0; padding: 0; border: 0; border-radius: 10px; background: var(--line); position: relative; cursor: pointer; transition: background 0.15s; flex: none; vertical-align: middle; }
+.switch::after { content: ''; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 50%; background: #FFFFFF; transition: left 0.15s; }
+.switch:checked, .switch.on { background: var(--accent); }
+.switch:checked::after, .switch.on::after { left: 16px; }
+.switch:disabled { opacity: 0.5; cursor: default; }
+.switch:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.switch + .switchsays { margin-left: 8px; color: var(--muted); font-size: 13px; }
+/* Several switches in a row, each with what it is (0138), and the chips of what came of each. */
+.ways { display: flex; flex-wrap: wrap; gap: 6px 20px; align-items: center; overflow-wrap: normal; }
+.ways > .each { display: flex; flex: none; align-items: center; white-space: nowrap; }
+.row .value.ways { font-family: inherit; }
+/* The askings behind a count (0138): a row of their own under it, opened by a click. */
+table.list tr.under > td { border-top: 0; padding-top: 0; }
+table.list tr.under summary { cursor: pointer; color: var(--muted); font-size: 13px; }
+table.list tr.under table.list { margin-top: 6px; }
+.ticks { display: flex; flex-wrap: wrap; gap: 6px 22px; margin: 4px 20px 0; }
+.tick { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; }
+.whence { margin-left: 6px; font-size: 12px; color: var(--muted); }
+.row.actions { justify-content: flex-end; gap: 8px; }
+.bandhead select { text-transform: none; letter-spacing: 0; font-weight: 400; }
+.row .label .whence { display: block; margin-left: 0; }
+/* A band's 802.11 generations and its guard intervals, one for each kind
+   (0089). */
+.ticks.inline { margin: 0; display: inline-flex; }
+/* One of several among the tick boxes, as a band's DFS channels (0120). */
+.tick.choice { cursor: default; }
+/* Where a node's band settings come from, and Customize (Griff,
+   2026-10-09): until it is pressed, a node that sets none of them shows
+   them greyed out. */
+.inherits { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 0 0 14px; }
+.inherits .label { color: var(--muted); }
+.inherits .gap { flex: 1; }
+.inherits .go { display: inline-flex; align-items: center; justify-content: center; width: 30px; height: 30px; border: 1px solid var(--line); border-radius: 6px; text-decoration: none; color: var(--ink); font-size: 16px; }
+.inherits .go:hover { border-color: var(--accent); color: var(--accent); }
+/* Interfaces › Ethernet (Griff, 2026-10-09): a row a port, the uplink
+   first; Edit or Info opens a row under it. Inherited, greyed out. */
+.portlist td.actions { text-align: right; white-space: nowrap; width: 1%; }
+.portlist tr.under > td { padding: 4px 0 14px; border-top: none; }
+.portlist .whence { display: block; margin-left: 0; }
+.ports.inherited td.set { opacity: 0.55; }
+/* Ethernet by kind of AP (0092): a line a kind, its arrow opening its
+   ports, drawn as jacks (0093): green with a link (on an AP), white set,
+   grey not set or off. A bond's members sit together under its name. */
+.panel.kind { padding: 0; margin-bottom: 10px; }
+.kindhead { display: flex; align-items: center; gap: 10px; width: 100%; padding: 12px 16px; background: none; border: none; font: inherit; color: inherit; text-align: left; cursor: pointer; }
+.kindhead .arrow { width: 14px; color: var(--muted); }
+.kindhead .gap { flex: 1; }
+.kindbody { padding: 0 16px 16px; }
+.jacks { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 14px; }
+.jack { display: inline-flex; flex-direction: column; align-items: center; gap: 2px; min-width: 56px; padding: 6px 4px; background: none; border: 1px solid transparent; border-radius: 8px; font: inherit; color: inherit; cursor: pointer; }
+.jack:hover, .bond:hover { border-color: var(--line); }
+.jack.chosen, .bond.chosen { border-color: var(--accent); }
+.jack .icon svg { width: 44px; height: 36px; display: block; }
+.jack .icon .body { stroke: #5B6470; stroke-width: 1.5; }
+.jack .icon .pin { stroke: #8A9099; stroke-width: 1.2; }
+.jack.on .icon .body { fill: #3FAE5A; stroke: #23753A; }
+.jack.on .icon .pin { stroke: #E6F4EA; }
+.jack.set .icon .body { fill: var(--panel); }
+.jack.unset .icon .body, .jack.off .icon .body { fill: #C9CDD2; stroke: #8A9099; }
+.jack.off .icon .pin { stroke: #A3A9B0; }
+.jack.blocked .icon .body { fill: #E8B04B; stroke: #8A5A00; }
+.jack.blocked .icon .pin { stroke: #FBF1DF; }
+.jack .stpblock { color: var(--warn); font-weight: 700; }
+.kindstp { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; margin-top: 12px; font-size: 13px; }
+.kindstp .label { color: var(--muted); }
+.jack .jname { font-size: 12px; display: inline-flex; gap: 3px; align-items: center; }
+.jack .jsub { font-size: 11px; color: var(--muted); }
+.jack .up { color: var(--accent); font-weight: 600; }
+.jack .poe { color: #B7791F; }
+.jack .loop { color: #C53030; font-weight: 700; }
+.jack.add .icon.plus { width: 44px; height: 36px; display: flex; align-items: center; justify-content: center; border: 1.5px dashed var(--line); border-radius: 4px; color: var(--muted); font-size: 18px; }
+.bond { display: inline-flex; flex-direction: column; gap: 4px; padding: 6px 8px 4px; border: 1.5px solid var(--line); border-radius: 10px; background: none; font: inherit; color: inherit; cursor: pointer; }
+.bond .bondname { font-size: 12px; display: flex; gap: 4px; align-items: center; }
+.bond .members { display: flex; gap: 6px; }
+.bond .members .jack { cursor: inherit; padding: 2px; }
+.portdetail { margin-top: 12px; }
+.ports.inherited .jack .icon, .ports.inherited .bond .members { opacity: 0.55; }
+.bandpanel > .ahead { margin: 2px 20px 6px; }
+.bandpanel.inherited .chmap, .bandpanel.inherited > .ticks, .bandpanel.inherited > .row, .bandpanel.inherited .bandhead .width, .bandpanel.inherited .bandhead .radio-on .switch { opacity: 0.55; }
+.gis { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 22px; }
+.chrange { display: flex; gap: 6px; }
+.chblock { display: flex; gap: 1px; padding: 2px; border-radius: 6px; }
+/* Channel ratings as blocks at the radio's width (issue #45): a box a
+   block, green to red by its rating; the one in use ringed, those a
+   neighbour uses dimmed, DFS hatched as on the channel map. */
+.rateblocks { display: flex; flex-wrap: wrap; gap: 4px; margin: 4px 20px 6px; }
+.rblock { display: flex; flex-direction: column; align-items: center; gap: 1px; min-width: 52px; padding: 4px 6px; border-radius: 6px; border: 2px solid transparent; color: #1E2A22; font-size: 12px; cursor: pointer; }
+.rblock .cost { font-size: 11px; opacity: 0.8; }
+.rblock.own { border-color: var(--accent); }
+.rblock.used { opacity: 0.6; }
+.rblock.dfs { background-image: repeating-linear-gradient(135deg, var(--hatch) 0 3px, transparent 3px 7px); }
+/* A rating only remembered (0332): what the AP last knew, faded, its age under it. */
+.rblock.stale { filter: saturate(0.25); opacity: 0.55; border: 2px dashed rgba(30, 42, 34, 0.35); }
+.rblock.stale.own { border-color: var(--accent); }
+.rblock .age { font-style: italic; }
+.ratekey { margin: 0 20px 6px; font-size: 12px; }
+.chstack { display: flex; flex-direction: column; }
+/* The DFS bracket over 52–144: a piece above each block, each reaching across
+   the gap to the next; a tick and the label where it starts, a tick where it
+   ends. */
+.chbr { height: 20px; position: relative; }
+.chbr.dfs::after { content: ''; position: absolute; left: 0; right: -6px; bottom: 4px; height: 6px; border-top: 2px solid var(--muted); }
+.chbr.dfs.join::after { right: -14px; }
+.chbr.dfs.start::after { border-left: 2px solid var(--muted); }
+.chbr.dfs.end::after { right: 0; border-right: 2px solid var(--muted); }
+/* The label sits in the line, on the panel's background: ┌─ DFS ───┐. */
+.chbr .lbl { display: none; position: absolute; z-index: 1; left: 8px; top: 5px; padding: 0 4px; background: var(--panel); font-size: 11px; font-weight: 600; letter-spacing: 0.04em; color: var(--muted); line-height: 11px; }
+.chbr.start .lbl { display: block; }
+.chblock.a { background: var(--chblock-a); }
+.chblock.b { background: var(--chblock-b); }
+.ch { width: 34px; padding: 4px 0 3px; border: 1px solid transparent; border-radius: 4px; background: var(--panel); color: var(--ink-2); font: 12px var(--mono); display: flex; flex-direction: column; align-items: center; gap: 3px; cursor: pointer; }
+.chblock.a .ch.on { background: var(--accent); color: var(--on-accent); }
+.chblock.b .ch.on { background: #8A6A2E; color: #FFFFFF; }
+.ch.part { border-color: var(--warn); border-style: dashed; }
+/* 2.4 GHz at 40 MHz (0117): the channel a picked one is joined with is
+   filled in its pair's colour, lighter. */
+.ch.on.taken { opacity: 0.68; }
+.chblock .ch.on.taken.shared { background: linear-gradient(135deg, var(--accent) 50%, #8A6A2E 50%); }
+.ch.dfs { background-image: repeating-linear-gradient(135deg, var(--hatch) 0 3px, transparent 3px 7px); }
+.ch.on.dfs { background-image: repeating-linear-gradient(135deg, var(--hatch-on) 0 3px, transparent 3px 7px); }
+.ch.off { opacity: 0.4; cursor: not-allowed; }
+.ch:disabled:not(.off) { cursor: default; }
+.ch .ap { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+.ch .ap.none { visibility: hidden; }
+/* 6 GHz (0087): a preferred scanning channel is underlined; where the set
+   is kept to those, or to one channel a block, the channels the APs go to
+   are ringed. */
+.ch.psc > span:first-child { text-decoration: underline; text-underline-offset: 2px; font-weight: 600; }
+.ch.goes { box-shadow: inset 0 0 0 2px var(--ok, #1F7A4A); }
+.ch.on.goes { box-shadow: inset 0 0 0 2px #FFFFFF; }
+.panel > h2 .title { display: flex; align-items: center; gap: 10px; }
+.panel > h2 .title .chip { text-transform: none; letter-spacing: 0; height: 22px; }
+
+/* Rename beside an AP's name on the APs tab (0076). */
+.button.rename { margin-left: 8px; height: 24px; padding: 0 8px; font-size: 12px; }
+.button.rename.head { margin-left: 12px; vertical-align: middle; }
+.button.rename.head + .button.rename.head { margin-left: 6px; }
+
+/* The neighbour map (map.js): APs as nodes, each pair of neighbours a line
+   coloured by how strongly they hear each other. */
+.seg { display: inline-flex; gap: 4px; }
+.seg .button.on { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+.nmapbox { padding: 4px 12px 0; border-top: 1px solid var(--line-2); }
+.nmap { display: block; width: 100%; height: auto; font-family: var(--sans); }
+.nmap .edge line { stroke-width: 4; stroke-linecap: round; stroke: var(--c); }
+.nmap .edge.heard line { stroke-dasharray: 2 8; }
+.nmap .edge text { font-size: 12px; font-family: var(--mono); fill: var(--c); paint-order: stroke; stroke: var(--panel); stroke-width: 4px; stroke-linejoin: round; }
+.nmap .edge, .nmaplegend .key { --c: var(--faint); }
+.nmap .strong, .nmaplegend .strong { --c: #1E7A46; }
+.nmap .good, .nmaplegend .good { --c: #5E9E2F; }
+.nmap .fair, .nmaplegend .fair { --c: #B7791F; }
+.nmap .weak, .nmaplegend .weak { --c: var(--bad); }
+.nmap .node circle { fill: var(--panel); stroke: var(--accent); stroke-width: 2.5; }
+.nmap .node .waves { fill: none; stroke: var(--accent); stroke-width: 2; stroke-linecap: round; }
+.nmap .node circle.dot { fill: var(--accent); stroke: none; }
+.nmap .node text { paint-order: stroke; stroke: var(--panel); stroke-width: 4px; stroke-linejoin: round; }
+.nmap .node .name { font-size: 13px; font-weight: 600; fill: var(--ink); }
+.nmap .node .facts { font-size: 11px; fill: var(--muted); font-family: var(--mono); }
+.nmap .node.away circle { stroke: var(--faint); stroke-dasharray: 3 3; }
+.nmap .node.away .waves { stroke: var(--faint); }
+.nmap .node.away circle.dot { fill: var(--faint); }
+.nmap .node.away .name { fill: var(--muted); font-weight: 500; }
+.nmap { user-select: none; -webkit-user-select: none; }
+.nmap .node { cursor: grab; touch-action: none; outline: none; }
+.nmap .node.dragging { cursor: grabbing; }
+.nmap .node:focus-visible circle:not(.dot) { stroke-width: 4; }
+.nmap .hellos { pointer-events: none; }
+.nmap .hellos .ping { fill: var(--accent); stroke: var(--panel); stroke-width: 1.5; }
+.nmap .hellos .ring { fill: none; stroke: var(--accent); stroke-width: 2; }
+.nmaptools { margin-left: auto; display: inline-flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; }
+.nmaptools .hint { font-style: italic; }
+.nmaplegend .key.hello::before { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); }
+.nmaplegend { display: flex; flex-wrap: wrap; gap: 6px 16px; padding: 6px 20px 14px; font-size: 12px; color: var(--muted); }
+.nmaplegend .key::before { content: ''; display: inline-block; width: 18px; height: 4px; border-radius: 2px; background: var(--c); margin-right: 6px; vertical-align: middle; }
+.nmaplegend .key.heard::before { background: repeating-linear-gradient(90deg, var(--faint) 0 2px, transparent 2px 6px); }
+/* Alerts (0099). */
+.alertsum { display: flex; gap: 8px; margin-bottom: 12px; }
+table.alerts { width: 100%; border-collapse: collapse; font-size: 14px; }
+table.alerts th { text-align: left; color: var(--muted); font-weight: 500; padding: 6px 8px; border-bottom: 1px solid var(--line); }
+table.alerts td { padding: 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+table.alerts td:first-child { width: 1%; white-space: nowrap; }
+/* The advisor's findings (0205): when and the button keep to their size; a long summary folds in its cell. */
+table.findings td:nth-child(3), table.findings td:last-child { width: 1%; }
+table.findings td > div + div { margin-top: 3px; }
+table.findings .turns { display: flex; gap: 6px; }
+/* An AP in maintenance (0218): its alerts greyed, last. */
+table.alerts tr.maint td { color: var(--muted); }
+/* Asking the advisor (0215): the question beside its button; each answer under it. */
+.askrow { display: flex; gap: 8px; align-items: flex-start; padding: 0 20px 12px; }
+.askrow textarea.ask { flex: 1; min-height: 2.6em; padding: 6px 10px; border: 1px solid var(--line-strong); border-radius: 8px; font: inherit; resize: vertical; }
+.answer { padding: 10px 20px 12px; border-top: 1px solid var(--line-2); }
+.said p { margin: 6px 0 0; }
+.said ul, .said ol { margin: 6px 0 0; padding-left: 20px; }
+.said li + li { margin-top: 2px; }
+details.inline { border-top: 0; }
+.banner.setup { flex-direction: column; gap: 6px; }
+details.inline > summary { display: inline; padding: 0; font-size: inherit; }
+details.inline > summary:hover { background: none; text-decoration: underline; }
+/* Overview (0102). */
+/* Tiles keep their size where there are few: a row of two is not two halves of the page. */
+.tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 12px; margin-bottom: 14px; }
+.tile { display: block; padding: 14px 16px; border: 1px solid var(--line); border-radius: 12px; background: var(--panel, #fff); color: inherit; text-decoration: none; }
+a.tile:hover { border-color: var(--accent); }
+.tile .tlabel { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+.tile .tbig { font-size: 26px; font-weight: 600; margin: 4px 0 2px; }
+.tile .tsub { font-size: 12px; color: var(--muted); }
+.tile.ok { border-left: 4px solid var(--ok); }
+.tile.warn { border-left: 4px solid var(--warn); }
+.tile.bad { border-left: 4px solid var(--bad); }
+/* A client's own page (0222): who it is and where it is now; what it did
+   and where it stayed, a line each, dense, to be read down. A line that went
+   badly is tinted; one opened, or the one the page was opened at, marked. */
+.clienthead .controls { margin-top: 10px; flex-wrap: wrap; }
+.panel .issues { list-style: none; padding: 0 20px; margin: 4px 0 14px; display: flex; flex-direction: column; gap: 6px; }
+table.list.dense { font-size: 13px; }
+table.list.dense th { padding: 6px 10px; white-space: nowrap; }
+table.list.dense td { padding: 4px 10px; white-space: nowrap; vertical-align: middle; }
+table.list.dense td.why { white-space: normal; min-width: 160px; color: var(--muted); }
+table.list.dense td.why .capture { margin-left: 8px; }
+table.list.dense .chip { height: 20px; padding: 0 8px; }
+table.list.dense tr.attemptrow { cursor: pointer; }
+table.list.dense tr.attemptrow:hover td { background: var(--side); }
+table.list.dense tr.failed td { background: var(--bad-bg); }
+table.list.dense tr.opened td { background: var(--accent-bg); }
+table.list.dense tr.sel td { background: var(--select); }
+table.list.dense tr.stepsrow > td { padding: 4px 0 8px; white-space: normal; background: var(--panel); }
+/* An AP's Activity (0338): its lines' words wrap; a line with no more to
+   it does not look clickable; what one opens to is a short list of names
+   and values. */
+table.list.dense td.said { white-space: normal; min-width: 240px; }
+table.list.dense tr.attemptrow.plain { cursor: default; }
+.activitymore { padding: 2px 12px 6px 24px; }
+.activitymore dl.facts { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 2px 16px; margin: 0 0 4px; font-size: 13px; }
+.activitymore dl.facts dt { color: var(--muted); }
+.activitymore dl.facts dd { margin: 0; }
+.activitymore p.sub { margin: 0; }
+/* The switch between the clients on now and everyone seen sits in the
+   panel's heading, and reads as it is written. */
+.panel > h2 .segmented button { text-transform: none; letter-spacing: 0; font-weight: 400; }
+.panel > h2 .segmented button.on { font-weight: 600; }
+/* A folder's map (0169): OpenStreetMap's tiles drawn on a canvas, the
+   pins over them. A folder's pin is square, an AP's round and coloured as
+   its dot in the tree is; the one the page is of is ringed. */
+.placemap { position: relative; overflow: hidden; border: 1px solid var(--line); border-radius: 6px; background: var(--map-bg); touch-action: none; cursor: grab; user-select: none; }
+.placemap.aiming { cursor: crosshair; }
+.placemap .mapcanvas { position: absolute; inset: 0; }
+.placemap .mappins { position: absolute; inset: 0; pointer-events: none; }
+.placemap .pin { position: absolute; transform: translate(-50%, -50%); pointer-events: auto; width: 16px; height: 16px; padding: 0; border: 2px solid #FFFFFF; box-shadow: 0 1px 3px rgba(0, 0, 0, 0.45); cursor: pointer; }
+.placemap .pin.folder { width: 18px; height: 18px; border-radius: 4px; background: var(--accent); }
+.placemap .pin.ap { border-radius: 50%; background: var(--faint); }
+.placemap .pin.ap.ok { background: var(--ok); }
+.placemap .pin.ap.warn { background: #C98A12; }
+.placemap .pin.ap.bad { background: var(--bad); }
+.placemap .pin.here { outline: 3px solid var(--accent); outline-offset: 2px; }
+.placemap .pin.pending { width: 14px; height: 14px; border-radius: 50%; background: #F2A33A; border-color: #3B2A0A; }
+.placemap .mapzoom { position: absolute; top: 8px; right: 8px; display: flex; flex-direction: column; gap: 4px; }
+.placemap .mapzoom button { width: 28px; height: 28px; border: 1px solid var(--line); border-radius: 4px; background: var(--panel); font-size: 16px; line-height: 1; cursor: pointer; }
+.placemap .mapcredit { position: absolute; right: 0; bottom: 0; padding: 1px 6px; font-size: 11px; background: rgba(255, 255, 255, 0.8); color: #333333; }
+.mapinfo { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; min-height: 28px; margin: 8px 0 0; font-size: 13px; }
+.mapedit { margin-top: 10px; display: flex; flex-direction: column; gap: 8px; }
+.mapedit .mapline { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+/* The suggestions hang below the panel, over what follows it. */
+.panel.placepanel { overflow: visible; }
+.mapedit .mapaddr { position: relative; flex: 1 1 280px; min-width: 0; }
+.mapedit .mapaddr input { width: 100%; box-sizing: border-box; }
+.mapsuggest { position: absolute; top: 100%; left: 0; right: 0; z-index: 20; margin: 2px 0 0; padding: 4px 0; list-style: none; max-height: 260px; overflow-y: auto; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; box-shadow: 0 4px 14px rgba(0, 0, 0, 0.15); }
+.mapsuggest li { padding: 6px 10px; font-size: 13px; line-height: 1.35; cursor: pointer; }
+.mapsuggest li:hover, .mapsuggest li.on { background: var(--accent-bg); }
+.mapedit input.num { width: 130px; }
+.mapedit .switchrow { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; }
+.mapfound { display: flex; flex-wrap: wrap; gap: 6px; }
+.mapedit .error:empty, .mapfound:empty { display: none; }
+.mapfound .button { max-width: 100%; white-space: normal; text-align: left; height: auto; }
+/* A client's way out, drawn (0168): each thing on it a picture, and
+   between each two the link they are joined by, the port it leaves by over
+   it and the port it comes in by under it. Coloured by how the thing a link leads to is; the client's own link,
+   its radio's, dashed. */
+.hopmap { flex: 0 0 auto; display: flex; align-items: flex-start; overflow-x: auto; overflow-y: hidden; padding: 14px 20px 10px; --c: var(--faint); }
+.hopmap .ok { --c: var(--ok); }
+.hopmap .warn { --c: #C98A12; }
+.hopmap .bad { --c: var(--bad); }
+.hopmap .idle, .hopmap .start { --c: var(--faint); }
+.hopmap .node { flex: 0 0 96px; display: flex; flex-direction: column; align-items: center; text-align: center; gap: 2px; }
+.hopmap .node .top { font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); }
+.hopmap .node .glyph { width: 60px; height: 60px; margin: 2px 0 4px; border-radius: 50%; border: 2px solid var(--c); background: var(--panel); color: var(--c); display: grid; place-items: center; }
+.hopmap .node.start .glyph { color: var(--ink); }
+.hopmap .node .glyph svg { width: 36px; height: 36px; }
+.hopmap .node .name { font-family: var(--mono); font-size: 12px; font-weight: 600; color: var(--ink); overflow-wrap: anywhere; }
+.hopmap .node .sub { font-size: 11px; color: var(--muted); overflow-wrap: anywhere; }
+.hopmap .link { flex: 1 1 72px; min-width: 72px; position: relative; height: 60px; margin-top: 16px; display: flex; align-items: center; }
+.hopmap .link .wire { width: 100%; border-top: 2px solid var(--c); }
+.hopmap .link.air .wire { border-top-style: dashed; }
+.hopmap .link .end { position: absolute; max-width: calc(100% - 6px); overflow: hidden; text-overflow: ellipsis; font-family: var(--mono); font-size: 10px; color: var(--muted); white-space: nowrap; }
+.hopmap .link .from { left: 3px; top: 10px; }
+.hopmap .link .to { right: 3px; bottom: 10px; }
+.hopmap .link .mid { position: absolute; left: 0; right: 0; bottom: 6px; text-align: center; font-size: 10px; color: var(--muted); white-space: nowrap; }
+
+/* The admin section (0176). */
+.head .acts { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+.filters { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 0 0 12px; }
+.filters input[type=search] { height: 34px; padding: 0 10px; border: 1px solid var(--line-strong); border-radius: 8px; font: 14px var(--mono); }
+.preview input[type=text] { height: 34px; padding: 0 10px; border: 1px solid var(--line-strong); border-radius: 8px; font: inherit; min-width: 200px; }
+
+/* The manager's own releases (0183): the banner's buttons on its right, and
+   the last update's output, scrolled within its fold. */
+.banner.update { align-items: center; }
+.banner.update .controls { gap: 10px; }
+/* What a newer release says of itself (0217), folded under its line. */
+.whatsnew summary { cursor: pointer; margin-top: 4px; }
+.whatsnew .release { margin-top: 8px; }
+pre.log { max-height: 280px; overflow: auto; margin: 6px 20px 12px; padding: 10px 12px; border-radius: 8px; background: var(--line-2); font: 12px var(--mono); white-space: pre-wrap; }
+
+/* One save for a page (Griff, 2026-10-21): kept in view at the page's foot. */
+.pagesave { position: sticky; bottom: 0; z-index: 5; margin-top: 12px; padding: 10px 16px; background: var(--panel, #FFFFFF); border: 1px solid var(--line); border-radius: 10px; box-shadow: 0 -2px 8px rgba(0, 0, 0, 0.06); }
+.pagesave .actions { display: flex; gap: 8px; justify-content: flex-end; }
+.pagesave[hidden] { display: none; }
+
+/* The Overview (0284): one strip of how things stand, each cell leading to
+   the tab that says more; under it the APs on the page's band, with what
+   needs attention beside them. */
+.nowstrip { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); background: var(--panel); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
+.nowstrip .scell { display: block; padding: 12px 18px; border-right: 1px solid var(--line-2); color: inherit; }
+.nowstrip a.scell:hover { text-decoration: none; background: var(--side); }
+.nowstrip .slabel { font-size: 12px; color: var(--muted); }
+.nowstrip .sbig { font-size: 20px; font-weight: 650; line-height: 1.3; }
+.nowstrip .sbig.bad { color: var(--bad); }
+.nowstrip .sbig.warn { color: var(--warn); }
+.nowstrip .ssub { font-size: 12px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+.overgrid { display: flex; flex-wrap: wrap; gap: 18px; align-items: flex-start; }
+.overgrid > .main { flex: 999 1 560px; min-width: 0; }
+.overgrid > .side { flex: 1 1 300px; min-width: 0; display: flex; flex-direction: column; gap: 18px; }
+.overgrid table.list td, .overgrid table.list th { padding-left: 14px; padding-right: 14px; }
+ul.attention { list-style: none; margin: 0; padding: 4px 20px 16px; display: flex; flex-direction: column; gap: 10px; font-size: 14px; }
+/* Something said in a few words, in full a click down (0330): inline, so it
+   runs on from the chip and the name before it. */
+details.said { display: inline; border: 0; }
+details.said > summary { display: inline; padding: 0; gap: 0; font-size: inherit; }
+details.said > summary:hover { background: none; text-decoration: underline dotted var(--muted); }
+details.said > summary::after { content: '›'; display: inline-block; margin-left: 5px; color: var(--muted); transition: transform 0.12s; }
+details.said[open] > summary::after { transform: rotate(90deg); }
+details.said > .more { margin: 6px 0 2px; padding: 8px 10px; border-left: 2px solid var(--line); background: var(--side); border-radius: 0 6px 6px 0; color: var(--muted); font-size: 13px; line-height: 1.45; }
+details.said > .more > div { margin-top: 4px; }
+
+/* The AP page (0284): its state beside its name, what it is in a line under
+   it; its radio on the page's band with that radio's clients; what it did
+   lately. */
+.head h1 .chip.headchip { font-size: 13px; letter-spacing: 0; }
+.sub.standing { margin-top: 2px; }
+.sub.standing.bad { color: var(--bad); }
+.sub.standing.warn { color: var(--warn); }
+.radiofacts { display: flex; flex-wrap: wrap; gap: 6px 22px; padding: 0 20px 12px; font-size: 14px; }
+ol.lately { list-style: none; margin: 0; padding: 4px 20px 16px; display: flex; flex-direction: column; gap: 8px; font-size: 14px; }
+ol.lately li { display: flex; gap: 12px; }
+ol.lately li > .mono { flex: 0 0 auto; min-width: 48px; }
+ol.lately li.bad > span:last-child { color: var(--bad); }
+.overgrid .kv { grid-template-columns: 90px minmax(0, 1fr); }
+.overgrid .kv dd { font-family: var(--sans); }
+.overgrid .kv dd.mono { font-family: var(--mono); }
+details.fold.inpanel { padding: 0 20px 14px; font-size: 14px; }
+details.fold.inpanel .kv { padding: 8px 0 0; }
+
+/* Settings, dense (0284): the panels side by side, as many across as fit;
+   a line a setting; where it comes from in a word at its end. */
+.fieldgrid { columns: 340px; column-gap: 18px; }
+.fieldgrid > .panel { break-inside: avoid; margin-bottom: 18px; }
+.fieldgrid .row { min-height: 34px; padding: 3px 16px; gap: 4px 10px; }
+.fieldgrid .row .label { width: 140px; font-size: 13px; }
+.fieldgrid .row .value { font-size: 13px; }
+.fieldgrid .row .button { padding: 3px 10px; font-size: 13px; }
+.fieldgrid .panel > h2 { padding: 12px 16px 6px; }
+.whence { margin-left: auto; font-size: 12px; white-space: nowrap; color: var(--muted); display: inline-flex; align-items: center; gap: 2px; }
+.whence.here { color: var(--accent); font-weight: 600; }
+.whence.locked { color: var(--lock-ink); }
+.whence.baseline, .whence.template { color: var(--branch-ink); }
+.whence svg { width: 12px; height: 12px; }
+/* A value changed in its own row (0286): pressed, its input takes its place,
+   and how to fill it in and Cancel go under it. */
+.row .value button.inline { all: unset; cursor: pointer; border-bottom: 1px dashed var(--line-2); overflow-wrap: anywhere; }
+.row .value button.inline:hover { color: var(--accent); border-bottom-color: var(--accent); }
+.row .value button.inline:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.row .value > input[type=text], .row .value > input[type=password], .row .value > input[type=number], .row .value > textarea, .row .value > select { box-sizing: border-box; width: 100%; min-height: 30px; padding: 0 8px; border: 1px solid var(--line-strong); border-radius: 8px; font: inherit; }
+.row .value > textarea { padding: 4px 8px; }
+.fieldgrid .edit:has(> .inlinebar) { padding: 0 16px 8px; }
+.inlinebar { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 4px 10px; font-size: 12.5px; }
+.inlinebar .hint { flex: 1 1 100%; color: var(--muted); line-height: 1.4; }
+.inlinebar .error:empty { display: none; }
+/* Which service folders a location takes (0320): as the folder above has
+   them or set here, a tick a folder, with the networks each offers; a
+   network the draft takes away is dimmed on its card. */
+.svcedit { display: flex; flex-direction: column; gap: 8px; padding: 0 16px 10px; }
+.svcedit .segmented { align-self: flex-start; }
+.svcedit .clash { font-size: 13px; }
+.svcpick { display: flex; flex-direction: column; border: 1px solid var(--line-strong); border-radius: 8px; padding: 4px; background: var(--panel); }
+.svcpick label { display: grid; grid-template-columns: 22px minmax(120px, 1fr) minmax(0, 2fr); gap: 8px; align-items: center; padding: 4px 8px; border-radius: 6px; cursor: pointer; font-size: 13px; }
+.svcpick label:hover { background: var(--accent-bg); }
+.svcpick .name { font-weight: 600; }
+.svcpick .nets { display: flex; flex-wrap: wrap; gap: 6px; }
+.svcpick .ssid { font-size: 12px; padding: 1px 7px; border: 1px solid var(--line-strong); border-radius: 6px; }
+.bands > .going { opacity: 0.5; }
+.below-rows { padding: 0 16px 8px; }
+@media (max-width: 700px) {
+	.svcpick label { grid-template-columns: 22px 1fr; min-height: 44px; }
+	.svcpick .nets { grid-column: 2; }
+}
+/* Suggest a feature (0323): a form over the page, with what goes with it. */
+/* A client's failed joins alone (0330), over the page. */
+dialog.failures { width: min(1100px, calc(100vw - 32px)); max-height: calc(100vh - 64px); border: 1px solid var(--line-strong); border-radius: 12px; padding: 0; background: var(--panel); color: var(--ink); }
+dialog.failures::backdrop { background: rgba(22, 25, 29, 0.45); }
+dialog.failures .failhead { display: flex; align-items: center; gap: 12px; padding: 14px 20px 8px; position: sticky; top: 0; background: var(--panel); z-index: 1; }
+dialog.failures .failhead h2 { flex: 1; margin: 0; font-size: 17px; display: flex; gap: 12px; align-items: baseline; }
+dialog.failures .failhead h2 .note { font-size: 13px; font-weight: 400; color: var(--muted); }
+dialog.failures .failbody { padding: 0 20px 16px; }
+dialog.failures ul.failkinds { list-style: none; margin: 0 0 12px; padding: 0; display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: var(--muted); }
+button.chipbutton { border: 0; font: inherit; font-size: 12px; cursor: pointer; }
+button.chipbutton:hover { filter: brightness(1.15); text-decoration: underline; }
+dialog.suggest { width: min(560px, calc(100vw - 32px)); border: 1px solid var(--line-strong); border-radius: 12px; padding: 0; background: var(--panel); color: var(--ink); }
+dialog.suggest::backdrop { background: rgba(22, 25, 29, 0.45); }
+dialog.suggest .fieldform { padding: 18px 20px; display: flex; flex-direction: column; gap: 10px; }
+dialog.suggest h2 { margin: 0; font-size: 18px; }
+dialog.suggest label.field.stack { flex-direction: column; align-items: stretch; flex-wrap: nowrap; gap: 4px; }
+dialog.suggest label.field.stack > .label { width: auto; color: var(--ink); font-weight: 600; }
+dialog.suggest textarea, dialog.suggest input[type=text] { box-sizing: border-box; width: 100%; padding: 6px 10px; border: 1px solid var(--line-strong); border-radius: 8px; font: inherit; background: var(--panel); color: var(--ink); }
+dialog.suggest .sentwith { border: 1px solid var(--line-2); border-radius: 8px; padding: 8px 12px; font-size: 13px; }
+dialog.suggest .sentwith dl { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 2px 12px; margin: 4px 0 0; }
+dialog.suggest .sentwith dt { color: var(--muted); }
+dialog.suggest .sentwith dd { margin: 0; overflow-wrap: anywhere; }
+dialog.suggest .error:empty { display: none; }
+td.suggesttext { white-space: pre-wrap; max-width: 520px; }

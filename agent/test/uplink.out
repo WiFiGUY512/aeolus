@@ -1,0 +1,6 @@
+vlan 20 [ "Aeolus-Enterprise", "Home Wi-Fi" ]
+vlan 1 [ ]
+bridge [ "Home_Wi-Fi_IoT" ]
+hidden [ "" ]
+nothing [ ] [ ]
+moved true false false false false false

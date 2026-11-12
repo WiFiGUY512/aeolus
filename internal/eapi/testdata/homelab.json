@@ -1,0 +1,36 @@
+[
+  {"hostname": "homelab", "fqdn": "homelab.example.com"},
+  {"mfgName": "Arista", "modelName": "CCS-720DP-24ZS-2F", "systemMacAddress": "28:e7:1d:d2:d0:13", "hwMacAddress": "28:e7:1d:d2:d0:13", "version": "4.30.1F"},
+  {"tablesLastChangeTime": 1783187400.0, "tablesAgeOuts": 1, "tablesInserts": 40, "tablesDeletes": 2, "tablesDrops": 0, "lldpNeighbors": [
+    {"port": "Ethernet13", "neighborDevice": "C360-AP", "neighborPort": "eth1", "ttl": 120},
+    {"port": "Ethernet17", "neighborDevice": "Living-Room-C-360", "neighborPort": "eth0", "ttl": 120},
+    {"port": "Ethernet26", "neighborDevice": "helios", "neighborPort": "enp1s0", "ttl": 120},
+    {"port": "Ethernet28", "neighborDevice": "tower-switch.example.com", "neighborPort": "Ethernet18", "ttl": 120}
+  ]},
+  {"multicastTable": {"tableEntries": []}, "unicastTable": {"tableEntries": [
+    {"vlanId": 20, "macAddress": "30:86:2d:ef:2f:ff", "entryType": "dynamic", "interface": "Port-Channel2", "moves": 1, "lastMove": 1783187500.0},
+    {"vlanId": 20, "macAddress": "aa:bb:cc:00:11:22", "entryType": "dynamic", "interface": "Port-Channel2", "moves": 1, "lastMove": 1783187600.0},
+    {"vlanId": 10, "macAddress": "30:86:2d:bc:a5:ff", "entryType": "dynamic", "interface": "Ethernet17", "moves": 1, "lastMove": 1783187500.0},
+    {"vlanId": 10, "macAddress": "aa:bb:cc:00:33:44", "entryType": "dynamic", "interface": "Ethernet17", "moves": 1, "lastMove": 1783187600.0},
+    {"vlanId": 1010, "macAddress": "2c:dd:e9:12:72:e2", "entryType": "dynamic", "interface": "Ethernet28", "moves": 1, "lastMove": 1783187000.0}
+  ]}},
+  {"interfaces": {
+    "Vlan1": {"name": "Vlan1", "lineProtocolStatus": "up", "interfaceStatus": "connected", "interfaceAddress": {"ipAddr": {"address": "192.168.1.1", "maskLen": 24}}},
+    "Vlan10": {"name": "Vlan10", "lineProtocolStatus": "up", "interfaceStatus": "connected", "interfaceAddress": {"ipAddr": {"address": "192.168.10.1", "maskLen": 24}}},
+    "Vlan20": {"name": "Vlan20", "lineProtocolStatus": "up", "interfaceStatus": "connected", "interfaceAddress": {"ipAddr": {"address": "192.168.20.1", "maskLen": 24}}},
+    "Vlan50": {"name": "Vlan50", "lineProtocolStatus": "up", "interfaceStatus": "connected", "interfaceAddress": {"ipAddr": {"address": "192.168.50.1", "maskLen": 24}}},
+    "Vlan1010": {"name": "Vlan1010", "lineProtocolStatus": "up", "interfaceStatus": "connected", "interfaceAddress": {"ipAddr": {"address": "10.0.1.249", "maskLen": 30}}},
+    "Management1": {"name": "Management1", "lineProtocolStatus": "down", "interfaceStatus": "notconnect", "interfaceAddress": {"ipAddr": {"address": "0.0.0.0", "maskLen": 0}}}
+  }},
+  {"vrfs": {"default": {"routingDisabled": false, "allRoutesProgrammedHardware": true, "routes": {"0.0.0.0/0": {"routeType": "static", "kernelProgrammed": true, "directlyConnected": false, "preference": 1, "metric": 0, "vias": [{"nexthopAddr": "10.0.1.250", "interface": "Vlan1010"}]}}}}},
+  {"dynamicEntries": 3, "staticEntries": 0, "totalEntries": 3, "notLearnedEntries": 0, "ipV4Neighbors": [
+    {"address": "10.0.1.250", "age": 0, "hwAddress": "2cdd.e912.72e2", "interface": "Vlan1010, Ethernet28"},
+    {"address": "192.168.20.7", "age": 0, "hwAddress": "3086.2def.2fff", "interface": "Vlan20, Port-Channel2"},
+    {"address": "192.168.20.151", "age": 0, "hwAddress": "aabb.cc00.1122", "interface": "Vlan20, Port-Channel2"},
+    {"address": "192.168.10.9", "age": 0, "hwAddress": "aabb.cc00.0909", "interface": "Vlan10, not learned"}
+  ]},
+  {"numberOfChannelsInUse": 1, "numberOfAggregators": 1, "portChannels": {
+    "Port-Channel2": {"lacpMode": "active", "protocol": "lacp", "linkState": "down", "fallback": {"status": "fallbackIndividual"},
+      "ports": {"Ethernet13": {"intf": "Ethernet13", "lagMember": false}, "Ethernet14": {"intf": "Ethernet14", "lagMember": false}}, "inactive": false}
+  }}
+]

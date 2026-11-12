@@ -1,0 +1,321 @@
+package change
+
+import (
+	"encoding/json"
+	"errors"
+	"reflect"
+	"strings"
+	"testing"
+
+	"github.com/WiFiGUY512/aeolus/internal/hierarchy"
+)
+
+func TestFirstChangeCreatesTheOrg(t *testing.T) {
+	if _, _, err := Apply(nil, Op{Kind: AddFolder, Tree: Locations, Node: "house", Name: "House", Parent: "example"}); !errors.Is(err, ErrNoOrg) {
+		t.Fatalf("got %v, want ErrNoOrg", err)
+	}
+	o, _, err := Apply(nil, Op{Kind: CreateOrg, Node: "example", Name: "Example", Account: "griff"})
+	if err != nil || o == nil {
+		t.Fatalf("create-org: %v", err)
+	}
+	if _, _, err := Apply(o, Op{Kind: CreateOrg, Node: "other", Name: "Other", Account: "griff"}); !errors.Is(err, ErrOrgExists) {
+		t.Fatalf("second create-org: got %v", err)
+	}
+}
+
+func TestSetDecodesJSONAndRecordsBeforeAfter(t *testing.T) {
+	o := org(t)
+	_, eff, err := Apply(o, Op{Kind: Set, Tree: Locations, Node: "example", Path: "radio.5g.width", Value: json.RawMessage(`80`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if eff.Before != nil || eff.After != float64(80) {
+		t.Fatalf("effect = %+v", eff)
+	}
+	_, eff, err = Apply(o, Op{Kind: Set, Tree: Locations, Node: "example", Path: "radio.5g.width", Value: json.RawMessage(`40`)})
+	if err != nil || eff.Before != float64(80) || eff.After != float64(40) {
+		t.Fatalf("second set: effect %+v, err %v", eff, err)
+	}
+}
+
+func TestSetValuesAllOrNone(t *testing.T) {
+	o := org(t)
+	mustApply(t, o, Op{Kind: Set, Tree: Locations, Node: "house", Path: "radio.5g.width", Value: json.RawMessage(`40`)})
+	_, eff, err := Apply(o, Op{Kind: Set, Tree: Locations, Node: "house", Values: map[hierarchy.Path]json.RawMessage{
+		"radio.5g.width": json.RawMessage(`160`), "radio.5g.channel": json.RawMessage(`36`)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := Effect{Before: map[string]any{"radio.5g.width": float64(40)}, After: map[string]any{"radio.5g.width": float64(160), "radio.5g.channel": float64(36)}}
+	if !reflect.DeepEqual(eff, want) {
+		t.Fatalf("effect = %+v", eff)
+	}
+
+	// With the width locked above, neither field changes: the channel,
+	// set first in path order, is put back.
+	mustApply(t, o, Op{Kind: Set, Tree: Locations, Node: "example", Path: "radio.5g.width", Value: json.RawMessage(`80`)})
+	mustApply(t, o, Op{Kind: Lock, Tree: Locations, Node: "example", Path: "radio.5g.width"})
+	_, _, err = Apply(o, Op{Kind: Set, Tree: Locations, Node: "house", Values: map[hierarchy.Path]json.RawMessage{
+		"radio.5g.width": json.RawMessage(`40`), "radio.5g.channel": json.RawMessage(`44`)}})
+	var locked *hierarchy.LockedError
+	if !errors.As(err, &locked) {
+		t.Fatalf("got %v, want a lock error", err)
+	}
+	if v, _ := o.Org.Locations.Own("house", "radio.5g.channel"); v != float64(36) {
+		t.Fatalf("channel = %v, want 36 put back", v)
+	}
+	if _, _, err := Apply(o, Op{Kind: Set, Tree: Locations, Node: "house", Path: "radio.5g.width", Value: json.RawMessage(`40`),
+		Values: map[hierarchy.Path]json.RawMessage{"radio.5g.channel": json.RawMessage(`44`)}}); !errors.Is(err, ErrTwoForms) {
+		t.Fatalf("both forms: %v", err)
+	}
+}
+
+func TestUnsetPathsAllOrNone(t *testing.T) {
+	o := org(t)
+	mustApply(t, o, Op{Kind: Set, Tree: Locations, Node: "house", Values: map[hierarchy.Path]json.RawMessage{
+		"radio.5g.width": json.RawMessage(`160`), "radio.5g.channel": json.RawMessage(`"auto"`)}})
+
+	// One path not set here: nothing is unset.
+	_, _, err := Apply(o, Op{Kind: Unset, Tree: Locations, Node: "house", Paths: []hierarchy.Path{"radio.5g.width", "radio.2g.width"}})
+	if !errors.Is(err, hierarchy.ErrNotSetHere) {
+		t.Fatalf("got %v, want ErrNotSetHere", err)
+	}
+	if _, ok := o.Org.Locations.Own("house", "radio.5g.width"); !ok {
+		t.Fatal("width was unset although the change failed")
+	}
+
+	_, eff, err := Apply(o, Op{Kind: Unset, Tree: Locations, Node: "house", Paths: []hierarchy.Path{"radio.5g.width", "radio.5g.channel"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := (Effect{Before: map[string]any{"radio.5g.width": float64(160), "radio.5g.channel": "auto"}}); !reflect.DeepEqual(eff, want) {
+		t.Fatalf("effect = %+v", eff)
+	}
+	if _, ok := o.Org.Locations.Own("house", "radio.5g.channel"); ok {
+		t.Fatal("channel still set")
+	}
+	if _, _, err := Apply(o, Op{Kind: Unset, Tree: Locations, Node: "house", Path: "radio.5g.width", Paths: []hierarchy.Path{"radio.5g.channel"}}); !errors.Is(err, ErrTwoForms) {
+		t.Fatalf("both forms: %v", err)
+	}
+}
+
+// A batch makes its sets and unsets, on nodes of either tree, as one: all
+// of them or none, its effect each one's in order (0203).
+func TestBatchAllOrNone(t *testing.T) {
+	o := org(t)
+	mustApply(t, o, Op{Kind: Set, Tree: Locations, Node: "house", Path: "radio.5g.width", Value: json.RawMessage(`40`)})
+	_, eff, err := Apply(o, Op{Kind: Batch, Ops: []Op{
+		{Kind: Set, Tree: Services, Node: "household", Path: "network.home.ssid", Value: json.RawMessage(`"Home"`)},
+		{Kind: Unset, Tree: Locations, Node: "house", Path: "radio.5g.width"},
+		{Kind: Set, Tree: Locations, Node: "example", Values: map[hierarchy.Path]json.RawMessage{"system.tz": json.RawMessage(`"UTC"`)}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := Effect{After: []Effect{
+		{After: "Home"},
+		{Before: float64(40)},
+		{After: map[string]any{"system.tz": "UTC"}},
+	}}
+	if !reflect.DeepEqual(eff, want) {
+		t.Fatalf("effect = %#v", eff)
+	}
+	if v, _ := o.Org.Services.Own("household", "network.home.ssid"); v != "Home" {
+		t.Fatalf("ssid = %v", v)
+	}
+	if _, ok := o.Org.Locations.Own("house", "radio.5g.width"); ok {
+		t.Fatal("width still set")
+	}
+
+	// The last fails, its node gone: the first two are not made.
+	_, _, err = Apply(o, Op{Kind: Batch, Ops: []Op{
+		{Kind: Set, Tree: Services, Node: "household", Path: "network.home.ssid", Value: json.RawMessage(`"Other"`)},
+		{Kind: Set, Tree: Locations, Node: "house", Path: "radio.5g.width", Value: json.RawMessage(`80`)},
+		{Kind: Set, Tree: Locations, Node: "nope", Path: "radio.5g.width", Value: json.RawMessage(`80`)},
+	}})
+	if !errors.Is(err, hierarchy.ErrNotFound) || !strings.Contains(err.Error(), "change 3 of 3") {
+		t.Fatalf("got %v, want change 3's ErrNotFound", err)
+	}
+	if v, _ := o.Org.Services.Own("household", "network.home.ssid"); v != "Home" {
+		t.Fatalf("ssid = %v, want Home kept", v)
+	}
+	if _, ok := o.Org.Locations.Own("house", "radio.5g.width"); ok {
+		t.Fatal("width set although the batch failed")
+	}
+
+	for _, bad := range []Op{
+		{Kind: Batch},
+		{Kind: Batch, Ops: []Op{{Kind: Lock, Tree: Locations, Node: "house", Path: "system.tz"}}},
+		{Kind: Batch, Ops: []Op{{Kind: Batch, Ops: []Op{{Kind: Unset, Tree: Locations, Node: "house", Path: "system.tz"}}}}},
+		{Kind: Batch, Ops: make([]Op, MaxBatch+1)},
+	} {
+		if _, _, err := Apply(o, bad); !errors.Is(err, ErrBadBatch) {
+			t.Errorf("%d changes, first %+v: got %v, want ErrBadBatch", len(bad.Ops), bad.Ops, err)
+		}
+	}
+}
+
+func TestLockReportsRemovedOverrides(t *testing.T) {
+	o := org(t)
+	mustApply(t, o, Op{Kind: Set, Tree: Locations, Node: "example", Path: "system.tz", Value: json.RawMessage(`"America/Chicago"`)})
+	mustApply(t, o, Op{Kind: Set, Tree: Locations, Node: "house", Path: "system.tz", Value: json.RawMessage(`"UTC"`)})
+	_, eff, err := Apply(o, Op{Kind: Lock, Tree: Locations, Node: "example", Path: "system.tz"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(eff.Removed, []hierarchy.Override{{Node: "house", Path: "system.tz", Value: "UTC"}}) {
+		t.Fatalf("removed = %v", eff.Removed)
+	}
+}
+
+func TestAssignServicesIsTheOnlyWayToSetServices(t *testing.T) {
+	o := org(t)
+	_, _, err := Apply(o, Op{Kind: Set, Tree: Locations, Node: "house", Path: hierarchy.ServicesPath, Value: json.RawMessage(`["household"]`)})
+	if !errors.Is(err, ErrUseAssign) {
+		t.Fatalf("got %v, want ErrUseAssign", err)
+	}
+	_, eff, err := Apply(o, Op{Kind: AssignServices, Node: "house", Services: []hierarchy.NodeID{"household"}})
+	if err != nil || !reflect.DeepEqual(eff.After, []hierarchy.NodeID{"household"}) {
+		t.Fatalf("assign: effect %+v, err %v", eff, err)
+	}
+}
+
+func TestBadOps(t *testing.T) {
+	o := org(t)
+	cases := []struct {
+		op   Op
+		want error
+	}{
+		{Op{Kind: "frobnicate", Tree: Locations, Node: "house"}, ErrUnknownKind},
+		{Op{Kind: Rename, Tree: Locations, Node: "house"}, ErrBadName},
+		{Op{Kind: AddFolder, Tree: "sites", Node: "x", Name: "X", Parent: "example"}, ErrUnknownTree},
+		{Op{Kind: AddFolder, Tree: Locations, Name: "X", Parent: "example"}, ErrNoNode},
+		{Op{Kind: Set, Tree: Locations, Node: "house", Value: json.RawMessage(`1`)}, ErrNoPath},
+		{Op{Kind: Set, Tree: Locations, Node: "house", Path: "a"}, ErrNoValue},
+		{Op{Kind: Move, Tree: Locations, Node: "nope", Parent: "example"}, hierarchy.ErrNotFound},
+	}
+	for _, c := range cases {
+		if _, _, err := Apply(o, c.op); !errors.Is(err, c.want) {
+			t.Errorf("%+v: got %v, want %v", c.op, err, c.want)
+		}
+	}
+}
+
+func org(t *testing.T) *State {
+	t.Helper()
+	o, _, err := Apply(nil, Op{Kind: CreateOrg, Node: "example", Name: "Example", Account: "griff"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustApply(t, o, Op{Kind: AddFolder, Tree: Locations, Node: "house", Name: "House", Parent: "example"})
+	mustApply(t, o, Op{Kind: AddFolder, Tree: Services, Node: "household", Name: "Household", Parent: "example"})
+	return o
+}
+
+func mustApply(t *testing.T, o *State, op Op) {
+	t.Helper()
+	if _, _, err := Apply(o, op); err != nil {
+		t.Fatalf("%+v: %v", op, err)
+	}
+}
+
+// An AP's name is its hostname (0076): a rename must give it one, and no
+// other AP's; a folder's name is freer.
+func TestRename(t *testing.T) {
+	o := org(t)
+	mustApply(t, o, Op{Kind: AddAP, Tree: Locations, Node: "office-ap", Name: "OfficeOpenWrt", Parent: "house"})
+	mustApply(t, o, Op{Kind: AddAP, Tree: Locations, Node: "gate-ap", Name: "GateOpenWrt", Parent: "house"})
+	for _, c := range []struct {
+		node, name string
+		want       error
+	}{
+		{"office-ap", "Office-AP", nil},
+		{"office-ap", "office ap", ErrBadHostname},
+		{"office-ap", "-office", ErrBadHostname},
+		{"office-ap", strings.Repeat("a", 64), ErrBadHostname},
+		{"office-ap", "gateopenwrt", ErrNameTaken},
+		{"house", "The House, north wing", nil},
+		{"house", strings.Repeat("h", 65), ErrBadName},
+		{"house", "two\nlines", ErrBadName},
+	} {
+		_, eff, err := Apply(o, Op{Kind: Rename, Tree: Locations, Node: hierarchy.NodeID(c.node), Name: c.name})
+		if !errors.Is(err, c.want) {
+			t.Errorf("rename %s to %q: %v, want %v", c.node, c.name, err, c.want)
+			continue
+		}
+		if err == nil && eff.After != c.name {
+			t.Errorf("rename %s: effect %+v", c.node, eff)
+		}
+	}
+	if n, _ := o.Org.Locations.Node("office-ap"); n.Name != "Office-AP" {
+		t.Errorf("office-ap is named %q", n.Name)
+	}
+}
+
+// A new folder's ID and name are checked when it is made, not when the log
+// is replayed (0076).
+func TestGuardChecksNewFolders(t *testing.T) {
+	for _, c := range []struct {
+		node, name string
+		want       error
+	}{
+		{"north-wing", "North wing", nil},
+		{"North Wing", "North wing", ErrBadFolderID},
+		{"-wing", "Wing", ErrBadFolderID},
+		{strings.Repeat("a", 33), "Wing", ErrBadFolderID},
+		{"wing", "", ErrBadName},
+		{"wing", "two\nlines", ErrBadName},
+	} {
+		op := Op{Kind: AddFolder, Tree: Locations, Node: hierarchy.NodeID(c.node), Name: c.name, Parent: "example"}
+		if err := Guard(op); !errors.Is(err, c.want) {
+			t.Errorf("add folder %q named %q: %v, want %v", c.node, c.name, err, c.want)
+		}
+	}
+	if err := Guard(Op{Kind: Set, Tree: Locations, Node: "Odd Old ID"}); err != nil {
+		t.Errorf("a set is not guarded here: %v", err)
+	}
+}
+
+// A batch may make a services folder, have a location take it and put a
+// network in it, as one change (0320): all of it or none, its effect each
+// one's; a change of another kind still is no batch's.
+func TestBatchMakesAServicesFolder(t *testing.T) {
+	o := org(t)
+	op := Op{Kind: Batch, Ops: []Op{
+		{Kind: AddFolder, Tree: Services, Node: "guests", Name: "Guests", Parent: "example"},
+		{Kind: AssignServices, Node: "house", Services: []hierarchy.NodeID{"household", "guests"}},
+		{Kind: Set, Tree: Services, Node: "guests", Path: "network.guest.ssid", Value: json.RawMessage(`"Guest"`)},
+	}}
+	_, eff, err := Apply(o, op)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if effs, ok := eff.After.([]Effect); !ok || len(effs) != 3 {
+		t.Fatalf("effect = %#v", eff)
+	}
+	if v, _ := o.Org.Services.Own("guests", "network.guest.ssid"); v != "Guest" {
+		t.Fatalf("ssid = %v", v)
+	}
+	if v, _ := o.Org.Locations.Own("house", hierarchy.ServicesPath); !reflect.DeepEqual(v, []hierarchy.NodeID{"household", "guests"}) {
+		t.Fatalf("house takes %v", v)
+	}
+
+	// Taking a folder that is not there yet fails, and the folder made
+	// before it in the batch is not made either.
+	_, _, err = Apply(o, Op{Kind: Batch, Ops: []Op{
+		{Kind: AddFolder, Tree: Services, Node: "iot", Name: "IoT", Parent: "example"},
+		{Kind: AssignServices, Node: "house", Services: []hierarchy.NodeID{"nope"}},
+	}})
+	if !errors.Is(err, hierarchy.ErrNotFound) || !strings.Contains(err.Error(), "change 2 of 2") {
+		t.Fatalf("got %v, want change 2's ErrNotFound", err)
+	}
+	if _, ok := o.Org.Services.Node("iot"); ok {
+		t.Fatal("the folder was made by a batch that failed")
+	}
+
+	// A move is still no batch's.
+	_, _, err = Apply(o, Op{Kind: Batch, Ops: []Op{{Kind: Move, Tree: Services, Node: "guests", Parent: "household"}}})
+	if !errors.Is(err, ErrBadBatch) {
+		t.Fatalf("a move in a batch: %v", err)
+	}
+}

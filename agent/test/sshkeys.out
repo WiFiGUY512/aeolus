@@ -1,0 +1,36 @@
+-- first time, two keys by hand
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHand1 griff@laptop
+ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQOther porting
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIManager aeolus-manager
+ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYSet claude
+managed: aeolus-manager, claude
+-- the same again is the same: true
+-- one key unset
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHand1 griff@laptop
+ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQOther porting
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIManager aeolus-manager
+managed: aeolus-manager
+-- a key already there by hand
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHand1 griff@laptop
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIManager aeolus-manager
+managed: aeolus-manager
+-- then unset in Aeolus: the hand key stays
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHand1 griff@laptop
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIManager aeolus-manager
+managed: aeolus-manager
+-- no file
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIManager aeolus-manager
+managed: aeolus-manager
+-- an option line kept
+no-pty ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQOther porting
+# a comment
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIManager aeolus-manager
+managed: aeolus-manager
+-- none from Aeolus
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHand1 griff@laptop
+ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQOther porting
+managed: 
+-- not a key
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIManager aeolus-manager
+managed: aeolus-manager
+-- id ignores the comment: true

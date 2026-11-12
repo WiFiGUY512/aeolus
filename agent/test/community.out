@@ -1,0 +1,15 @@
+== What this AP has to say, from aeolus-steer's file
+  four seconds after it was written, made older, the old and the bad left out: [ [ "6c:ac:c2:cf:b6:3f", [ "2g", "5g", "6g" ], 4 ], [ "02:00:00:00:00:0b", [ "2g", "5g" ], 54 ] ]
+  a file twenty seconds old says nothing: [ ]; nor none: [ ]; nor one from the future: [ ]
+
+== Its message, fitted to one frame
+  { "v": 1, "t": "community", "ap": "ap-30862dbca5ff", "at": 1791770000, "seq": 7, "clients": [ [ "6c:ac:c2:cf:b6:3f", [ "2g", "5g", "6g" ], 4 ], [ "02:00:00:00:00:0b", [ "2g", "5g" ], 54 ] ] }
+  nothing to say, as where community sharing is off, no message: null
+  eighty: 24 said, the latest first, 1374 bytes signed, at most 1400
+
+== Another AP's, checked
+  [ [ "6c:ac:c2:cf:b6:3f", [ "5g", "6g" ], 2 ] ]
+  a hello is not one: [ ]; nor junk: [ ]
+
+== What aeolus-steer reads, by this AP's clock
+  { "at": 1791770000, "clients": { "6c:ac:c2:cf:b6:3f": [ { "ap": "ap-30862d46348f", "bands": [ "2g", "5g", "6g" ], "at": 1791769985 }, { "ap": "ap-e4d124be3a7f", "bands": [ "5g", "6g" ], "at": 1791769998 } ] } }

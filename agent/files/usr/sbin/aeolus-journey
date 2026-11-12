@@ -1,0 +1,1261 @@
+#!/usr/bin/ucode -S
+// aeolus-journey: the Aeolus agent's record of each Wi-Fi client coming
+// online (0118).
+//
+// From a client's authentication to its first traffic, it notes each step
+// as it happens: what hostapd says of it (authenticated, associated, signed
+// in, its keys made, or why not), then, from the frames that cross the
+// network's Wi-Fi interface, its DHCP, the ARP for its gateway, its first
+// DNS lookups and the first connection it opens. An attempt ends when the
+// client is online, when it leaves, or when it gets no further; each is one
+// record, passed or failed, with the stage it stopped at.
+//
+// Where hostapd's rings are read (0146), the steps up to the keys come from
+// its frames (0254): its answers to a client's authentication and
+// association, WPA3's exchange, each message of the key handshake, and a
+// client's leaving, each at hostapd's own time of it. hostapd's own words
+// come from the system log: logread, which this daemon starts, sends the
+// lines that name hostapd to it over UDP on the loopback. Of those, what
+// the frames say is left out, and the rest kept: the keys in place, a
+// wrong passphrase, the sign-in. Where the rings are not read, hostapd is
+// asked for its debug lines instead (0133), on its control socket: there
+// it says each message of the key handshake, and WPA3's authentication. A
+// step from the log is timed by when the log took the line in, which
+// logread says to the millisecond: the lines reach here a few at a time,
+// and the messages of a handshake are milliseconds apart.
+// The frames come from a packet socket on each Wi-Fi interface, with a
+// kernel filter that keeps only ARP and DHCP until a client is being
+// watched, and then DNS and the frames that open TCP connections too. A
+// step from a frame is timed by when the kernel took the frame in.
+// Nothing is sent, and no client is held up.
+//
+// The records go to /var/run/aeolus/connections.json, which the agent sends
+// to the manager; the agent writes back how far it got, and what was sent
+// is let go. procd runs it beside the agent.
+//
+// Of an attempt that fails it keeps a capture too (0135): the client's
+// frames as the AP heard and sent them, and those that crossed the wire
+// side. The AP's are hostapd's own (0146): it keeps what it says to the
+// kernel and hears from it in rings another process may read (udebug),
+// and this daemon reads them as they fill. No monitor interface is made,
+// and nothing is asked of a radio. The captures go to a directory beside
+// the records, a file each, which the agent sends to the manager and takes
+// away.
+//
+// Of a client that is traced (0144) it says more, and at once: every step
+// of an attempt as it is noted, what hostapd says of the client outside
+// one, what an attempt came to, and twice a second how strongly the client
+// is heard, on one of the AP's networks or only asking. Where hostapd's
+// rings are read (0146), each frame hostapd hears from the client and sends
+// to it is said too, at hostapd's own time of it: its probes, its
+// authentication and association and the answers, each key message, and
+// its leaving. Whom to trace is in
+// a file beside the records, which aeolus-live writes when the manager
+// says so on the AP's line (0145), and the agent at its poll where there is
+// no line. Each thing seen goes to aeolus-live's socket as it is seen, and
+// from there to the manager.
+//
+//	aeolus-journey [-o <records file>] [-p <UDP port>]
+//
+// -o and -p are for trying it out beside the one procd runs.
+
+'use strict';
+
+import * as fs from 'fs';
+import * as socket from 'socket';
+import { cursor } from 'uci';
+import * as capture from 'aeolus.capture';
+import { connect } from 'ubus';
+import { openlog, syslog, LOG_PID, LOG_DAEMON, LOG_INFO, LOG_WARNING } from 'log';
+import * as journey from 'aeolus.journey';
+import * as rrm from 'aeolus.rrm';
+import * as letgo from 'aeolus.letgo';
+import * as sentoff from 'aeolus.sentoff';   // what Aeolus sent a client off for (0255)
+import * as wifinames from 'aeolus.wifinames';   // netifd's Wi-Fi status through a radio being set up again (0301)
+
+// OpenWrt's reader of the rings its services keep (ucode-mod-udebug), where
+// it is installed: without it a capture has the wire side alone.
+let udebug = null;
+try {
+	udebug = require('udebug');
+} catch (e) {
+}
+
+let out = '/var/run/aeolus/connections.json', port = 16731;
+for (let i = 0; i < length(ARGV); i++) {
+	if (ARGV[i] == '-o')
+		out = ARGV[++i];
+	else if (ARGV[i] == '-p')
+		port = int(ARGV[++i]);
+}
+
+const SENT = out + '.sent';        // how far the agent got: { boot, seq }
+const PIDFILE = out + '.logread';  // the logread this daemon started
+const LOOK_EVERY = 10;             // seconds between looks at the Wi-Fi interfaces
+const CTL_SOCKET = out + '.ctl';    // this daemon's sockets, which hostapd answers to: one a network
+const HOSTAPD_CTL = '/var/run/hostapd/';   // where hostapd's networks have their control sockets
+const DEBUG = 1, INFO = 2;         // hostapd's log levels: the lower, the more it says
+const WRITE_EVERY = 2;             // seconds between writes of the records, at most
+const COLLECT_EVERY = 60;          // seconds between two runs of the garbage collector
+const KEPT = 128;                  // records kept for the agent; past that, the oldest go
+const OPEN = 256;                  // attempts followed at once
+const WIDE = journey.capture(true), NARROW = journey.capture(false);
+const CAPTURES = replace(out, /[^\/]*$/, 'captures');   // where the captures go, beside the records
+const CAPTURES_KEPT = 10;          // captures kept for the agent; past that, the oldest go
+const CAPTURE_EVERY = 60;          // seconds between two captures of one client, at the least
+const RINGS = {                    // hostapd's rings that are read (0146), and what each is asked to hold:
+	wpa_nl_rx: { size: 1048576, entries: 4096 },   // what the kernel hands it, the frames a radio heard among it: half a minute and more of an AP's usual talk
+	wpa_nl_tx: { size: 262144, entries: 2048 },    // and what it asks of the kernel, the frames to send among it
+};
+const RING_SAID = replace(out, /[^\/]*$/, 'rings');   // whether they are read, for the agent: 'read', 'restart' where hostapd must start anew to have them, or 'none'
+const RING_EVERY = 0.2;            // seconds between two reads of them, at the least
+const RING_TRACED = 0.05;          // and while a client is traced, whose frames are said as they are read
+const PROBE_EVERY = 1000;          // ms between two of a traced client's probes that are said, a radio
+// Tracing a client (0144): whom, and where what is seen of them goes.
+const TRACE = replace(out, /[^\/]*$/, 'trace.json');   // the clients to trace (0144): { macs: { mac: until, in seconds } }
+const LIVE = replace(out, /[^\/]*$/, 'live.sock');     // where aeolus-live takes what is seen of them, to send at once (0145)
+const TRACE_KEPT = 400;            // things kept while aeolus-live is not there to take them; past that, the oldest go
+const TRACE_LOOK = 0.5;            // seconds between looks at how strongly each traced client is heard
+const TRACE_READ = 2;              // seconds between looks at whom to trace, where nothing said it changed
+const POKE = 'aeolus-trace';       // what aeolus-live sends to the log's socket when whom to trace has changed
+const HOLD = capture.AFTER + 1.2;  // seconds an attempt that failed waits for its capture: for the frames after it, and the radio's word on those the AP sent
+
+let bus = connect();
+let wifi_names = wifinames.keeper();   // what netifd's Wi-Fi status last said of each radio it is not setting up (0301)
+openlog('aeolus-journey', LOG_PID, LOG_DAEMON);
+
+function log(fmt, ...args) {
+	syslog(LOG_INFO, fmt, ...args);
+}
+
+function note(fmt, ...args) {
+	syslog(LOG_WARNING, fmt, ...args);
+}
+
+function read(path) {
+	let v = fs.readfile(path);
+	return v == null ? null : trim(v);
+}
+
+function store(path, data) {
+	let tmp = path + '.new';
+	if (fs.writefile(tmp, data) == null)
+		return false;
+	return fs.rename(tmp, path);
+}
+
+// now is monotonic time in seconds, to the microsecond.
+function now() {
+	let c = clock(true);
+	return c[0] + c[1] / 1e9;
+}
+
+// wall is the calendar's time in milliseconds.
+function wall() {
+	let c = clock();
+	return c[0] * 1000 + int(c[1] / 1e6);
+}
+
+let boot = wall();    // this run, so the agent tells its records from the last run's
+let bsses = {};       // a network's Wi-Fi interface, as hostapd names it -> { network, ssid, band, more }
+let fine = {};        // a network's interface -> whether hostapd took the asking for its debug lines
+let air = {};         // a network's interface -> what its frames said of each client that a later frame needs (journey.air_event)
+let leaving = {};     // '<bss> <mac>' -> the client's latest leaving frame (0255): { by, frame, reason, at }, at in ms by the calendar
+let downs = {};       // a network's interface -> the AP's latest leaving frame to every station: { frame, reason, at }
+let ifaces = {};      // an interface watched -> { sock, bss, index, wide }: a BSS, or a VLAN's interface on it
+let open = {};        // '<bss> <mac>' -> the attempt being followed
+let done = [];        // the records not yet sent, oldest first
+let seq = 0, dropped = 0, dirty = false;
+let logsock = null;
+let capturing = true; // whether captures are kept: unless the AP's config says not (0135)
+let radios = {};      // a radio that serves, by its phy -> its ring of frames, as hostapd had them (0146)
+let rings = {};       // hostapd's rings being read, by name -> { ref, id, pid, flag, skip }
+let taken = {};       // one of them, by name -> { pid, last }: the time of the latest entry taken from it, in microseconds
+let links = {};       // a Wi-Fi interface, by its index -> { phy, bssid, bss }, or false: whose a frame of hostapd's is
+let ring_state = null; // why nothing is read of hostapd's rings, as last said in the log: '' where they are read
+let probed = {};      // '<mac> <phy>' -> when a traced client's probe was last said, in ms
+let captured = {};    // a client -> when a capture of it was last kept
+let captures = 0;     // captures kept by this run
+let held = [];        // attempts that failed, waiting for their captures: { a, r, at, until }, the first first
+let waiting = [];     // captures kept whose records are not yet written, by their names
+let stopping = false; // asked to stop
+let heard = null;     // usteer's clients, when last asked, and when
+let tracing = {};     // a client traced -> until when, in seconds by the calendar's clock
+let told = [];        // what was seen of them and aeolus-live has not taken: { seq, at, mac, stage, what, ... }
+let told_seq = 0;
+let hearing = {};     // a client traced -> how it was last said to be heard: { k, signal, at }
+let livesock = null;  // the socket to aeolus-live, once it is there
+let poked = false;    // aeolus-live said whom to trace has changed
+
+function ifindex(name) {
+	return read(`/sys/class/net/${name}/ifindex`);
+}
+
+// unwatched keeps what was said of each interface that could not be
+// watched: one not there yet, as a network while its radio listens for
+// radar, is said of once, and again only where what is wrong changes.
+let unwatched = {};
+
+// packet opens a packet socket on dev that sees what prog keeps.
+function packet(dev, prog) {
+	let s = socket.create(socket.AF_PACKET, socket.SOCK_RAW, 0);
+	if (!s)
+		return null;
+	if (!s.bind({ family: socket.AF_PACKET, protocol: 3, address: '00:00:00:00:00:00', interface: dev }) ||
+	    !s.setopt(socket.SOL_SOCKET, socket.SO_ATTACH_FILTER, { len: length(prog), filter: prog })) {
+		let said = sprintf('cannot watch %s: %s', dev, socket.error());
+		if (unwatched[dev] != said)
+			note('%s', said);
+		unwatched[dev] = said;
+		s.close();
+		return null;
+	}
+	delete unwatched[dev];
+	// The kernel says when each frame came, for a capture (0135): the
+	// daemon reads them when it gets to it, which may be a while after.
+	// Asked for in nanoseconds: ucode hands that stamp as the kernel wrote
+	// it, and reads the one in microseconds wrongly on a 32-bit processor.
+	s.setopt(socket.SOL_SOCKET, socket.SO_TIMESTAMPNS, 1);
+	// What arrived before the filter took hold goes.
+	while (s.recv(2048, socket.MSG_DONTWAIT) != null)
+		;
+	return s;
+}
+
+// came is when the kernel took a frame in, as it says with the frame: on
+// the steady clock in seconds, and on the calendar's in ms. Where it does
+// not say, or says a time that cannot be right, now.
+function came(m) {
+	let t = now(), w = wall();
+	for (let c in m?.ancillary ?? []) {
+		let stamped = c.level == socket.SOL_SOCKET ? capture.stamp(c.data, w) : null;
+		if (stamped != null)
+			return [t - (w - stamped) / 1000.0, stamped];
+	}
+	return [t, w];
+}
+
+// hostapd_ctl sends one of hostapd's networks a command on its control
+// socket, and returns its answer: null where none comes in a tenth of a
+// second, false where the command could not be sent, as where hostapd
+// takes nothing in just now: it is not waited for. hostapd answers to the
+// asking socket's own path, as its own user, which must be able to write
+// there; the path is the network's own, so an answer that comes late is
+// not taken for another's.
+function hostapd_ctl(bss, ask) {
+	let k = socket.create(socket.AF_UNIX, socket.SOCK_DGRAM);
+	if (!k)
+		return false;
+	let mine = CTL_SOCKET + '.' + bss;
+	fs.unlink(mine);
+	let answer = false;
+	if (k.bind({ path: mine }) && fs.chmod(mine, 0o666) && k.connect({ path: HOSTAPD_CTL + bss }) && k.send(ask, socket.MSG_DONTWAIT) != null) {
+		socket.poll(100, [k, socket.POLLIN]);
+		answer = k.recv(256, socket.MSG_DONTWAIT);
+	}
+	k.close();
+	fs.unlink(mine);
+	return answer;
+}
+
+// framed says whether an attempt's steps come from hostapd's frames
+// (0254): both its rings are read.
+function framed() {
+	return length(rings) > 0 && length(rings) == length(RINGS);
+}
+
+// say_more asks hostapd for its debug lines of each network (0133). It is
+// asked on its control socket, which restarts nothing and drops no client,
+// and at every look, as hostapd goes back to what its config says each time
+// that is loaded. Not every network is asked: see look. With back, those
+// that were asked are put back to hostapd's own level instead, as the
+// daemon stops. Where the frames are read (0254) none is asked, and those
+// this daemon asked before are put back.
+function say_more(back) {
+	if (!back && framed()) {
+		let put = [];
+		for (let bss in keys(fine)) {
+			if (fine[bss] && bsses[bss])
+				hostapd_ctl(bss, 'SET logger_syslog_level ' + INFO);
+			if (fine[bss])
+				push(put, bss);
+			delete fine[bss];
+		}
+		if (length(put))
+			log('hostapd\'s frames say each step: its debug lines are no longer asked for on %s', join(' ', sort(put)));
+		return;
+	}
+	let now_fine = [], not_fine = [];
+	for (let bss, b in bsses) {
+		if (!b.more || (back && !fine[bss]))
+			continue;
+		let took = match(hostapd_ctl(bss, 'SET logger_syslog_level ' + (back ? INFO : DEBUG)) || '', /^OK/) != null;
+		if (back)
+			continue;
+		if (fine[bss] !== took)
+			push(took ? now_fine : not_fine, bss);
+		fine[bss] = took;
+	}
+	for (let bss in keys(fine))
+		if (!bsses[bss])
+			delete fine[bss];
+	// Said once of a network, and again where it changes.
+	if (length(now_fine))
+		log('hostapd says each message of the key handshake on %s', join(' ', sort(now_fine)));
+	if (length(not_fine))
+		note('hostapd did not take the asking for its debug lines on %s: the key handshake is recorded as one step there', join(' ', sort(not_fine)));
+}
+
+// ask_rings has hostapd keep the rings this daemon reads (0146), or lets
+// them go, by udebug's own config: the service that hands rings out
+// (udebugd) tells hostapd, which makes or frees them as it runs. Nothing
+// restarts, and no client is dropped. What is set is marked as Aeolus's,
+// and only what is marked is taken back: an AP whose owner has hostapd keep
+// rings for reasons of their own keeps them. Where hostapd kept none
+// before, the others it could keep stay off: its log's would have every
+// line it logs written twice.
+function ask_rings(on) {
+	let c = cursor(), s = c.get_all('udebug', 'hostapd');
+	if (type(s) != 'object')
+		return;
+	let want = {};
+	if (on) {
+		for (let name, r in RINGS) {
+			want[name] = '1';
+			want[name + '_size'] = '' + r.size;
+			want[name + '_entries'] = '' + r.entries;
+		}
+		want.enabled = '1';
+		want.aeolus = s.aeolus ?? (s.enabled == '1' ? 'rings' : 'all');
+		if (want.aeolus == 'all') {
+			want.wpa_log = '0';
+			want.wpa_nl_ctrl = '0';
+		}
+	}
+	else if (s.aeolus != null) {
+		for (let name in keys(RINGS)) {
+			want[name] = '0';
+			want[name + '_size'] = null;
+			want[name + '_entries'] = null;
+		}
+		if (s.aeolus == 'all') {
+			want.enabled = '0';
+			want.wpa_log = '1';
+		}
+		want.aeolus = null;
+	}
+	let changed = false;
+	for (let k, v in want) {
+		if (s[k] == v)
+			continue;
+		changed = true;
+		if (v == null)
+			c.delete('udebug', 'hostapd', k);
+		else
+			c.set('udebug', 'hostapd', k, v);
+	}
+	if (!changed)
+		return;
+	c.commit('udebug');
+	system(['/etc/init.d/udebug', 'reload']);
+	log(on ? 'hostapd is asked to keep what it says to the kernel and hears from it, for captures (udebug)' : 'hostapd is no longer asked to keep what it says to the kernel');
+}
+
+// close_rings lets go of hostapd's rings; what was taken from each is
+// remembered, should the same hostapd's be opened again.
+function close_rings() {
+	for (let name, o in rings)
+		o.ref.close();
+	rings = {};
+}
+
+// link_of is the radio an interface of hostapd's is on, its network's
+// address and the network's own interface, by the interface's index as
+// netlink says it; null for what is no Wi-Fi interface. Looked up when
+// first needed, and anew after each look at the AP's networks.
+function link_of(index) {
+	let l = links[index];
+	if (l != null)
+		return l || null;
+	l = false;
+	for (let name in fs.lsdir('/sys/class/net') ?? []) {
+		if (ifindex(name) != '' + index)
+			continue;
+		let phy = read(`/sys/class/net/${name}/phy80211/name`), addr = read(`/sys/class/net/${name}/address`);
+		// A VLAN's interface on a network is that network's.
+		let base = match(name, /^(.+)-[kr][0-9]+$/)?.[1];
+		if (phy && match(phy, /^phy[0-9]+$/) && addr && match(addr, /^([0-9a-f]{2}:){5}[0-9a-f]{2}$/))
+			l = { phy: phy, bssid: addr, bss: !bsses[name] && base && bsses[base] ? base : name };
+		break;
+	}
+	links[index] = l;
+	return l || null;
+}
+
+// watch_hostapd sees that hostapd's rings are there to read (0146), at
+// each look: hostapd asked to keep them, each one opened, and the rx ring
+// told to keep the frames a radio heard, which it forgets with each start
+// of hostapd. A radio that serves has a ring of its own here, which the
+// frames go to as they are read, where captures are on. The rings are read
+// whether or not they are: an attempt's steps come from them (0254).
+//
+// hostapd looks for the service that hands rings out once, as it starts:
+// where the service was installed after, hostapd has no rings until Wi-Fi
+// is next restarted, or the AP. That is said in the log, once, and to the
+// agent, and not brought about: restarting Wi-Fi drops every client. The
+// agent, asked by someone to restart the Wi-Fi, then starts hostapd anew
+// with it. Until then a failed attempt's capture has what crossed the wire
+// side.
+function watch_hostapd(at) {
+	// A monitor interface a release before this one left on a radio (0135).
+	for (let n in fs.lsdir('/sys/class/net') ?? [])
+		if (match(n, /^aemon[0-9]+$/))
+			system(['iw', 'dev', n, 'del']);
+	links = {};
+	let want = {};
+	for (let ifname, b in bsses) {
+		let phy = read(`/sys/class/net/${ifname}/phy80211/name`);
+		if (phy && match(phy, /^phy[0-9]+$/)) {
+			b.phy = phy;
+			want[phy] = true;
+		}
+	}
+	for (let phy in keys(radios))
+		if (!capturing || !want[phy])
+			delete radios[phy];
+	if (capturing)
+		for (let phy in keys(want))
+			radios[phy] ??= capture.ring();
+	let why = '', restart = false;
+	if (!udebug)
+		why = 'what reads hostapd\'s rings is not installed (ucode-mod-udebug)';
+	else {
+		ask_rings(true);
+		let list = udebug.init(null, false) ? bus.call('udebug', 'list', { proc_name: [ 'hostapd' ] })?.results : null;
+		if (type(list) != 'array')
+			why = 'the service that hands out hostapd\'s rings does not run (udebugd)';
+		else {
+			let found = {};
+			for (let l in list)
+				if (RINGS[l.ring_name])
+					found[l.ring_name] = l;
+			// One whose hostapd went, or was started anew, is let go.
+			for (let name in keys(rings))
+				if (found[name]?.id != rings[name].id || found[name]?.pid != rings[name].pid) {
+					rings[name].ref.close();
+					delete rings[name];
+				}
+			for (let name, l in found) {
+				let o = rings[name];
+				if (!o) {
+					let ref = udebug.get_ring(l);
+					if (!ref)
+						continue;
+					// What was taken of this hostapd's ring before is not taken twice.
+					o = rings[name] = { ref: ref, id: l.id, pid: l.pid, flag: 0, skip: taken[name]?.pid == l.pid ? taken[name].last : null };
+					for (let f in l.flags ?? [])
+						if (f[0] == 'rx_frame')
+							o.flag = f[1];
+				}
+				if (o.flag)
+					o.ref.change_flags(0, o.flag);
+			}
+			if (length(rings) < length(RINGS)) {
+				why = 'hostapd keeps no rings: it found no service to hand them out when it started, and has them once Wi-Fi is next restarted, or the AP';
+				restart = true;
+			}
+		}
+	}
+	if (why !== ring_state) {
+		if (why)
+			note('hostapd\'s frames are not read, so records come from its log and a failed attempt has no capture of its radio: %s', why);
+		else
+			log('reading what hostapd hears and sends, for records and captures');
+		ring_state = why;
+		// For the agent: asked to restart the Wi-Fi of an AP whose hostapd
+		// must start anew to have its rings, it starts hostapd anew too.
+		store(RING_SAID, why ? (restart ? 'restart' : 'none') : 'read');
+	}
+}
+
+// keep_capture keeps the capture of an attempt that failed, and returns
+// what the record says of it, { id, frames }, or null where there is
+// none: nothing was heard of the client, or it had one within the last
+// CAPTURE_EVERY seconds, so that a client that fails over and over, as one
+// with a wrong passphrase, does not take every place. The file is the
+// capture in base64 with whose it is, for the agent to send as it is.
+// CAPTURES_KEPT are kept, the latest.
+function keep_capture(a, at) {
+	if (!capturing || (captured[a.mac] != null && at - captured[a.mac] < CAPTURE_EVERY))
+		return null;
+	let phy = bsses[a.bss]?.phy;
+	let c = capture.capture(radios[phy], a.mac, a.started, at, a.wire, `${phy ?? 'radio'}, as hostapd heard and sent`, `${a.bss}, the wire side`);
+	if (!c)
+		return null;
+	let id = sprintf('%d-%d', boot, ++captures);
+	// A client's key handshake is for no one else on the AP to read.
+	fs.mkdir(CAPTURES, 0o700);
+	// Under a name the agent does not take up, until the attempt's record
+	// is written: sent before the record, the manager has no attempt for
+	// it, refuses it, and the agent lets it go.
+	let path = `${CAPTURES}/${id}.json.wait`;
+	let file = fs.open(path, 'w', 0o600);
+	let whole = file != null && file.write(sprintf('%J\n', { id: id, mac: a.mac, bss: a.bss, started: a.wall, frames: c.frames, radio: c.radio, wire: c.wire, file: b64enc(c.file) })) != null;
+	if (file)
+		file.close();
+	if (!whole) {
+		fs.unlink(path);
+		return null;
+	}
+	push(waiting, id);
+	for (let mac, t in captured)
+		if (at - t >= CAPTURE_EVERY)
+			delete captured[mac];
+	captured[a.mac] = at;
+	// The oldest go: by this run's count, and any a run before left.
+	let mine = (n) => index(n, boot + '-') == 0 ? int(substr(n, length('' + boot) + 1)) : 0;
+	let files = sort(filter(fs.lsdir(CAPTURES) ?? [], n => match(n, /^[0-9]+-[0-9]+\.json(\.wait)?$/)), (x, y) => mine(x) - mine(y));
+	for (let n in slice(files, 0, max(0, length(files) - CAPTURES_KEPT)))
+		fs.unlink(`${CAPTURES}/${n}`);
+	return { id: id, frames: c.frames };
+}
+
+// look takes up the AP's Wi-Fi networks as netifd has them now: each one's
+// interface, and the interfaces hostapd makes on it for clients a key or
+// the RADIUS server put in a VLAN (<bss>-k<vlan>, <bss>-r<vlan>), whose
+// frames cross there. A radio netifd is setting up again is as it last
+// was (0301): its interfaces run on, and their sockets with them, through
+// the moments its clients rejoin.
+function look() {
+	let want = {};
+	bsses = {};
+	for (let r, v in wifi_names.view(bus.call('network.wireless', 'status')) ?? {})
+		for (let i in v.interfaces ?? []) {
+			if (!i.ifname || (i.config?.mode ?? 'ap') != 'ap')
+				continue;
+			let n = filter(i.config?.network ?? [], x => match(x, /^aeolus_/))[0];
+			let enc = '' + (i.config?.encryption ?? 'none');
+			bsses[i.ifname] = {
+				network: n ? replace(substr(n, 7), /_/g, '-') : '',
+				ssid: substr(replace('' + (i.config?.ssid ?? ''), /[^ -~]/g, '?'), 0, 32), band: v.config?.band ?? '',
+				// Whether hostapd is asked for its debug lines there (0133).
+				// Not where the AP's own config says how much its radio
+				// logs: that is someone's choice. And not on a network that
+				// signs clients in by 802.1X: there the lines name each
+				// client's identity, and every word with the RADIUS server.
+				more: v.config?.log_level == null && !match(enc, /^(wpa|eap|8021x)/),
+				// What its frames are read with (0254): whether it has WPA3,
+				// and whether its clients sign in by 802.1X.
+				sae: match(enc, /sae/) != null, eap: match(enc, /^(wpa|eap|8021x)/) != null,
+			};
+			want[i.ifname] = i.ifname;
+		}
+	for (let name in fs.lsdir('/sys/class/net') ?? []) {
+		let m = match(name, /^(.+)-[kr][0-9]+$/);
+		if (m && bsses[m[1]])
+			want[name] = m[1];
+	}
+	// What a network's frames said of a client is kept two minutes, and
+	// a leaving's frame a minute.
+	let t = time();
+	for (let k, l in leaving)
+		if (t * 1000 - l.at > 60000)
+			delete leaving[k];
+	for (let k, d in downs)
+		if (t * 1000 - d.at > 60000 || !bsses[k])
+			delete downs[k];
+	for (let bss in keys(air)) {
+		if (!bsses[bss]) {
+			delete air[bss];
+			continue;
+		}
+		for (let mac, st in air[bss])
+			if (t - (st.at ?? 0) > 120)
+				delete air[bss][mac];
+	}
+	for (let name in keys(ifaces))
+		if (want[name] != ifaces[name].bss || ifindex(name) != ifaces[name].index) {
+			ifaces[name].sock.close();
+			delete ifaces[name];
+		}
+	for (let name, bss in want)
+		if (!ifaces[name]) {
+			let s = packet(name, NARROW);
+			if (s)
+				ifaces[name] = { sock: s, bss: bss, index: ifindex(name), wide: 0 };
+		}
+}
+
+// widen has a network's interfaces keep DNS and new connections too, until
+// a time: while a client on it is being watched.
+function widen(bss, until) {
+	for (let name, i in ifaces)
+		if (i.bss == bss) {
+			if (!i.wide)
+				i.sock.setopt(socket.SOL_SOCKET, socket.SO_ATTACH_FILTER, { len: length(WIDE), filter: WIDE });
+			i.wide = max(i.wide, until);
+		}
+}
+
+// narrow puts back the filter that lets the AP's traffic be, where no
+// client is watched any more.
+function narrow(at) {
+	for (let name, i in ifaces)
+		if (i.wide && at > i.wide) {
+			i.sock.setopt(socket.SOL_SOCKET, socket.SO_ATTACH_FILTER, { len: length(NARROW), filter: NARROW });
+			i.wide = 0;
+		}
+}
+
+// probes is where a client was heard asking for networks before it joined,
+// as band steering's usteer has it, the strongest first: this AP's radios,
+// and the other APs' it shares what it hears with. Null where usteer does
+// not run.
+function probes(mac, at) {
+	if (!heard || at - heard.at > 2)
+		heard = { at: at, clients: bus.call('usteer', 'get_clients') };
+	let nodes = heard.clients?.[mac];
+	if (type(nodes) != 'object')
+		return null;
+	let best = {};
+	for (let node, n in nodes) {
+		let m = match(node, /^(([0-9a-f.:]+)#)?hostapd\.(.+)$/);
+		if (!m || !(type(n?.signal) in ['int', 'double']) || n.signal > 0 || n.signal < -127)
+			continue;
+		let ap = m[2] ?? '', radio = match(m[3], /^([a-z0-9]+)-/)?.[1] ?? m[3];
+		let k = ap + ' ' + radio;
+		if (!best[k] || n.signal > best[k].signal)
+			best[k] = { ap: ap, band: ap == '' ? bsses[m[3]]?.band ?? '' : '', signal: int(n.signal) };
+	}
+	let list = sort(values(best), (a, b) => b.signal - a.signal);
+	return length(list) ? slice(list, 0, 6) : null;
+}
+
+// live_give hands aeolus-live what waits for it, the oldest first, a
+// datagram each. Where aeolus-live is not there, or is behind, the rest
+// waits for the next turn.
+function live_give() {
+	while (length(told)) {
+		if (!livesock) {
+			let k = socket.create(socket.AF_UNIX, socket.SOCK_DGRAM);
+			if (!k || !k.connect({ path: LIVE })) {
+				k?.close();
+				return;
+			}
+			livesock = k;
+		}
+		if (livesock.send(sprintf('%J', told[0]), socket.MSG_DONTWAIT) == null) {
+			livesock.close();
+			livesock = null;
+			return;
+		}
+		shift(told);
+	}
+}
+
+// tell says one thing seen of a traced client (0144), to aeolus-live and
+// so to the manager, at once: when, by the calendar's clock in ms; where, a
+// network's { network, band }; the stage, and what, in words.
+function tell(mac, wall_at, where, stage, what, ok, signal) {
+	let e = { seq: ++told_seq, at: wall_at, mac: mac, stage: stage, what: what };
+	if (where?.network)
+		e.network = where.network;
+	if (where?.band)
+		e.band = where.band;
+	if (ok != null)
+		e.ok = ok;
+	if (signal != null)
+		e.signal = signal;
+	push(told, e);
+	if (length(told) > TRACE_KEPT)
+		told = slice(told, -TRACE_KEPT);
+	live_give();
+}
+
+// news hands aeolus-live a client's coming or going (0252), which it sends
+// the manager at once, with what waits for it.
+function news(n) {
+	if (!n)
+		return;
+	push(told, n);
+	if (length(told) > TRACE_KEPT)
+		told = slice(told, -TRACE_KEPT);
+	live_give();
+}
+
+// tell_steps says the steps an attempt gained after its first n, where its
+// client is traced: each as it is worded for the attempt's record, and
+// timed as it is there.
+function tell_steps(a, n) {
+	if (tracing[a.mac] == null)
+		return;
+	// Where hostapd's frames are read, each key message is said from its
+	// frame (0146), and not a second time from hostapd's log; and a step
+	// that came from a frame (0254) was said as the frame was read.
+	let on_air = framed();
+	for (let i = n; i < length(a.events); i++) {
+		let st = a.events[i];
+		if (on_air && (st.air || st.k && match(st.k, /^m[1-4]$/)))
+			continue;
+		tell(a.mac, a.wall + st.t, a, st.stage, st.what, st.ok, null);
+	}
+}
+
+// trace_read takes from the file which clients to trace, and until when.
+function trace_read() {
+	let f = null;
+	try {
+		f = json(read(TRACE) ?? 'null');
+	} catch (e) {
+	}
+	let on = {}, t = time();
+	for (let mac, until in f?.macs ?? {})
+		if (type(until) == 'int' && until > t && match(mac, /^[0-9a-f][0-9a-f](:[0-9a-f][0-9a-f]){5}$/))
+			on[mac] = until;
+	for (let mac in keys(hearing))
+		if (on[mac] == null)
+			delete hearing[mac];
+	if (!length(on))
+		probed = {};
+	tracing = on;
+}
+
+// trace_look says how each traced client is heard here: on one of the
+// AP's networks, and how strongly; or not on, and heard asking, as usteer
+// has it. It is said when it changes: which network or band, or the signal
+// by 3 dB, and now and then while it is on.
+function trace_look(at, wall_at) {
+	if (!length(tracing))
+		return;
+	// Who is on each network, asked once for all of them.
+	let on = {};
+	for (let bss in keys(bsses)) {
+		let all = bus.call('hostapd.' + bss, 'get_clients')?.clients;
+		for (let mac in keys(tracing)) {
+			let c = all?.[mac];
+			if (c && on[mac] == null && type(c.signal) in ['int', 'double'] && c.signal <= 0 && c.signal >= -127)
+				on[mac] = { bss: bss, signal: int(c.signal) };
+		}
+	}
+	for (let mac in keys(tracing)) {
+		let was = hearing[mac] ?? {}, o = on[mac];
+		let far = (a, b) => b == null || (a > b ? a - b : b - a) >= 3;
+		if (o) {
+			let k = 'on ' + o.bss;
+			if (was.k != k || far(o.signal, was.signal) || at - was.at >= 10) {
+				tell(mac, wall_at, bsses[o.bss], 'signal', sprintf('on, heard at %d dBm', o.signal), null, o.signal);
+				hearing[mac] = { k: k, signal: o.signal, at: at };
+			}
+			continue;
+		}
+		// Not on here: its asking, as this AP's own radios heard it.
+		let best = filter(probes(mac, at) ?? [], p => p.ap == '')[0];
+		if (!best) {
+			if (was.k != null && was.k != 'gone') {
+				tell(mac, wall_at, null, 'heard', 'not heard here any more', null, null);
+				hearing[mac] = { k: 'gone', signal: null, at: at };
+			}
+			continue;
+		}
+		let k = 'heard ' + best.band;
+		if (was.k != k || far(best.signal, was.signal)) {
+			tell(mac, wall_at, { band: best.band }, 'heard', sprintf('not on here; heard asking at %d dBm', best.signal), null, best.signal);
+			hearing[mac] = { k: k, signal: best.signal, at: at };
+		}
+	}
+}
+
+// start begins following a client's attempt on a network: at by the steady
+// clock, and wall_at by the calendar's, in ms.
+function start(bss, mac, at, wall_at) {
+	if (length(keys(open)) >= OPEN)
+		return null;
+	let a = journey.begin({ bss: bss, mac: mac, ...(bsses[bss] ?? {}) }, at, wall_at);
+	a.probes = probes(mac, at);
+	open[bss + ' ' + mac] = a;
+	// Its DHCP comes right after it is let on: the wide filter is on by then.
+	widen(bss, at + journey.WATCH * 2);
+	return a;
+}
+
+// finish closes an attempt: its record joins those the agent sends.
+// emit puts a record with those the agent sends, numbered as it joins
+// them: the agent says how far it got by that number.
+function emit(r) {
+	r.seq = ++seq;
+	push(done, r);
+	if (length(done) > KEPT) {
+		dropped += length(done) - KEPT;
+		done = slice(done, -KEPT);
+	}
+	dirty = true;
+}
+
+function finish(key, at) {
+	let a = open[key];
+	// Associated, and nothing said of it since (0136): hostapd is asked
+	// whether it holds the client as let on, and how strongly it hears it.
+	// A client that went of itself before its keys leaves the same silence
+	// as one whose keys came with it.
+	if (journey.silent(a)) {
+		let all = bus.call('hostapd.' + a.bss, 'get_clients')?.clients;
+		if (type(all) == 'object') {
+			let c = all[a.mac];
+			a.held = !c ? 'gone' : c.authorized ? 'on' : 'off';
+			if (c?.authorized && a.signal == null && type(c.signal) in ['int', 'double'] && c.signal <= 0 && c.signal >= -127)
+				a.signal = int(c.signal);
+		}
+	}
+	let r = journey.record(a, at);
+	delete open[key];
+	// What it came to, where its client is traced (0144).
+	if (tracing[a.mac] != null)
+		tell(a.mac, wall(), a, 'done', sprintf('%s%s, %d ms from its start%s', r.outcome, r.reason ? ': ' + r.reason : '', r.took_ms,
+			r.how?.alg == 'ft' ? ', by 802.11r' : (r.how?.pmk ? ', its keys kept from before' : '')),
+			r.outcome != 'failed', a.signal);
+	// Every failure has a capture, where anything was heard of it (0135):
+	// made a little after the attempt ended, for the frames that follow
+	// it, and the radio's word on those the AP sent. Its record waits with
+	// it, to say that it has one.
+	if (r.outcome == 'failed' && capturing)
+		push(held, { a: a, r: r, at: at, until: at + HOLD });
+	else
+		emit(r);
+}
+
+// release gives each attempt that has waited long enough its capture, and
+// its record to the agent; every one, where all says so.
+function release(at, all) {
+	while (length(held) && (all || held[0].until <= at)) {
+		let h = shift(held);
+		let kept = keep_capture(h.a, h.at);
+		if (kept)
+			h.r.capture = kept;
+		emit(h.r);
+	}
+}
+
+// write stores the records the agent has not said it sent.
+function write() {
+	let sent = null;
+	try {
+		sent = json(read(SENT) ?? 'null');
+	} catch (e) {
+	}
+	if (sent?.boot == boot && type(sent.seq) == 'int')
+		done = filter(done, r => r.seq > sent.seq);
+	if (!store(out, sprintf('%J\n', { at: time(), boot: boot, seq: seq, dropped: dropped, list: done })))
+		return;
+	dirty = false;
+	// The captures of the records now written are the agent's to send.
+	for (let id in waiting)
+		fs.rename(`${CAPTURES}/${id}.json.wait`, `${CAPTURES}/${id}.json`);
+	waiting = [];
+}
+
+// The other Aeolus APs this one says it let a client on to (0226), as radio
+// resource management knows them, and what it signs with: looked at again
+// every PEERS_EVERY seconds, as a client is let on. Off where radio
+// resource management is.
+const PEERS_EVERY = 10;
+const RRM_KEY = '/etc/aeolus/rrm.key';
+const RRM_OUT = '/var/run/aeolus/rrm.json';
+let peers = { at: null, ap: null, key: null, to: [] };
+let said_here = {}, here_seq = 0, here_sock = null;
+
+function peers_look(at) {
+	if (peers.at != null && at - peers.at < PEERS_EVERY)
+		return;
+	peers = { at: at, ap: null, key: null, to: [] };
+	let s = cursor().get_all('aeolus', 'aeolus_rrm');
+	let key = rrm.unhex(trim(fs.readfile(RRM_KEY) ?? ''));
+	if (s?.enabled != '1' || !match(s?.ap ?? '', /^ap-[0-9a-f]{12}$/) || key == null || length(key) < 16)
+		return;
+	let r = null;
+	try {
+		r = json(fs.readfile(RRM_OUT) ?? 'null');
+	} catch (e) {
+	}
+	for (let n in (type(r?.neighbours) == 'array' ? r.neighbours : []))
+		if (n?.ap != s.ap && match(n?.address ?? '', /^[0-9]{1,3}(\.[0-9]{1,3}){3}$/) && index(peers.to, n.address) < 0)
+			push(peers.to, n.address);
+	peers.ap = s.ap;
+	peers.key = key;
+}
+
+// tell_here says to the other Aeolus APs, over the wire, that a client was
+// let on here (0226), so one that still holds it lets go of it. A client's
+// coming is said once a second at most.
+function tell_here(mac, at) {
+	peers_look(at);
+	if (!peers.key || !length(peers.to) || !letgo.due(said_here, mac, at))
+		return;
+	here_sock ??= socket.create(socket.AF_INET, socket.SOCK_DGRAM);
+	if (!here_sock)
+		return;
+	let pkt = rrm.seal(peers.key, letgo.here(peers.ap, time(), ++here_seq, [mac]));
+	for (let to in peers.to)
+		here_sock.send(pkt, socket.MSG_DONTWAIT, { address: to, port: rrm.PORT });
+}
+
+// on_event takes one step of a client's, from hostapd's log or from one of
+// its frames (air): into the attempt being followed, or as the start of
+// one. at is when it happened, by the steady clock, and wall_at by the
+// calendar's, in ms.
+function on_event(e, at, wall_at, air) {
+	// A leaving's frame is kept for the news of the leaving (0255).
+	if (air && e.end && e.by)
+		leaving[e.bss + ' ' + e.mac] = { by: e.by, frame: e.frame, reason: e.reason, at: wall_at };
+	// hostapd let go of a client it held as on: the manager hears it at
+	// once (0252), and not at the AP's next report, and why (0255).
+	if (e.end && e.held) {
+		let k = e.bss + ' ' + e.mac;
+		news(journey.moved('left', e.mac, bsses[e.bss], wall_at, null,
+			journey.left_why(leaving[k], downs[e.bss], sentoff.why(e.mac, e.bss), wall_at)));
+		delete leaving[k];
+	}
+	let key = e.bss + ' ' + e.mac, a = open[key];
+	// What its attempt had before this line, to say what the line adds
+	// where its client is traced (0144).
+	let had = a, n = a ? length(a.events) : 0;
+	// A client that comes anew while its last coming is still followed, as
+	// one that left without a word and is back within the watch: that
+	// attempt's record is made as it stands, and this is another (0136).
+	let anew = a != null && journey.again(a, e, at), carry = [];
+	if (anew) {
+		// What hostapd said of its asking, just before, is of this coming.
+		carry = journey.carried(a, at);
+		journey.cut(a, at);
+		finish(key, at);
+		a = null;
+	}
+	if (!a) {
+		// A client leaving, a line that only explains, or the keys of one
+		// long on made again begins nothing.
+		if (!anew && !journey.begins(e)) {
+			// Of a traced client it is said all the same: its leaving, or
+			// its keys made again. A frame was said as it was read, and
+			// one of a keeping on 6 GHz is not (0300).
+			if (tracing[e.mac] != null && !air && !(e.stage == 'end' && sentoff.kept_off(e.mac, e.bss, wall_at / 1000.0)))
+				tell(e.mac, wall_at, bsses[e.bss], e.stage ?? 'said', e.what, e.ok, null);
+			return;
+		}
+		let from = length(carry) ? carry[0].at : at;
+		a = start(e.bss, e.mac, from, wall_at - int((at - from) * 1000 + 0.5));
+		if (!a)
+			return;
+		for (let l in carry)
+			journey.on_log(a, l.e, l.at);
+	}
+	let was_on = a.on != null;
+	journey.on_log(a, e, at);
+	tell_steps(a, a === had ? n : 0);
+	// Let on: the other APs are told, so one that still holds it lets go
+	// (0226). A fast transition lets it on at its association.
+	if (e.on || a.on != null && !was_on)
+		tell_here(e.mac, at);
+	// How strongly the AP hears it, once it is let on.
+	if ((e.on || a.on != null && !was_on) && a.signal == null) {
+		let s = bus.call('hostapd.' + e.bss, 'get_clients')?.clients?.[e.mac]?.signal;
+		if (type(s) in ['int', 'double'] && s <= 0 && s >= -127)
+			a.signal = int(s);
+	}
+	// Let on, by its keys or by a fast transition: the manager hears it at
+	// once (0252), once an attempt, and has it on this AP from then.
+	if (a.on != null && !was_on)
+		news(journey.moved('joined', e.mac, bsses[e.bss], a.wall + int((a.on - a.started) * 1000 + 0.5), a.signal));
+}
+
+// read_rings takes what hostapd's rings have had since they were last
+// read: the frames of clients' comings among it, each into its radio's
+// ring at hostapd's own time of it, where captures are on, and the rest let
+// go. Each is the steps it stands for in its client's attempt (0254). The
+// two rings are gone through as one, by time, so that the radio's word on
+// a frame the AP sent comes after the frame. A frame of a client that is
+// traced (0144) is said to the manager as well.
+function read_rings() {
+	let snaps = [];
+	for (let name, o in rings) {
+		let s = o.ref.fetch();
+		if (s)
+			push(snaps, s);
+	}
+	if (!length(snaps))
+		return;
+	let t = now(), w = wall(), bad = null;
+	udebug.foreach_packet(snaps, (snap, data, at) => {
+		try {
+			// Which ring it is from, by which way it went.
+			let name = ord(data, 1) == 7 ? 'wpa_nl_tx' : 'wpa_nl_rx', o = rings[name];
+			if (!o || (o.skip != null && at <= o.skip))
+				return;
+			let k = taken[name];
+			if (k?.pid != o.pid)
+				k = taken[name] = { pid: o.pid, last: 0 };
+			if (at > k.last)
+				k.last = at;
+			let e = capture.said(data);
+			let l = e?.ifindex != null ? link_of(e.ifindex) : null;
+			if (!l)
+				return;
+			let r = radios[l.phy];
+			let ms = at / 1000.0, mono = t - (w - ms) / 1000.0;
+			let f = r ? capture.ring_said(r, mono, ms, e, l.bssid) : null;
+			// The steps it is of its client's attempt (0254), each at
+			// hostapd's own time of the frame. What the rings held from
+			// before this daemon started is no attempt's: the ring of what
+			// the AP sent reaches further back than the ring of what it
+			// heard, and its log was not being read.
+			if (bsses[l.bss] && ms >= boot) {
+				let got = journey.air_event(e, bsses[l.bss], air[l.bss] ??= {});
+				if (got?.all)
+					downs[l.bss] = { ...got.all, at: int(ms + 0.5) };
+				for (let x in got?.events ?? [])
+					on_event({ ...x, bss: l.bss }, mono, int(ms + 0.5), true);
+			}
+			// Said at once, of a client that is traced (0144): once for a
+			// frame handed up several times over.
+			if (!length(tracing) || (e.what == 'heard' && r && !f) || (e.what == 'status' && f?.all))
+				return;
+			let said = capture.words(e);
+			if (!said || tracing[said.mac] == null)
+				return;
+			// A disassociation hostapd sent a client that steering keeps
+			// off this network while it is on 6 GHz here (0300), at each
+			// renewal: the client, listening on 6 GHz, never hears it, and
+			// steering tells the trace of the keeping once.
+			if (said.stage == 'end' && e.what != 'heard' && sentoff.kept_off(said.mac, l.bss, ms / 1000.0))
+				return;
+			let where = bsses[l.bss];
+			if (said.stage == 'find') {
+				// A probe is to every network the radio has, and a client
+				// sends several at a time.
+				let key = said.mac + ' ' + l.phy;
+				if (probed[key] != null && ms - probed[key] < PROBE_EVERY && ms >= probed[key])
+					return;
+				probed[key] = ms;
+				where = { band: where?.band };
+			}
+			// How strongly it was heard, where that is a strength a radio can say.
+			let heard_at = e.what == 'heard' && e.signal != null && e.signal <= 0 && e.signal >= -127 ? e.signal : null;
+			tell(said.mac, int(ms + 0.5), where, said.stage, said.what, said.ok, heard_at);
+		} catch (x) {
+			bad ??= x;
+		}
+	});
+	for (let name, o in rings)
+		o.skip = null;
+	if (bad)
+		note('an entry of hostapd\'s rings could not be read: %s', bad);
+}
+
+// on_log takes one of hostapd's log lines: a client's step, into the
+// attempt being followed, or the start of one. at is when the line reached
+// here, by the steady clock, and wall_at by the calendar's, in ms. The step
+// is timed by when the log took the line in, where the line says
+// (journey.log_time). Where hostapd's frames are read (0254), what they
+// say is left out of the line, and the rings are read first, so each frame
+// is in its attempt before the word that follows it.
+function on_log(msg, at, wall_at) {
+	let line = rtrim(split(split(msg, '\n')[0], chr(0))[0], '\r ');
+	let on_air = framed();
+	let e = journey.log_event(line, on_air);
+	if (!e || !bsses[e.bss])
+		return;
+	let when = journey.log_time(line, at, wall_at);
+	if (on_air)
+		read_rings();
+	on_event(e, when[0], when[1], false);
+}
+
+// on_frames reads what crossed one interface: the frames of the clients
+// being followed.
+function on_frames(i) {
+	let m;
+	while ((m = i.sock.recvmsg(2048, 64, socket.MSG_DONTWAIT)) != null) {
+		let p = journey.frame(m.data, m.address?.packet_type == 4);
+		let a = p ? open[i.bss + ' ' + p.mac] : null;
+		if (a) {
+			// A step is timed by when the kernel took its frame in, which it
+			// says with the frame: the daemon reads them when it gets to it,
+			// several at a turn, and a turn may come late.
+			let when = came(m);
+			let n = length(a.events);
+			journey.on_frame(a, p, when[0]);
+			tell_steps(a, n);
+			// Kept as it crossed, for a capture should the attempt fail. One
+			// of the client's own going out to its network again is the AP
+			// handing it on to the other clients there, once for each: it is
+			// kept as it came in, and not again.
+			a.wire ??= [];
+			a.raw ??= join('', map(split(a.mac, ':'), x => chr(hex(x))));
+			if (capturing && length(a.wire) < capture.WIRE && !(m.address?.packet_type == 4 && substr(m.data, 6, 6) == a.raw))
+				push(a.wire, { at: when[0], wall: when[1], m: m.data });
+		}
+	}
+}
+
+// logread_pid is the logread this daemon started, where it still runs.
+function logread_pid() {
+	let pid = int(read(PIDFILE) ?? '0');
+	return pid > 1 && index(fs.readfile(`/proc/${pid}/cmdline`) ?? '', 'logread') >= 0 ? pid : 0;
+}
+
+// listen opens the socket hostapd's log lines come in on, and starts the
+// logread that sends them: only lines that name hostapd, as they are
+// logged, none from before.
+function listen() {
+	if (!logsock) {
+		let s = socket.create(socket.AF_INET, socket.SOCK_DGRAM);
+		if (!s || !s.bind({ address: '127.0.0.1', port: port })) {
+			note('cannot listen for the log on 127.0.0.1:%d: %s', port, socket.error());
+			s?.close();
+			return;
+		}
+		logsock = s;
+	}
+	if (logread_pid())
+		return;
+	// -t: each line with when the log took it in, to the millisecond.
+	system(sprintf("logread -f -t -u -r 127.0.0.1 %d -e 'hostapd: ' -p %s >/dev/null 2>&1 &", port, PIDFILE));
+}
+
+// stop ends the logread with the daemon, and has hostapd log as its config
+// says again.
+function stop() {
+	let pid = logread_pid();
+	if (pid)
+		system(['kill', '' + pid]);
+	say_more(true);
+	// What waits goes to the agent as it is, with what hostapd has had
+	// since the last turn.
+	if (length(rings))
+		read_rings();
+	release(now(), true);
+	if (dirty)
+		write();
+	close_rings();
+	exit(0);
+}
+
+function main() {
+	// Asked to stop, it does so at the top of its loop, with nothing half
+	// done: a record taken from those that wait and not yet given on.
+	signal('SIGTERM', () => { stopping = true; });
+	signal('SIGINT', () => { stopping = true; });
+	fs.mkdir('/var/run/aeolus');
+	// A capture a run before this kept and never wrote the record of: no
+	// attempt is the manager's to hang it on.
+	for (let n in fs.lsdir(CAPTURES) ?? [])
+		if (match(n, /\.json\.wait$/))
+			fs.unlink(`${CAPTURES}/${n}`);
+	// A logread the last run left sends to a socket that is gone.
+	let old = logread_pid();
+	if (old)
+		system(['kill', '' + old]);
+	let next_look = 0, next_write = 0, next_read = 0, next_trace = 0, next_ring = 0, next_collect = 0;
+	// What the release before this one left there, which nothing reads now.
+	for (let n in ['follow.json', 'followed.json', 'followed.json.sent'])
+		fs.unlink(replace(out, /[^\/]*$/, n));
+	log('watching clients come online');
+	while (true) {
+		if (stopping)
+			stop();
+		let at = now();
+		// ucode -S runs with the garbage collector off: what refers to
+		// itself, as a function kept in what it makes does, would never be
+		// freed. It is run here, at the top of the loop, where nothing is
+		// half made, and never started with gc('start'): started, it may run
+		// inside a function filter() or map() calls and free the array being
+		// made, which then comes back null (airscan, 2026-10-16).
+		if (at >= next_collect) {
+			gc('collect');
+			next_collect = at + COLLECT_EVERY;
+		}
+		if (at >= next_look) {
+			look();
+			// Captures are kept unless the AP's config says not.
+			capturing = cursor().get('aeolus', 'aeolus_journey', 'captures') != '0';
+			watch_hostapd(at);
+			// After the rings: where they are read, hostapd is not asked for
+			// its debug lines (0254).
+			say_more();
+			listen();
+			narrow(at);
+			next_look = at + LOOK_EVERY;
+		}
+		for (let key in keys(open))
+			if (journey.due(open[key], at))
+				finish(key, at);
+		// What hostapd heard and sent since the last turn (0146), before any
+		// capture is made of it.
+		if (at >= next_ring && length(rings)) {
+			read_rings();
+			next_ring = at + (length(tracing) ? RING_TRACED : RING_EVERY);
+		}
+		release(at);
+		// Whom to trace (0144): read when aeolus-live says it has changed,
+		// and now and then besides; then how each is heard, at once and
+		// twice a second.
+		if (poked || at >= next_read) {
+			trace_read();
+			next_read = at + TRACE_READ;
+			if (poked)
+				next_trace = 0;
+			poked = false;
+		}
+		if (at >= next_trace) {
+			trace_look(at, wall());
+			next_trace = at + TRACE_LOOK;
+		}
+		if (length(told))
+			live_give();
+		if (at >= next_write) {
+			// Written when there is something new, and now and then so what
+			// the agent sent is let go.
+			if (dirty || length(done))
+				write();
+			next_write = at + WRITE_EVERY;
+		}
+		let polls = [], by = {};
+		if (logsock)
+			push(polls, [logsock, socket.POLLIN]);
+		for (let name, i in ifaces) {
+			by[i.sock.fileno()] = name;
+			push(polls, [i.sock, socket.POLLIN]);
+		}
+		if (!length(polls)) {
+			sleep(1000);
+			continue;
+		}
+		// While a client's attempt is watched it is looked at again soon,
+		// and sooner while a client is traced.
+		let wait = length(tracing) ? 100 : length(keys(open)) ? 250 : 1000;
+		for (let r in socket.poll(wait, ...polls) ?? []) {
+			if (!(r[1] & (socket.POLLIN | socket.POLLERR | socket.POLLHUP)))
+				continue;
+			let t = now(), w = wall(), fd = r[0].fileno();
+			if (logsock && fd == logsock.fileno()) {
+				let msg;
+				while ((msg = logsock.recv(2048, socket.MSG_DONTWAIT)) != null) {
+					if (msg == POKE)
+						poked = true;
+					else
+						on_log(msg, t, w);
+				}
+				continue;
+			}
+			let name = by[fd], i = ifaces[name];
+			if (!i)
+				continue;
+			on_frames(i);
+			// An interface that went: closed, and looked for again.
+			if (r[1] & (socket.POLLERR | socket.POLLHUP)) {
+				i.sock.close();
+				delete ifaces[name];
+			}
+		}
+	}
+}
+
+main();

@@ -1,0 +1,1331 @@
+#!/bin/sh
+# The packages Aeolus needs on an AP, fetched through the manager's cache of
+# OpenWrt's feeds (0069): the first AP of a kind brings each package into the
+# cache, and every other AP gets it from the manager.
+#
+#	aeolus-packages feeds     point the AP's package feeds at the manager
+#	aeolus-packages install   install them, when the agent is installed
+#	aeolus-packages restore   after a sysupgrade, install again those that were
+#	aeolus-packages required  install the modules the agent cannot start without
+#	aeolus-packages boot      restore, again and again until those load
+#	aeolus-packages add PKG   install one that a setting asks for, when it does
+#	aeolus-packages get PKG   install a tool the agent is about to run
+#	aeolus-packages early     after a sysupgrade, before the network: put back
+#	                          those it installed, from the copies it kept
+#	aeolus-packages keep      keep those copies, where what is installed changed
+#
+# The packages: usteer, for band steering (0050); snmpd-ssl, for SNMP (0052);
+# vxlan and kmod-nft-bridge, for VXLAN tunnels and their MSS clamp (0054);
+# ucode-mod-socket, for the prober (0059); kmod-veth, for a network with a
+# fallback (0061); and ucode-mod-nl80211 and ucode-mod-digest, for radio
+# resource management (0073), which OpenWrt's image has already. Without
+# one, everything else works, and a setting that needs it is refused until
+# it is installed.
+#
+# And udebugd with ucode-mod-udebug, for the capture of a failed attempt
+# (0146): the service that hands out the rings hostapd keeps, and what reads
+# them. hostapd looks for the service once, as it starts, so install puts
+# them in before it swaps wpad, which starts hostapd anew. On an AP that
+# had the agent before them, the agent asks for them like ustp, and hostapd
+# has its rings once Wi-Fi is next restarted, or the AP.
+#
+# And the full wpad, for 802.11v (BSS transition), which band steering needs
+# (0050, 0057, 0088): OpenWrt's images have wpad-basic, built without it,
+# and hostapd refuses a radio's whole config that asks for it. The full one,
+# of the same TLS library, replaces it in one go, and the Wi-Fi comes up
+# again on it.
+#
+# install exits 3 when it installed vxlan: netifd loads its protocols only
+# when it starts, so the network must be restarted (0057). restore restarts
+# it itself, and then the agent whenever it put anything back.
+#
+# restore also puts back the ucode modules the agent cannot start without,
+# the package's dependencies (0080): after a sysupgrade onto an image that
+# lacks one (uclient, on some), the agent cannot run to ask for it, so the
+# init script starts restore itself, by boot, which tries again until they
+# load (0234). required installs only those, for aeolus-setup on an AP that
+# never had the agent (0083).
+#
+# add installs one that only some APs need, when a setting asks for it: ustp,
+# for spanning tree (0095). The agent asks for it, and once it is installed,
+# starts again, to render with it. It goes in the list like the others, so a
+# sysupgrade brings it back. One that takes another to be of use has that
+# installed with it.
+#
+# get installs a tool the agent runs when someone asks for what needs it:
+# tcpdump-mini, for a capture (0148). Nothing is configured and the agent is
+# not started again: it waits for the tool, and runs it.
+#
+# The kernel modules come from the feed that fits the AP's kernel. On an
+# image of OpenWrt's own that is OpenWrt's, among its feeds. An image built
+# with a kernel of its own, as the Arista ports are, takes them only from
+# its build's feed, which the manager keeps (0171): where the manager has one
+# for this AP's kernel, feeds adds it beside the others. The image trusts
+# its build's key, which that feed is signed with.
+#
+# apk on OpenWrt 25.12 and later, opkg before (0083).
+#
+# And after a sysupgrade the packages go back before the network and the
+# Wi-Fi start (0248). Put back once they are up, two of them restart every
+# radio: the full wpad starts hostapd anew, and vxlan wants the network
+# restarted, for its kernel module, and for its protocol where a reload does
+# not load it (0269); a radio on a DFS channel then listens a minute for
+# radar a second time. So restore keeps a copy of each package installed
+# beyond the image's own, in $COPIES, which a sysupgrade keeps, and keep,
+# which the agent runs once restore is done, keeps it as what is installed
+# changes: install and add keep none, so an AP set up afresh had none at its
+# first sysupgrade (ce7f, 2026-10-31); and the init
+# script aeolus-early, at the start of boot, runs early, which installs them
+# from those copies in one go, with no network. What early cannot put back,
+# as kernel modules after a new image's new kernel, restore puts back as
+# before, once the network is up.
+
+PACKAGES="usteer snmpd-ssl vxlan kmod-nft-bridge ucode-mod-socket kmod-veth ucode-mod-nl80211 ucode-mod-digest"
+BEFORE_WPAD="udebugd ucode-mod-udebug"
+ON_DEMAND="ustp udebugd ucode-mod-udebug tcpdump-mini"
+# Those of PACKAGES a module feed brings, which need no configuring (0171).
+MODULES="vxlan kmod-nft-bridge kmod-veth"
+REQUIRED="ucode-mod-fs ucode-mod-uci ucode-mod-ubus ucode-mod-uloop ucode-mod-uclient ucode-mod-math ucode-mod-log ucode-mod-digest"
+# The packages beyond the image, by the start of their names, that keep
+# brings to the build's own feeds' build of them (0331). Not kernel modules,
+# which go with the image's kernel, nor the wpad, whose upgrade starts the
+# radios anew.
+AS_BUILT="ucode-mod-"
+LIST=/etc/aeolus/packages      # what was installed; kept over a sysupgrade
+COPIES=/etc/aeolus/pkgs        # a copy of each package installed beyond the image's (0248); kept too
+NEXT=/etc/aeolus/pkgs-next     # the kernel modules among them as the next build has them (0280); kept too
+KEEP_RULE=4   # in the copies' stamp: one more where what keep_copies keeps changes, so copies kept before are fetched again
+KMODS=/etc/apk/repositories.d/aeolus-kmods.list   # the manager's module feed for this AP's kernel (0171)
+DONE=/usr/lib/aeolus/packages  # not kept: present until the next sysupgrade
+REFUSED=/usr/lib/aeolus/wpad-refused  # a full wpad's .ipk that would not install (opkg, 0172): gone at a sysupgrade, so one try an image
+SWAPPING=/etc/aeolus/wpad-swapping    # a wpad swap under way, its TLS library: until a wpad is back (0172)
+UPSTREAM=https://downloads.openwrt.org/releases/
+SNAPSHOTS=https://downloads.openwrt.org/snapshots/  # main's, an image built from main names (0230)
+CERT=/etc/ssl/certs/aeolus-manager.crt
+if command -v apk >/dev/null 2>&1; then
+	PM=apk ADD='apk add' FEEDS=/etc/apk/repositories.d/distfeeds.list
+else
+	PM=opkg ADD='opkg install' FEEDS=/etc/opkg/distfeeds.conf
+fi
+
+say() {
+	logger -t aeolus-packages "$*"
+	echo "$*" >&2
+	# Early in boot logd is not up yet, and what logger says is lost: the
+	# kernel's log keeps it for logd to read when it starts (0248).
+	[ -n "$EARLY" ] && echo "aeolus-packages: $*" >/dev/kmsg 2>/dev/null
+	return 0
+}
+
+# The agent starts this script, so it runs in the agent's procd service, and
+# on OpenWrt main (cgroups) procd kills every process in a service when it
+# stops it: the init script run from inside was killed by its own stop,
+# before the start, and left no agent (a W-318, 2026-10-18). The script
+# leaves any service it is in first, so no restart cuts an install short and
+# the init script it runs is outside; and it asks rpcd's rc object to restart
+# the agent where there is one (rpcd runs the init script in its own
+# service), the init script itself where there is not.
+leave_service() {
+	grep -q ':/services/' /proc/$$/cgroup 2>/dev/null &&
+		echo $$ >/sys/fs/cgroup/cgroup.procs 2>/dev/null
+	return 0
+}
+
+restart_agent() {
+	ubus call rc init '{"name":"aeolus","action":"restart"}' >/dev/null 2>&1 ||
+		/etc/init.d/aeolus restart
+}
+
+# start_agent starts what of the agent is not running, the same way: procd
+# keeps what runs as it is.
+start_agent() {
+	ubus call rc init '{"name":"aeolus","action":"start"}' >/dev/null 2>&1 ||
+		/etc/init.d/aeolus start
+}
+
+# netifd_has_vxlan reloads the network and says whether netifd knows the
+# vxlan protocol then. A stock netifd reads its protocol scripts only when it
+# starts, so one installed later wants the network restarted (0057); one with
+# OpenWrt's fault fixed (port 0063, B44) reads those it has not seen on each
+# reload, and is not restarted (0269).
+netifd_has_vxlan() {
+	ubus call network reload >/dev/null 2>&1
+	ubus call network get_proto_handlers 2>/dev/null | jsonfilter -e '@.vxlan' >/dev/null 2>&1
+}
+
+has() {
+	if [ $PM = apk ]; then
+		apk info -e "$1"
+	else
+		opkg status "$1" | grep -q '^Status:.* installed'
+	fi >/dev/null 2>&1
+}
+
+# loads says whether a ucode module's package, $1 (ucode-mod-<name>), loads,
+# in a ucode of its own: one built for another ucode than the image's is
+# installed and does not (2026-10-24: ucode-mod-uclient and ucode-mod-udebug
+# of OpenWrt's snapshot on a port image of an older ucode, and the agent
+# could not reach its manager). Any other package loads.
+loads() {
+	case $1 in ucode-mod-*) ;; *) return 0 ;; esac
+	command -v ucode >/dev/null 2>&1 || return 0
+	ucode -e "require('${1#ucode-mod-}')" >/dev/null 2>&1
+}
+
+# pm_renew installs again packages that are there and do not load: a newer
+# build, where a feed has one, as the AP's own build's feed (0171) may.
+# swap_build puts in, in place of a module installed that does not load,
+# the build's own feeds' build of it, of the same version or the one the
+# feeds have (0343): apk takes a version installed as done, and adds
+# nothing by name, where a feed has built it anew under the same version
+# against another library (-135's uclient against libubox20261103, under
+# -132's version). From the file, apk swaps it. Only one apk verifies
+# against the image's keys goes in. Where there are no build's own feeds,
+# the AP's.
+swap_build() {
+	[ $PM = apk ] || return 1
+	sxs=
+	[ -s $KMODS ] && sxs="--repositories-file /dev/null $(build_feeds)"
+	stmp=/tmp/aeolus-swap
+	rm -rf $stmp && mkdir -p $stmp
+	apk $sxs fetch -o $stmp "$1" >/dev/null 2>&1
+	sf=$(ls $stmp/"$1"-[0-9]*.apk 2>/dev/null | head -1)
+	src=1
+	if [ -n "$sf" ] && [ "$(name_of "$sf")" = "$1" ] && apk verify "$sf" >/dev/null 2>&1 &&
+		timeout 120 apk add --allow-untrusted "$sf" >/dev/null 2>&1; then
+		# apk pins what it took from a file to that very file, in its world.
+		sed -i 's/><[^ ]*$//' /etc/apk/world
+		src=0
+	fi
+	rm -rf $stmp
+	return $src
+}
+
+pm_renew() {
+	[ $PM = apk ] || { opkg install --force-reinstall "$@"; return; }
+	set -- $(for p in "$@"; do
+		case $p in ucode-mod-*) f=$(APKX= fitting "$p"); echo "${f:-$p}" ;; *) echo "$p" ;; esac
+	done)
+	apk add --upgrade "$@"
+}
+
+# unfit says why a package that is there does not load.
+unfit() {
+	echo "$1 is installed but does not load on this image's ucode: it was built for another, and no feed has one that fits"
+}
+
+pm_update() { $PM update; }
+
+# fits says whether a build of a ucode module, $1 (name=version, or a name
+# for the build apk would choose), fits this image's own ucode (0256): apk
+# can put it in without putting another libucode in beside the image's. A
+# build for another ucode either cannot go in, where no feed offers its
+# libucode, or brings that libucode with it, and then installs and does not
+# load. $APKX is apk's options for the feeds to look in, where not all.
+#
+# Nor another ABI of any library the image has (0318): OpenWrt's snapshot
+# built usteer and ustp again against libubox20261103 while the port images
+# had libubox20260721 (2026-11-05), and a process that loaded both waited
+# for good (0317).
+fits() {
+	out=$(apk $APKX add --simulate "$1" 2>/dev/null) || return 1
+	! echo "$out" | grep -q "Installing libucode" && [ -z "$(abi_beside "$out")" ]
+}
+
+# abi_beside lists, of the libraries apk's simulated install, its output
+# $1, would put in, each of another ABI than a library of the same name the
+# AP has: libubox20261103 where libubox20260721 is. OpenWrt names a
+# library's package by its ABI, a number its name ends in (0318).
+abi_beside() {
+	have=$(apk info 2>/dev/null)
+	echo "$1" | sed -n 's/^([0-9]*\/[0-9]*) Installing \(lib[A-Za-z0-9_.+-]*[^0-9]\)\([0-9][0-9]*\) .*/\1 \2/p' |
+		while read -r stem abi; do
+			echo "$have" | awk -v s="$stem" -v a="$abi" '
+				index($0, s) == 1 { r = substr($0, length(s) + 1); if (r ~ /^[0-9]+$/ && r != a) f = 1 }
+				END { exit !f }' && echo "$stem$abi"
+		done
+}
+
+# fitting is what to ask apk for, for ucode module $1: the build apk would
+# choose, where it fits; else the first other build in the feeds that does,
+# by name=version; empty where none does. apk takes the highest version,
+# and that may be a build for another ucode either way: OpenWrt's snapshot
+# beside a port image of an older ucode (-49, 2026-10-28), or a port's own
+# build of its older ucode beside an image that moved to the snapshot's
+# (-82, 2026-10-31), the port's builds sharing one kernel and so one module
+# feed (0229).
+fitting() {
+	fits "$1" && { echo "$1"; return 0; }
+	for v in $(apk $APKX list -a "$1" 2>/dev/null | sed -n "s/^$1-\([^ ]*\) .*/\1/p"); do
+		fits "$1=$v" && { echo "$1=$v"; return 0; }
+	done
+	return 0
+}
+
+# pm_add installs $@, and of a ucode module the build that fits (0256),
+# pinned to that build, as one from the module feed is (0229). One that no
+# build of fits is asked for as it is, and fails as before.
+#
+# Any package, not a ucode module alone, goes in at a build that brings no
+# other ABI of a library the AP has (0318); one no build of fits is left
+# out, and why said: what needs it waits for a build that fits, rather than
+# a process that holds two (0317). One apk cannot simulate at all is asked
+# for as it is, for apk to say why.
+pm_add() {
+	[ $PM = apk ] || { $ADD "$@"; return; }
+	set -- $(for p in "$@"; do
+		case $p in
+		!*) echo "$p" ;;
+		ucode-mod-*) f=$(APKX= fitting "$p"); echo "${f:-$p}" ;;
+		*)
+			out=$(apk add --simulate "$p" 2>/dev/null) || { echo "$p"; continue; }
+			moved=$(abi_beside "$out")
+			if [ -z "$moved" ]; then
+				echo "$p"
+			elif f=$(APKX= fitting "$p") && [ -n "$f" ]; then
+				echo "$f"
+			else
+				say "$p is left out: the feeds' builds of it would put in $(echo $moved) beside the AP's own build of that library, and a program that loads both may stop working (0318)"
+			fi
+			;;
+		esac
+	done)
+	[ $# -gt 0 ] || return 1
+	apk add "$@"
+}
+
+# from_feed installs the ucode modules among $@ from the manager's module
+# feed for this AP's kernel alone (0229), each at the version it has there,
+# which stays pinned: a port image's ucode is older than OpenWrt's snapshot,
+# whose builds of the same modules are newer, and apk takes the highest
+# version, which did not load (-49, 2026-10-28: the first restore after each
+# sysupgrade took the snapshot's uclient, and the agent waited a pass for
+# one that fits). One the feed does not have, or has only for another
+# ucode than the image's (0256), is left to the other feeds.
+#
+# The packages the build's own feeds have (0315), any of them, go in from
+# those feeds alone too, each at the version they have: OpenWrt's snapshot
+# may build the same version against other libraries than the image's, as it
+# built uclient, usteer and ustp against libubox20261103 while the image had
+# libubox20260721 (-121, 2026-11-05): with two libubox in one process,
+# uclient's socket was in the other's loop, and the agent waited on it for
+# good.
+from_feed() {
+	[ $PM = apk ] && [ -s $KMODS ] || return 0
+	xs=$(build_feeds)
+	for p in "$@"; do
+		case $p in
+		ucode-mod-*) v=$(APKX="--repositories-file /dev/null $xs" fitting "$p") ;;
+		*)
+			has $p && continue
+			v=$(apk --repositories-file /dev/null $xs list -a "$p" 2>/dev/null | sed -n "s/^$p-\([0-9][^ ]*\) .*/$p=\1/p" | head -1)
+			;;
+		esac
+		[ -n "$v" ] && apk --repositories-file /dev/null $xs add "$v" >/dev/null 2>&1
+	done
+	return 0
+}
+
+# as_built puts in, of the packages beyond the image named in AS_BUILT, the
+# build's own feeds' build of each (0315) where the AP has another, and that
+# build fits (0331). After a sysupgrade early puts back the copies kept under
+# the build before, and restore then finds nothing missing: ucode-mod-math
+# stayed r1, kept under -129, while -130's feed had r5 (C-260, 2026-11-06).
+# The agent takes up the new build at its next start.
+as_built() {
+	[ $PM = apk ] && [ -s $KMODS ] || return 0
+	xs=$(build_feeds)
+	installed=$(apk list -I 2>/dev/null)
+	moved=
+	for p in $(extras); do
+		named=
+		for pre in $AS_BUILT; do case $p in "$pre"*) named=1 ;; esac; done
+		[ -n "$named" ] || continue
+		have=$(echo "$installed" | sed -n "s/^$p-\([0-9][^ ]*\) .*/\1/p" | head -1)
+		want=$(apk --repositories-file /dev/null $xs list -a "$p" 2>/dev/null | grep -v '\[installed\]' |
+			sed -n "s/^$p-\([0-9][^ ]*\) .*/\1/p" | head -1)
+		[ -n "$want" ] || continue
+		if [ "$want" = "$have" ]; then
+			# The same version, built anew: only where the one installed
+			# does not load, from the feed's file (0343).
+			loads $p && continue
+			swap_build $p || continue
+		else
+			APKX="--repositories-file /dev/null $xs" fits "$p=$want" || continue
+			apk --repositories-file /dev/null $xs add "$p=$want" >/dev/null 2>&1 || continue
+		fi
+		if loads $p; then
+			moved="$moved $p"
+		else
+			say "$(unfit $p)"
+		fi
+	done
+	[ -n "$moved" ] && say "brought to this build's own feeds' build:$moved"
+	return 0
+}
+
+# build_feeds is apk's options for the manager's feeds of this AP's build
+# alone: its module feed and, beside it, its own package feeds (0315).
+build_feeds() {
+	sed 's/^/-X /' $KMODS 2>/dev/null | tr '\n' ' '
+}
+
+# wanting keeps those of $@ that are missing, or there and do not load.
+wanting() {
+	for p in "$@"; do
+		has $p && loads $p || echo $p
+	done
+}
+
+# feeds points the AP's feeds at the manager: OpenWrt's release tree, or a
+# manager the AP knew before, becomes this one's /feeds/, and OpenWrt's main
+# snapshots its /feeds/snapshots/ (0230). apk fetches through
+# uclient-fetch, which trusts every certificate in /etc/ssl/certs, so the
+# manager's goes there too.
+feeds() {
+	url=$(uci -q get aeolus.agent.url) || return 1
+	url=${url%/}
+	if [ -f /etc/aeolus/manager.crt ] && { [ ! -f $CERT ] || [ "$(md5sum </etc/aeolus/manager.crt)" != "$(md5sum <$CERT)" ]; }; then
+		cp /etc/aeolus/manager.crt $CERT
+	fi
+	kmods "$url"
+	[ -f $FEEDS ] || return 0
+	sed -e "s|$UPSTREAM|$url/feeds/|" -e "s|$SNAPSHOTS|$url/feeds/snapshots/|" -e "s|^https\{0,1\}://[^/]*/feeds/|$url/feeds/|" $FEEDS >$FEEDS.new
+	if [ "$(md5sum <$FEEDS.new)" = "$(md5sum <$FEEDS)" ]; then
+		rm -f $FEEDS.new
+	else
+		mv $FEEDS.new $FEEDS
+		say "package feeds now come from the manager, $url/feeds/"
+	fi
+}
+
+# kernel_now is the version of the kernel the image runs, as its package
+# says: what the manager names a module feed by (0171).
+kernel_now() {
+	awk '/^P:kernel$/ { k = 1; next } k && /^V:/ { print substr($0, 3); exit } /^$/ { k = 0 }' /lib/apk/db/installed 2>/dev/null
+}
+
+# build_now is the tag of the port build the image is, as /etc/os-release
+# names it (0260); empty for OpenWrt's own images, which name none.
+build_now() {
+	sed -n 's/^OPENWRT_RELEASE=.*(arista \(v[0-9][^ )]*\)).*/\1/p' /etc/os-release 2>/dev/null | head -1
+}
+
+# target_now is the image's target as the builder names a target's feed,
+# ipq807x of qualcommax/ipq807x (0280).
+target_now() {
+	sed -n "s/^DISTRIB_TARGET='[^/']*\/\([^']*\)'.*/\1/p" /etc/openwrt_release 2>/dev/null | head -1
+}
+
+# kmods adds the manager's module feed for this AP's kernel, where it has
+# one, or takes away one for another kernel, as after a sysupgrade. The
+# kernel is known by its package's version, which is what the manager names
+# the feed by. A port image asks first for its own build's feed, by its
+# kernel and its build's tag (0260): every build of a port can have one
+# kernel, and another build's ucode modules may not fit (0256). Only the
+# manager's answer that it has no such feed takes a line away
+# (uclient-fetch's "HTTP error 404"); one that cannot be asked just now
+# leaves it as it is. A feed found after the packages were installed brings
+# in the modules that could not be had without it: they go on the list, and
+# restore, which the agent starts when it is not done, installs them. apk
+# only: the images built with a kernel of their own are all apk's.
+kmods() {
+	[ $PM = apk ] || return 0
+	kernel=$(kernel_now)
+	[ -n "$kernel" ] || return 0
+	build=$(build_now)
+	for key in ${build:+$kernel/$build} $kernel; do
+		feed="$1/feeds/kmods/$key/packages.adb"
+		if err=$(uclient-fetch -s -T 15 --ca-certificate=/etc/aeolus/manager.crt "$feed" 2>&1 >/dev/null); then
+			# A build's own package feeds, beside its module feed, where
+			# the manager has them (0315): what the build has comes
+			# from them, not from OpenWrt's snapshot.
+			lines=$feed
+			# OpenWrt's package arch, as its feeds are named
+			# (aarch64_cortex-a53): apk --print-arch says only
+			# aarch64.
+			arch=$(head -1 /etc/apk/arch 2>/dev/null)
+			[ -n "$arch" ] || arch=$(sed -n "s/^DISTRIB_ARCH='\([^']*\)'.*/\1/p" /etc/openwrt_release 2>/dev/null)
+			case $key in */*)
+				for f in base packages; do
+					u="$1/feeds/kmods/$key/$arch/$f/packages.adb"
+					[ -n "$arch" ] && uclient-fetch -s -T 15 --ca-certificate=/etc/aeolus/manager.crt "$u" >/dev/null 2>&1 &&
+						lines="$lines
+$u"
+				done
+				;;
+			esac
+			[ "$(cat $KMODS 2>/dev/null)" = "$lines" ] && return 0
+			was=$(head -1 $KMODS 2>/dev/null)
+			echo "$lines" >$KMODS
+			if [ "$was" = "$feed" ]; then
+				[ "$(echo "$lines" | wc -l)" -gt 1 ] && say "packages this AP's build has come from the manager's feeds of the build, $build"
+				return 0
+			fi
+			case $key in
+			*/*) say "kernel modules come from the manager's feed for this AP's build, $build, and kernel, $kernel" ;;
+			*) say "kernel modules come from the manager's feed for this AP's kernel, $kernel" ;;
+			esac
+			for p in $MODULES; do
+				has $p || grep -qx "$p" $LIST 2>/dev/null || echo $p >>$LIST
+			done
+			rm -f $DONE
+			return 0
+		fi
+		# Only the manager's no goes on to the next, or takes the line away.
+		echo "$err" | grep -q 'HTTP error 404' || return 0
+	done
+	if [ -f $KMODS ]; then
+		rm -f $KMODS
+		say "the manager has no module feed for this AP's kernel, $kernel"
+	fi
+}
+
+# configure turns off what a package does by itself when installed: Aeolus
+# owns its config from here on.
+configure() {
+	case $1 in
+	usteer)
+		# usteer's own default steers every SSID; Aeolus owns
+		# band_steering_interval and ssid_list.
+		uci set usteer.@usteer[0].band_steering_interval=0
+		uci -q delete usteer.@usteer[0].ssid_list
+		uci commit usteer
+		/etc/init.d/usteer reload
+		;;
+	snmpd-ssl)
+		# snmpd answers OpenWrt's default communities, public, and private
+		# from the AP itself: it is turned off and those deleted.
+		uci set snmpd.general.enabled=0
+		for s in public private public6 private6; do uci -q delete snmpd.$s; done
+		uci commit snmpd
+		/etc/init.d/snmpd restart
+		;;
+	ustp)
+		/etc/init.d/ustpd enable
+		/etc/init.d/ustpd start
+		;;
+	esac
+}
+
+why() {
+	case $1 in
+	usteer) echo "band steering will be refused on this AP" ;;
+	snmpd-ssl) echo "SNMP will be refused on this AP" ;;
+	vxlan | kmod-nft-bridge | kmod-vxlan) echo "VXLAN tunnels will be refused on this AP" ;;
+	ucode-mod-socket) echo "the tunnels go unprobed, and tunnel ports unguarded" ;;
+	kmod-veth) echo "a network with a VLAN transport and a fallback will be refused on this AP" ;;
+	ucode-mod-nl80211 | ucode-mod-digest) echo "radio resource management stays off on this AP" ;;
+	ustp) echo "spanning tree stays off on this AP" ;;
+	udebugd | ucode-mod-udebug) echo "a failed attempt has no capture of its radio on this AP" ;;
+	tcpdump-mini) echo "no capture can be taken on this AP" ;;
+	esac
+}
+
+# beside is what goes in with a package, for it to be of use.
+beside() {
+	case $1 in
+	udebugd) echo ucode-mod-udebug ;;
+	ucode-mod-udebug) echo udebugd ;;
+	esac
+}
+
+# served: hostapd is there, so the AP can serve Wi-Fi. Every wpad gives
+# /usr/sbin/hostapd, as hostapd's own packages do; a wpad removed takes it
+# away (0172).
+served() { [ -e /usr/sbin/hostapd ]; }
+
+# needs_wpad: no hostapd where there should be one, because the image came
+# with one (in /rom) or a swap of Aeolus's was under way. A device built
+# without one (wired only, a Wi-Fi station) is left as it is.
+needs_wpad() {
+	served && return 1
+	[ -e /rom/usr/sbin/hostapd ] || [ -f $SWAPPING ]
+}
+
+# image_tls is the TLS library of the wpad to put back: the swap's, where one
+# was under way; else that of the image's own wpad, read from its package
+# database in /rom; else mbedtls, OpenWrt's default since 23.05.
+image_tls() {
+	[ -s $SWAPPING ] && { cat $SWAPPING; return; }
+	for t in mbedtls openssl wolfssl; do
+		if [ -e /rom/usr/lib/opkg/info/wpad-basic-$t.control ] || [ -e /rom/usr/lib/opkg/info/wpad-$t.control ] ||
+			grep -qxE "P:wpad(-basic)?-$t" /rom/lib/apk/db/installed 2>/dev/null; then
+			echo $t
+			return
+		fi
+	done
+	echo mbedtls
+}
+
+# repair_wpad puts a wpad back where needs_wpad says one is missing, as a
+# swap cut off between its steps (a power cut) leaves (0172): one still
+# listed whose files are gone is installed again; else the basic one (the
+# smaller; full_wpad, with its room check, takes it from there), else the
+# full one. Then the Wi-Fi comes up on it. It returns 0 when nothing is
+# missing.
+repair_wpad() {
+	needs_wpad || return 0
+	itls=$(image_tls)
+	for w in wpad-basic-$itls wpad-$itls; do
+		served && break
+		has $w || continue
+		if [ $PM = apk ]; then apk fix -r -u $w; else opkg install --force-reinstall $w; fi >/dev/null 2>&1
+	done
+	served || pm_add wpad-basic-$itls >/dev/null 2>&1
+	served || pm_add wpad-$itls >/dev/null 2>&1
+	if ! served; then
+		say "no wpad is installed and none could be: the Wi-Fi is down until one is ($ADD wpad-basic-$itls)"
+		return 1
+	fi
+	rm -f $SWAPPING
+	/etc/init.d/wpad enable >/dev/null 2>&1
+	/etc/init.d/wpad start >/dev/null 2>&1
+	wifi >/dev/null 2>&1
+	say "there was no wpad: one is installed again, and the Wi-Fi is up on it"
+}
+
+# ipk_size is what a downloaded .ipk takes once installed, its data.tar.gz
+# unpacked (as ipkg-build reckons Installed-Size), once the package and its
+# data have both read whole; nothing where either has not.
+ipk_size() {
+	gzip -dc "$1" >/dev/null 2>&1 || return 1
+	itmp=/tmp/aeolus-ipk.$$
+	gzip -dc "$1" 2>/dev/null | tar -xOf - ./data.tar.gz >$itmp 2>/dev/null
+	if ! gzip -dc $itmp >/dev/null 2>&1; then
+		rm -f $itmp
+		return 1
+	fi
+	isz=$(gzip -dc $itmp | wc -c | tr -d ' ')
+	rm -f $itmp
+	case $isz in '' | 0 | *[!0-9]*) return 1 ;; esac
+	echo $isz
+}
+
+# room is true where the overlay (or /, without one) has room for all the
+# .ipk files given, with 256 KiB to spare, in KiB; and false where one cannot
+# be measured, so that nothing is removed on a guess (0172).
+room() {
+	need=262144
+	for ipk in "$@"; do
+		isz=$(ipk_size "$ipk") || return 1
+		need=$((need + isz))
+	done
+	avail=$(df -Pk /overlay 2>/dev/null | awk 'NR == 2 { print $4 }')
+	[ -n "$avail" ] || avail=$(df -Pk / 2>/dev/null | awk 'NR == 2 { print $4 }')
+	case $avail in '' | *[!0-9]*) return 1 ;; esac
+	[ $avail -ge $(((need + 1023) / 1024)) ]
+}
+
+# full_wpad replaces wpad-basic with the full wpad of the same TLS library,
+# then starts it and brings the Wi-Fi up again on it: removing the basic one
+# stops hostapd, and installing the full one does not start it, so without
+# that every network on the AP stays down (OfficeOpenWrt, 2026-10-09). It
+# returns 0 when it did, 1 when it could not, 2 when there is none to
+# replace, 3 when its full wpad would not install before on this image.
+# Where nothing was changed, the Wi-Fi is left alone, so an AP that cannot
+# reach its feeds does not drop its clients each time (0171).
+#
+# Before anything is taken away, the swap is written down ($SWAPPING) and
+# restore made due (no $DONE), so that one cut off between its steps (a
+# power cut) is mended by repair_wpad, from the init script or the agent
+# (0172). Under apk it is one change. Under opkg the basic one goes first,
+# so both are fetched before it does: with no package index (as after a
+# sysupgrade before the network is up) neither can be, and nothing is
+# taken away; nor where the overlay has no room for both (the basic one is
+# the image's, so removing it frees nothing), nor where the basic one will
+# not be removed. Should the full one then not install, the basic one goes
+# back, from its copy or the feeds, and that full one is written down and
+# not tried again on this image.
+full_wpad() {
+	for tls in mbedtls openssl wolfssl; do
+		has wpad-basic-$tls || continue
+		changed= removed= full=
+		if [ $PM = apk ]; then
+			echo $tls >$SWAPPING
+			rm -f $DONE
+			sync
+			apk add wpad-$tls "!wpad-basic-$tls" >/dev/null 2>&1
+			# By what is installed, not by apk's word: an add can fail
+			# after the basic one went.
+			has wpad-basic-$tls || changed=1
+		else
+			wdir=/tmp/aeolus-wpad
+			rm -rf $wdir && mkdir -p $wdir
+			(cd $wdir && opkg download wpad-$tls && opkg download wpad-basic-$tls) >/dev/null 2>&1
+			full=$(cd $wdir && ls wpad-${tls}_*.ipk 2>/dev/null | head -n 1)
+			copy=$(cd $wdir && ls wpad-basic-${tls}_*.ipk 2>/dev/null | head -n 1)
+			if [ -z "$full" ] || [ -z "$copy" ]; then
+				:
+			elif served && [ "$full" = "$(cat $REFUSED 2>/dev/null)" ]; then
+				rm -rf $wdir
+				return 3
+			elif ! room $wdir/$full $wdir/$copy; then
+				say "wpad-basic-$tls is not replaced with wpad-$tls: the overlay has too little room for both, or they did not download whole"
+			else
+				echo $tls >$SWAPPING
+				rm -f $DONE
+				sync
+				if opkg remove wpad-basic-$tls >/dev/null 2>&1; then
+					changed=1 removed=1
+					opkg install $wdir/$full >/dev/null 2>&1 ||
+						opkg install $wdir/$copy >/dev/null 2>&1
+				fi
+			fi
+			rm -rf $wdir
+		fi
+		# No hostapd after all: the basic one from the feeds, at once.
+		if ! served; then
+			changed=1
+			pm_add wpad-basic-$tls >/dev/null 2>&1
+		fi
+		# A full one that would not go in, the basic one back however it came.
+		if [ -n "$removed" ] && ! has wpad-$tls && has wpad-basic-$tls; then
+			mkdir -p ${REFUSED%/*} && echo "$full" >$REFUSED
+		fi
+		served && rm -f $SWAPPING
+		if [ -n "$changed" ]; then
+			/etc/init.d/wpad enable >/dev/null 2>&1
+			/etc/init.d/wpad start >/dev/null 2>&1
+			wifi >/dev/null 2>&1
+		fi
+		if has wpad-$tls; then
+			rm -f $REFUSED
+			say "wpad-basic-$tls is replaced with wpad-$tls, for 802.11v"
+			return 0
+		fi
+		say "wpad-basic-$tls could not be replaced with wpad-$tls: band steering and BSS transition will be refused on this AP until it is"
+		served || say "no wpad is installed and wpad-basic-$tls could not be put back: the Wi-Fi is down until it is ($ADD wpad-basic-$tls)"
+		return 1
+	done
+	return 2
+}
+
+# extras lists the packages installed beyond the image's own, by name: those
+# Aeolus put in, and what came in with them (0248). apk alone: under opkg,
+# none.
+extras() {
+	[ $PM = apk ] && [ -s /rom/lib/apk/db/installed ] || return 0
+	sed -n 's/^P://p' /rom/lib/apk/db/installed >/tmp/aeolus-rom.$$
+	apk info 2>/dev/null | grep -vxF -f /tmp/aeolus-rom.$$
+	rm -f /tmp/aeolus-rom.$$
+}
+
+# name_of is the package name of a file of it, name-version.apk: apk's
+# versions end in -r and a number; a name may hold a digit, as libubox20261103,
+# and no dash before one.
+name_of() {
+	basename "$1" .apk | sed -e 's/-[0-9][^-]*-r[0-9][0-9]*$//;t' -e 's/-[0-9].*$//'
+}
+
+# installed_from is a feed that has build $2 of package $1, as apk policy
+# names them; empty where none does.
+installed_from() {
+	apk policy "$1" 2>/dev/null | awk -v v="  $2:" '
+		/^  [^ ]/ { on = ($0 == v); next }
+		on && /^    / && $1 != "lib/apk/db/installed" { print $1; exit }'
+}
+
+# keep_copies keeps a copy of each of extras in $COPIES, fetched through the
+# manager, for early to put back after a sysupgrade (0248). They are fetched
+# again only when what is installed changed, or KEEP_RULE did, and kept only
+# whole, and where the overlay has room for them with 1 MiB to spare. apk
+# fetches each through its feed's signed index, which is what vouches for
+# it: the file itself carries no signature. So its SHA-256 is written beside
+# it, and early puts back only copies that still match. The index is read
+# again first: OpenWrt builds a release's package feeds anew under the same
+# names, and apk refuses a package of another build than the index it holds
+# names (0249).
+keep_copies() {
+	[ $PM = apk ] || return 0
+	installed=$(apk list -I 2>/dev/null | sort)
+	stamp="$KEEP_RULE $(echo "$installed" | md5sum | cut -d' ' -f1)"
+	[ "$stamp" = "$(cat $COPIES/.stamp 2>/dev/null)" ] && return 0
+	names=$(extras)
+	[ -n "$names" ] || return 0
+	ktmp=/tmp/aeolus-copies
+	rm -rf $ktmp && mkdir -p $ktmp
+	pm_update >/dev/null 2>&1
+	apk fetch -o $ktmp $names >/dev/null 2>&1
+	# What the build's own feeds have is kept as they build it (0315), not
+	# as OpenWrt's snapshot does under the same version: fetched again from
+	# them alone, one at a time, as apk fetches nothing where one name of
+	# many is not there.
+	frombuild=
+	if [ -s $KMODS ]; then
+		xs=$(build_feeds)
+		mkdir -p $ktmp/.build
+		for p in $names; do
+			rm -f $ktmp/.build/*.apk
+			apk --repositories-file /dev/null $xs fetch -o $ktmp/.build "$p" >/dev/null 2>&1 || continue
+			f=$(ls $ktmp/.build/"$p"-[0-9]*.apk 2>/dev/null | head -1)
+			[ -n "$f" ] && [ "$(name_of "$f")" = "$p" ] || continue
+			for o in $ktmp/"$p"-[0-9]*.apk; do
+				[ -f "$o" ] && [ "$(name_of "$o")" = "$p" ] && rm -f "$o"
+			done
+			mv "$f" $ktmp/
+			frombuild="$frombuild $p"
+		done
+		rm -rf $ktmp/.build
+	fi
+	# apk fetches the highest build the feeds have, and takes no version
+	# (3.0.5). That may be a build for another ucode than the image's (0256:
+	# the C-260 on -82 kept the module feed's old uclient, and its next
+	# sysupgrade put the ucode modules back only once the network was up).
+	# So one of another build than the one installed is fetched again from a
+	# feed that has the one installed, where one does.
+	for p in $names; do
+		case " $frombuild " in *" $p "*) continue ;; esac
+		v=$(echo "$installed" | sed -n "s/^$p-\([0-9][^ ]*\) .*/\1/p" | head -1)
+		[ -n "$v" ] && [ ! -f "$ktmp/$p-$v.apk" ] || continue
+		repo=$(installed_from "$p" "$v")
+		[ -n "$repo" ] || continue
+		mkdir -p $ktmp/.one
+		apk --repositories-file /dev/null -X "$repo" fetch -o $ktmp/.one "$p" >/dev/null 2>&1 &&
+			[ -f "$ktmp/.one/$p-$v.apk" ] && rm -f "$ktmp/$p"-[0-9]*.apk && mv "$ktmp/.one/$p-$v.apk" $ktmp/
+		rm -rf $ktmp/.one
+	done
+	# How many of them it got says why: none at all, as when the manager is
+	# not reached yet early in a boot, or some a feed lacks.
+	kgot=0
+	for p in $names; do
+		ls $ktmp/"$p"-[0-9]*.apk >/dev/null 2>&1 && kgot=$((kgot + 1))
+	done
+	kwant=$(echo $names | wc -w)
+	if [ "$kgot" -ne "$kwant" ]; then
+		rm -rf $ktmp
+		say "copies of the packages beyond the image could not all be fetched ($kgot of $kwant); kept as they were"
+		return 1
+	fi
+	ksize=$(du -sk $ktmp | cut -f1)
+	kavail=$(df -Pk /overlay 2>/dev/null | awk 'NR == 2 { print $4 }')
+	kold=$(du -sk $COPIES 2>/dev/null | cut -f1)
+	if [ -z "$kavail" ] || [ $((kavail + ${kold:-0})) -lt $((ksize + 1024)) ]; then
+		rm -rf $ktmp
+		say "copies of the packages beyond the image are not kept: the overlay has too little room"
+		return 1
+	fi
+	(cd $ktmp && sha256sum *.apk >.sums) &&
+		rm -rf $COPIES.new && cp -a $ktmp $COPIES.new && echo $stamp >$COPIES.new/.stamp &&
+		rm -rf $COPIES && mv $COPIES.new $COPIES
+	rm -rf $ktmp
+	say "kept copies of $kwant packages beyond the image, to put back before the network after a sysupgrade"
+}
+
+# keep_next keeps in $NEXT the packages beyond the image as the AP's next
+# build has them (0280, 0343): the newest build of its own target, newer
+# than its own and with another kernel, that the manager has a feed for
+# (/feeds/kmods/builds). After the sysupgrade to it, early puts them back in
+# place of the copies of the same names, before the network: the copies'
+# own kernel modules fit only the kernel before, and restore put them back
+# once the network was up, starting it again (port -103's 6.18.60,
+# 2026-11-01); and a build may move a library the copies' others link, as
+# -135 moved libubox to 20261103 and built uclient, usteer and ustp anew
+# against it under -132's very versions, which apk takes as installed and
+# does not swap (2026-11-08). The kernel modules come from the build's
+# module feed, all of them or none; the rest from it or its own package
+# feeds (0315), each where they have it. apk fetches no module for a
+# kernel other than the one running, so each is fetched from its feed by
+# its name there, and kept only where apk verifies it against the keys the
+# image trusts. Only a port image names its build.
+keep_next() {
+	[ $PM = apk ] || return 0
+	url=$(uci -q get aeolus.agent.url) || return 0
+	url=${url%/}
+	build=$(build_now) kernel=$(kernel_now) target=$(target_now)
+	if [ -z "$build" ] || [ -z "$kernel" ] || [ -z "$target" ]; then
+		rm -rf $NEXT
+		return 0
+	fi
+	builds=$(uclient-fetch -q -T 15 --ca-certificate=/etc/aeolus/manager.crt -O - "$url/feeds/kmods/builds" 2>/dev/null) || return 0
+	# A tag is its line (v2026.10.17.1) and its number on it (-103-g...):
+	# a later line is newer, and on one line a higher number.
+	next=$(echo "$builds" | awk -v own="$build" -v k="$kernel" -v t="$target" '
+		function line(tag) { sub(/-[0-9]+-g[0-9a-f]+$/, "", tag); return tag }
+		function num(tag) { if (!match(tag, /-[0-9]+-g[0-9a-f]+$/)) return -1; return substr(tag, RSTART + 1) + 0 }
+		function after(a, b) { return line(a) > line(b) || (line(a) == line(b) && num(a) > num(b)) }
+		NF == 3 && $3 == t && $2 != k && after($1, own) && (best == "" || after($1, best)) { best = $1; bk = $2 }
+		END { if (best != "") print best, bk }')
+	if [ -z "$next" ]; then
+		[ -d $NEXT ] && { rm -rf $NEXT; say "the kernel modules kept for a next build are taken away: the manager has no newer build's feed for this AP"; }
+		return 0
+	fi
+	ntag=${next% *} nkernel=${next#* }
+	names=$(extras | sort)
+	[ -n "$names" ] || return 0
+	stamp="$ntag $nkernel $(echo $names | md5sum | cut -d' ' -f1)"
+	[ "$stamp" = "$(cat $NEXT/.stamp 2>/dev/null)" ] && return 0
+	feed="$url/feeds/kmods/$nkernel/$ntag"
+	# apk searches only an index it holds: its update fetches the feed's
+	# first (a C-360 that had never read -103's found none, 2026-11-01).
+	if ! apk --repositories-file /dev/null -X "$feed/packages.adb" update >/dev/null 2>&1; then
+		say "the index of $ntag's module feed could not be read through the manager; its kernel modules are not kept yet"
+		return 1
+	fi
+	# The build's own package feeds, beside its module feed (0315): read
+	# where the manager has them, and passed over where it has not. By
+	# OpenWrt's package arch, as feeds names them (aarch64_cortex-a53): apk
+	# --print-arch says only aarch64.
+	arch=$(head -1 /etc/apk/arch 2>/dev/null)
+	[ -n "$arch" ] || arch=$(sed -n "s/^DISTRIB_ARCH='\([^']*\)'.*/\1/p" /etc/openwrt_release 2>/dev/null)
+	idx="$feed/packages.adb"
+	if [ -n "$arch" ]; then
+		for sub in base packages luci; do
+			apk --repositories-file /dev/null -X "$feed/$arch/$sub/packages.adb" update >/dev/null 2>&1 &&
+				idx="$idx $feed/$arch/$sub/packages.adb"
+		done
+	fi
+	ntmp=/tmp/aeolus-next
+	rm -rf $ntmp && mkdir -p $ntmp
+	for n in $names; do
+		for i in $idx; do
+			case $n in kmod-*) [ "$i" = "$feed/packages.adb" ] || continue ;; esac
+			v=$(apk --repositories-file /dev/null -X "$i" search -x "$n" 2>/dev/null | head -1)
+			[ -n "$v" ] || continue
+			uclient-fetch -q -T 30 --ca-certificate=/etc/aeolus/manager.crt -O "$ntmp/$v.apk" "${i%/packages.adb}/$v.apk" >/dev/null 2>&1 &&
+				apk verify "$ntmp/$v.apk" >/dev/null 2>&1 && break
+			rm -f "$ntmp/$v.apk"
+		done
+	done
+	# Every kernel module, or none: the copies' own fit no other kernel.
+	# The rest as many as were had; one not had goes back from its copy.
+	kwant=$(echo "$names" | grep -c '^kmod-')
+	kgot=$(ls $ntmp 2>/dev/null | grep -c '^kmod-.*\.apk$')
+	if [ "$kgot" -ne "$kwant" ]; then
+		rm -rf $ntmp
+		say "the kernel modules beyond the image could not all be had as $ntag has them ($kgot of $kwant); none are kept for it"
+		return 1
+	fi
+	ngot=$(ls $ntmp/*.apk 2>/dev/null | wc -l)
+	[ "$ngot" -gt 0 ] || { rm -rf $ntmp; return 0; }
+	nsize=$(du -sk $ntmp | cut -f1)
+	navail=$(df -Pk /overlay 2>/dev/null | awk 'NR == 2 { print $4 }')
+	nold=$(du -sk $NEXT 2>/dev/null | cut -f1)
+	if [ -z "$navail" ] || [ $((navail + ${nold:-0})) -lt $((nsize + 1024)) ]; then
+		rm -rf $ntmp
+		say "the kernel modules as $ntag has them are not kept: the overlay has too little room"
+		return 1
+	fi
+	(cd $ntmp && sha256sum *.apk >.sums) && echo "$nkernel" >$ntmp/.kernel && echo "$stamp" >$ntmp/.stamp &&
+		rm -rf $NEXT.new && cp -a $ntmp $NEXT.new && rm -rf $NEXT && mv $NEXT.new $NEXT
+	rm -rf $ntmp
+	say "kept $ngot of the $(echo $names | wc -w) packages beyond the image as $ntag has them, $kgot of them kernel modules, to put back before the network after a sysupgrade to it"
+}
+
+# early puts back, after a sysupgrade and before the network and the Wi-Fi
+# start, the packages kept in $COPIES, from those copies, in one go, with no
+# network (0248). The full wpad takes the image's basic one's place in the
+# same change. Where they will not all go in, as kernel modules built for an
+# image's older kernel, all but those and vxlan, which needs them, go in.
+# What it cannot put back, restore does once the network is up. The services
+# among them are started here: the boot's list of init scripts was read
+# before they came.
+early() {
+	[ $PM = apk ] || return 0
+	[ -f $DONE ] && return 0   # no sysupgrade since restore was last done
+	files=$(ls $COPIES/*.apk 2>/dev/null)
+	[ -n "$files" ] || return 0
+	# Only copies that are as they were fetched, through the signed index.
+	if ! (cd $COPIES && sha256sum -c .sums) >/dev/null 2>&1; then
+		say "after a sysupgrade, the copies kept are not as they were fetched: restore puts the packages back once the network is up"
+		return 1
+	fi
+	served && rm -f $SWAPPING
+	bang=
+	for tls in mbedtls openssl wolfssl; do
+		if ls $COPIES/wpad-$tls-[0-9]*.apk >/dev/null 2>&1 && has wpad-basic-$tls; then
+			bang="!wpad-basic-$tls"
+			echo $tls >$SWAPPING
+			sync
+		fi
+	done
+	before=$(extras | wc -l)
+	add_copies() { [ -n "$1" ] && timeout 120 apk add --repositories-file /dev/null --allow-untrusted $1 $bang >/dev/null 2>&1; }
+	# Where they will not all go in, those that keep the rest out are left
+	# for restore to fetch: first ucode modules built for another ucode than
+	# the image's (0256), whose libucode it does not have, so that vxlan and
+	# the kernel modules still go in before the network, and the network
+	# need not be started anew for them once it is up (-82, 2026-10-31: the
+	# C-260, with its DHCP server down then, was left with no address); then
+	# kernel modules built for an image's older kernel, with vxlan.
+	no_ucode() { for f in $1; do case ${f##*/} in ucode-mod-*) ;; *) echo $f ;; esac; done; }
+	no_kmods() { for f in $1; do case ${f##*/} in kmod-* | vxlan-[0-9]*) ;; *) echo $f ;; esac; done; }
+	# Packages kept as this build has them (0280, 0343), where they are for
+	# the kernel it runs, in place of the copies of the same names, which
+	# fit the build before: its kernel modules, and those it built anew
+	# against a library it moved. They go in first, with the rest.
+	next=
+	if [ "$(cat $NEXT/.kernel 2>/dev/null)" = "$(kernel_now)" ] && ls $NEXT/*.apk >/dev/null 2>&1 &&
+		(cd $NEXT && sha256sum -c .sums) >/dev/null 2>&1; then
+		nnames=" $(for f in $NEXT/*.apk; do name_of "$f"; done | tr '\n' ' ') "
+		next="$(for f in $files; do
+			case ${f##*/} in kmod-*) continue ;; esac
+			case $nnames in *" $(name_of "$f") "*) ;; *) echo $f ;; esac
+		done) $(ls $NEXT/*.apk)"
+	fi
+	try_all() {
+		add_copies "$1" || add_copies "$(no_ucode "$1")" || add_copies "$(no_kmods "$1")" ||
+			add_copies "$(no_kmods "$(no_ucode "$1")")"
+	}
+	# Where none of those go in, those apk can select nothing for that
+	# they need are left for restore, and the rest go in (0315): it names
+	# each as "required by: name-version[what]".
+	unselectable() {
+		timeout 60 apk add --simulate --repositories-file /dev/null --allow-untrusted $1 $bang 2>&1 |
+			grep -oE '[^ ]+\[' | sed 's/\[$//' | while read -r v; do name_of "$v.apk"; done | sort -u
+	}
+	without() {
+		for f in $1; do
+			echo " $(echo $2) " | grep -q " $(name_of "$f") " || echo $f
+		done
+	}
+	left=
+	{ [ -n "$next" ] && { add_copies "$next" || add_copies "$(no_ucode "$next")"; }; } || try_all "$files" || {
+		left=$(unselectable "$files")
+		[ -n "$left" ] && try_all "$(without "$files" "$left")"
+	}
+	served && rm -f $SWAPPING
+	got=$(($(extras | wc -l) - before))
+	if [ $got -le 0 ]; then
+		say "after a sysupgrade, the copies kept could not be put back before the network: restore puts the packages back once it is up"
+		return 1
+	fi
+	if [ -n "$left" ]; then
+		say "after a sysupgrade, these could not go in before the network, apk finding nothing for what they need: $(echo $left); restore puts them back once it is up"
+	fi
+	# apk pins what it took from a file to that very file, in its world:
+	# unpinned, they are as restore would have put them in, by name.
+	sed -i 's/><[^ ]*$//' /etc/apk/world
+	for svc in udebugd ustpd usteer; do
+		[ -x /etc/init.d/$svc ] || continue
+		/etc/init.d/$svc enabled || continue
+		/etc/init.d/$svc start >/dev/null 2>&1
+	done
+	say "after a sysupgrade, put back $got packages before the network came up, from the copies kept"
+}
+
+install_all() {
+	served && rm -f $SWAPPING
+	feeds
+	pm_update >/dev/null 2>&1 || say "the package index could not be read through the manager"
+	rc=0
+	: >$LIST.new
+	# Before hostapd is started anew on the full wpad, so that it finds them.
+	for p in $BEFORE_WPAD; do
+		if has $p || pm_add $p >/dev/null 2>&1; then
+			echo $p >>$LIST.new
+		else
+			say "$p could not be installed: $(why $p) until it is ($ADD $p)"
+		fi
+	done
+	full_wpad
+	repair_wpad
+	for p in $PACKAGES; do
+		if has $p; then
+			echo $p >>$LIST.new
+			configure $p
+		elif pm_add $p >/dev/null 2>&1; then
+			echo $p >>$LIST.new
+			configure $p
+			[ $p = vxlan ] && rc=3
+		else
+			say "$p could not be installed: $(why $p) until it is ($ADD $p)"
+		fi
+	done
+	# Those a setting asked for stay on the list.
+	for p in $ON_DEMAND; do has $p && ! grep -qx "$p" $LIST.new && echo $p >>$LIST.new; done
+	mv $LIST.new $LIST
+	# Not done without the wpad it should have: restore, due again, mends it.
+	needs_wpad || { mkdir -p ${DONE%/*} && touch $DONE; }
+	[ $rc = 3 ] && netifd_has_vxlan && rc=0
+	return $rc
+}
+
+restore() {
+	# A swap's note left by a power cut after the wpad was back.
+	served && rm -f $SWAPPING
+	# What the agent cannot start without comes first (0080).
+	required=
+	for p in $REQUIRED; do has $p || required="$required $p"; done
+	# And what is there and does not load, as a module built for another
+	# ucode than the image's.
+	broken=
+	for p in $REQUIRED $(cat $LIST 2>/dev/null); do
+		case " $broken " in *" $p "*) continue ;; esac
+		has $p && ! loads $p && broken="$broken $p"
+	done
+	[ -f $DONE ] && [ -z "$required$broken" ] && ! needs_wpad && { keep_copies; return 0; }
+	# An AP installed before 0069: what it has is what it was given.
+	if [ ! -f $LIST ]; then
+		for p in $PACKAGES; do has $p && echo $p; done >$LIST
+		[ -z "$required$broken" ] && ! needs_wpad && { mkdir -p ${DONE%/*} && touch $DONE; return 0; }
+	fi
+	# The feeds first: a module feed found now puts what it brings on the
+	# list.
+	feeds
+	# The full wpad comes back in place of the image's basic one, not
+	# beside it.
+	missing=$required basic= nowpad=
+	for p in $(cat $LIST); do has $p || missing="$missing $p"; done
+	for tls in mbedtls openssl wolfssl; do has wpad-basic-$tls && basic=$tls; done
+	needs_wpad && nowpad=1
+	if [ -z "$missing" ] && [ -z "$basic" ] && [ -z "$nowpad" ] && [ -z "$broken" ]; then
+		mkdir -p ${DONE%/*} && touch $DONE
+		keep_copies
+		return 0
+	fi
+	pm_update >/dev/null 2>&1 || say "the package index could not be read through the manager"
+	# The ucode modules from the module feed first, where it has them.
+	from_feed $required $missing $broken
+	# What the agent cannot start without goes in by itself first, and then
+	# the rest together, or one at a time where they would not: a package
+	# that cannot be had, as a kernel module where the manager has no feed
+	# for a new image's kernel, keeps out only itself.
+	need=
+	for p in $required; do has $p || need="$need $p"; done
+	[ -n "$need" ] && pm_add $need >/dev/null 2>&1
+	rest=
+	for p in $missing; do has $p || rest="$rest $p"; done
+	if [ -n "$rest" ] && ! pm_add $rest >/dev/null 2>&1; then
+		for p in $rest; do pm_add $p >/dev/null 2>&1; done
+	fi
+	# A module put in that does not load is no more back than a missing one.
+	got= still=
+	for p in $missing; do
+		if ! has $p; then
+			still="$still $p"
+		elif loads $p; then
+			got="$got $p"
+		else
+			still="$still $p"
+			say "$(unfit $p)"
+		fi
+	done
+	# What does not load, built anew where a feed has a build that fits.
+	renew=$(wanting $broken)
+	[ -n "$renew" ] && pm_renew $renew >/dev/null 2>&1
+	# Still not loading: the feed's build of the same version, from its file.
+	for p in $(wanting $broken); do swap_build $p; done
+	for p in $broken; do
+		if loads $p; then got="$got $p"; else still="$still $p"; say "$(unfit $p)"; fi
+	done
+	# No wpad where there should be one: one back first (0172), the basic
+	# one, which full_wpad then replaces as it would the image's.
+	if [ -n "$nowpad" ]; then
+		if repair_wpad; then got="$got wpad"; else still="$still wpad"; fi
+		for tls in mbedtls openssl wolfssl; do has wpad-basic-$tls && basic=$tls; done
+	fi
+	# full_wpad takes nothing away that it cannot put back, with or without
+	# an index; a full one refused before (3) is settled.
+	if [ -n "$basic" ]; then
+		full_wpad
+		case $? in
+		0) got="$got wpad-$basic" ;;
+		3) ;;
+		*) still="$still wpad-$basic" ;;
+		esac
+		if needs_wpad && ! repair_wpad; then
+			case " $still " in *" wpad "*) ;; *) still="$still wpad" ;; esac
+		fi
+	fi
+	[ -n "$got" ] && say "after a sysupgrade, installed again:$got"
+	if [ -n "$still" ]; then
+		say "after a sysupgrade, these could not be installed again:$still; the agent tries again in an hour"
+		# Due again: a module found unfit after restore was done, as
+		# when a feed moved on, is tried again each hour too.
+		rm -f $DONE
+	else
+		mkdir -p ${DONE%/*} && touch $DONE
+		keep_copies
+	fi
+	case " $got " in *" ustp "*) configure ustp ;; esac
+	# The tunnels netifd set up before kmod-vxlan was back had no module to
+	# make them with; vxlan, the protocol, a netifd with its fault fixed
+	# loads on a reload (0269).
+	case " $got " in
+	*" kmod-vxlan "*)
+		say "restarting the network so the tunnels start with kmod-vxlan"
+		/etc/init.d/network restart
+		;;
+	*" vxlan "*)
+		if netifd_has_vxlan; then
+			say "netifd loaded vxlan on a reload: the network is not restarted"
+		else
+			say "restarting the network so netifd loads vxlan"
+			/etc/init.d/network restart
+		fi
+		;;
+	esac
+	# The agent starts again on whatever came back: a module it cannot start
+	# without, or a package its config needs. It held that config for the
+	# package, and a render it has tried once it does not try again in the
+	# same run (vxlan on a C-260, 2026-10-17: held until restarted by hand).
+	[ -n "$got" ] && restart_agent
+	[ -z "$still" ]
+}
+
+leave_service
+
+# One at a time. The lock holds the run's pid: a run killed outright leaves
+# its lock (a service stop killed one on a W-318, 2026-10-18, and every run
+# after said "already running" until a reboot), and one whose run is gone,
+# its pid no longer this script, is taken over, by one run at a time (the
+# .take lock). A lock with no pid yet is a run just starting, given a second.
+# A run takes away only its own lock.
+LOCK=/var/run/aeolus-packages.lock
+running() {
+	pid=$(cat $1/pid 2>/dev/null)
+	[ -n "$pid" ] || { sleep 1; pid=$(cat $1/pid 2>/dev/null); }
+	[ -n "$pid" ] && tr "\0" " " </proc/$pid/cmdline 2>/dev/null | grep -q aeolus-packages
+}
+busy() {
+	case $1 in feeds | keep) ;; *) say "already running" ;; esac
+	exit 0
+}
+
+# boot is restore from the init script, where a module the agent cannot start
+# without is missing, or there and does not load. The agent cannot start to
+# try again itself, so this does, until they load (0234): at boot the AP may
+# have no address yet, and a try then reaches nothing (a C-260 on the port's
+# -54, 2026-10-28: its address came by DHCP after the one try there was, and
+# the agent stayed down without ucode-mod-math, which the image lacks, until
+# restore was run by hand). Half a minute on, then twice as long each time,
+# up to ten minutes apart. One boot run at a time, by a lock of its own; each
+# restore it runs takes restore's. Once they load it starts what of the agent
+# the init script could not start meanwhile (0237): restore starts it again
+# where it put something back, but they may have come back otherwise.
+ready() {
+	for p in $REQUIRED; do has $p && loads $p || return 1; done
+}
+if [ "$1" = boot ]; then
+	# The init script's lock is not this run's to hold (0342): rc.common
+	# holds it on fd 1000 while the script runs, and the script starts this
+	# run in the background, which took it along. Held, every other call of
+	# the script waited for as long as this run tried again, sysupgrade's
+	# config backup too (C360-AP on port -133, 2026-11-08). Closed only
+	# where it is open: busybox ash takes fd 1000, dash takes none past 9.
+	[ -e /proc/$$/fd/1000 ] && eval 'exec 1000>&-'
+	BOOT=/var/run/aeolus-packages.boot
+	if ! mkdir $BOOT 2>/dev/null; then
+		running $BOOT && exit 0
+		rm -rf $BOOT
+		mkdir $BOOT 2>/dev/null || exit 0
+	fi
+	echo $$ >$BOOT/pid
+	trap '[ "$(cat $BOOT/pid 2>/dev/null)" = "$$" ] && rm -rf $BOOT' EXIT
+	wait=30
+	until ready; do
+		sh "$0" restore
+		ready && break
+		[ $wait = 30 ] && say "the agent cannot start without$(printf ' %s' $(wanting $REQUIRED)); restore tries again until they load"
+		sleep $wait
+		wait=$((wait * 2))
+		[ $wait -gt 600 ] && wait=600
+	done
+	start_agent
+	exit 0
+fi
+
+if ! mkdir $LOCK 2>/dev/null; then
+	running $LOCK && busy "$1"
+	mkdir $LOCK.take 2>/dev/null || busy "$1"
+	running $LOCK && { rmdir $LOCK.take; busy "$1"; }
+	say "the last run ended without taking its lock away; taking it over"
+	rm -rf $LOCK
+	mkdir $LOCK 2>/dev/null || { rmdir $LOCK.take; busy "$1"; }
+	rmdir $LOCK.take
+fi
+echo $$ >$LOCK/pid
+trap '[ "$(cat $LOCK/pid 2>/dev/null)" = "$$" ] && rm -rf $LOCK' EXIT
+
+# required installs the modules the agent cannot start without, those
+# missing, through the manager (0083). It exits 1 if one still is.
+required() {
+	missing= broken=
+	for p in $REQUIRED; do
+		if ! has $p; then missing="$missing $p"; elif ! loads $p; then broken="$broken $p"; fi
+	done
+	[ -z "$missing$broken" ] && return 0
+	feeds
+	pm_update >/dev/null 2>&1 || say "the package index could not be read through the manager"
+	from_feed $missing $broken
+	add=$(for p in $missing; do has $p || echo $p; done)
+	renew=$(wanting $broken)
+	[ -n "$add" ] && { pm_add $add >/dev/null 2>&1 || true; }
+	[ -n "$renew" ] && { pm_renew $renew >/dev/null 2>&1 || true; }
+	for p in $missing; do
+		has $p || { say "$p could not be installed: the agent cannot start without it ($ADD $p)"; return 1; }
+	done
+	for p in $broken; do
+		loads $p || { say "$(unfit $p): the agent cannot start without it"; return 1; }
+	done
+	say "installed what the agent needs:$missing$broken"
+}
+
+# add installs one of ON_DEMAND, with what goes in beside it, and starts the
+# agent again to render with it.
+add() {
+	case " $ON_DEMAND " in *" $1 "*) ;; *)
+		say "$1 is not one a setting can ask for"
+		return 2
+		;;
+	esac
+	missing=
+	for p in $1 $(beside $1); do has $p || missing="$missing $p"; done
+	[ -z "$missing" ] && return 0
+	feeds
+	pm_update >/dev/null 2>&1 || say "the package index could not be read through the manager"
+	from_feed $missing
+	left=$(for p in $missing; do has $p || echo $p; done)
+	[ -n "$left" ] && pm_add $left >/dev/null 2>&1
+	for p in $missing; do
+		if ! has $p; then
+			say "$p could not be installed: $(why $p) until it is ($ADD $p); the agent tries again in an hour"
+			return 1
+		fi
+	done
+	for p in $1 $(beside $1); do grep -qx "$p" $LIST 2>/dev/null || echo $p >>$LIST; done
+	configure $1
+	say "installed$missing, which a setting asks for"
+	restart_agent
+}
+
+# get installs one of ON_DEMAND that is a tool, and no more: the agent that
+# asked waits for it.
+get() {
+	case " $ON_DEMAND " in *" $1 "*) ;; *)
+		say "$1 is not one the agent can ask for"
+		return 2
+		;;
+	esac
+	has $1 && return 0
+	feeds
+	pm_update >/dev/null 2>&1 || say "the package index could not be read through the manager"
+	if ! pm_add $1 >/dev/null 2>&1 || ! has $1; then
+		say "$1 could not be installed: $(why $1) until it is ($ADD $1)"
+		return 1
+	fi
+	grep -qx "$1" $LIST 2>/dev/null || echo $1 >>$LIST
+	say "installed $1, which the agent was asked to run"
+}
+
+case $1 in
+feeds) feeds ;;
+add) add "$2" ;;
+get) get "$2" ;;
+install) install_all ;;
+restore) restore ;;
+required) required ;;
+early) EARLY=1; early ;;
+keep)
+	pm_update >/dev/null 2>&1 && as_built
+	keep_copies
+	rc=$?
+	keep_next
+	exit $rc
+	;;
+*)
+	sed -n '6,15p' "$0" >&2
+	exit 2
+	;;
+esac

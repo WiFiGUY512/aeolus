@@ -1,0 +1,2378 @@
+// Rendering an AP's intent into UCI (0006, 0008, 0040).
+//
+// render() is pure: it takes the composed config from the manager, the AP's
+// current UCI and a few local facts, and returns the new UCI. It never reads
+// or writes files, so the same code runs on the AP and in CI, where its output
+// is fed to the manager's render check.
+//
+// Aeolus only touches what it owns (0040): the radio options intent names,
+// the bridge-vlan entries and enabled of the ports intent names (0053),
+// spanning tree on the uplink's bridge, with a hello time where it has
+// none (0095), usteer's band_steering_interval and ssid_list (0050, 0138), all of snmpd's
+// config (0052), sections named aeolus_ (in the firewall, 0054, and in its
+// own package, the prober's plan, 0059), and the time zone, NTP and syslog
+// settings. It takes OpenWrt's internet pool out of the time servers, and
+// adds to dnsmasq's rebind_domain the names it uses on the AP (0069). A
+// section it did not create is never otherwise edited, or removed; nor are
+// the key agent's wifi-station sections, which hold per-user keys (0070). A
+// radio another service owns, such as airscan's scan radio, is left alone
+// altogether (0081). One exception, and only where a network says so
+// (replace_own, 0137): an AP's own Wi-Fi network that is one of Aeolus's
+// over again, same SSID, security and key, is taken out as Aeolus's goes
+// in, on the radios Aeolus's is on. And once, where the uplink's bridge is
+// made to filter VLANs (0152), the AP's own interfaces on it move to its
+// VLAN, keeping the DHCP client id they sent before (0288).
+
+'use strict';
+
+import { text } from 'aeolus.uciexport';
+import { segment_mac } from 'aeolus.probe';
+
+// MD5 is from ucode's digest module, which the agent needs too. Loaded this
+// way, the renderer still loads without it, and keep_clientid does nothing.
+let md5 = null;
+try {
+	md5 = require('digest').md5;
+} catch (e) {
+}
+
+const PACKAGES = ['wireless', 'network', 'system', 'aeolus', 'usteer', 'snmpd', 'firewall', 'dhcp'];
+
+// OpenWrt's default time servers, which are on the internet (0069).
+const POOL = /\.openwrt\.pool\.ntp\.org$/;
+
+// The MSS clamp's nftables file, which fw4 loads (0054).
+const CLAMP = '/etc/aeolus/clamp.nft';
+
+const ENCRYPTION = {
+	'open': 'none', 'owe': 'owe', 'wpa2-psk': 'psk2', 'wpa3-sae': 'sae', 'wpa2-wpa3': 'sae-mixed',
+	'wpa2-enterprise': 'wpa2', 'wpa3-enterprise': 'wpa3', 'wpa2-wpa3-enterprise': 'wpa3-mixed',
+};
+const NEEDS_KEY = { 'wpa2-psk': true, 'wpa3-sae': true, 'wpa2-wpa3': true };
+// 802.1X, against a RADIUS server (0098).
+const ENTERPRISE = { 'wpa2-enterprise': true, 'wpa3-enterprise': true, 'wpa2-wpa3-enterprise': true };
+// 6 GHz takes WPA3 and OWE only (0086): a network in WPA2/WPA3 transition is
+// WPA3 alone there, and one that is WPA2 or open is not offered there.
+const SIX_GHZ = { 'wpa3-sae': 'sae', 'wpa2-wpa3': 'sae', 'owe': 'owe', 'wpa3-enterprise': 'wpa3', 'wpa2-wpa3-enterprise': 'wpa3' };
+// Protected management frames (0227), as hostapd's ieee80211w, on a network
+// that takes WPA2: WPA3 alone and OWE always require them.
+const PMF = { 'optional': '1', 'required': '2' };
+const PMF_CHOICE = { 'wpa2-psk': true, 'wpa2-wpa3': true, 'wpa2-enterprise': true, 'wpa2-wpa3-enterprise': true };
+// Transition Disable (WPA3 §13, 0297), by security: the bitmap that tells a
+// client signed in the newer way never to use the older one on this SSID
+// again. WPA3-Personal on SAE, WPA3-Enterprise, Enhanced Open on OWE.
+const TRANSITION_DISABLE = { 'wpa3-sae': '0x01', 'wpa2-wpa3': '0x01', 'wpa3-enterprise': '0x04', 'wpa2-wpa3-enterprise': '0x04', 'owe': '0x08' };
+
+// The most BSSes a network's 802.11k neighbour list names (0228): every
+// one of a site of eight APs on three bands, where usteer's own is 8.
+const NEIGHBOUR_REPORTS = 24;
+const HOME_HOLD = 30;          // seconds a client is kept off an AP it does not belong on, unless its rule says (0319)
+
+// The htmode families each band can use, best first.
+const FAMILIES = { '2g': ['EHT', 'HE', 'HT'], '5g': ['EHT', 'HE', 'VHT', 'HT'], '6g': ['EHT', 'HE'] };
+
+// The 802.11 generations a band's clients may use (0089), oldest first; the
+// htmode family each takes, NOHT before 802.11n, and the widest it goes;
+// and OpenWrt's require_mode for the oldest allowed, as internal/radio has
+// them.
+const GENERATIONS = { '2g': ['b', 'g', 'n', 'ax', 'be'], '5g': ['a', 'n', 'ac', 'ax', 'be'], '6g': ['ax', 'be'] };
+const FAMILY = { b: 'NOHT', g: 'NOHT', a: 'NOHT', n: 'HT', ac: 'VHT', ax: 'HE', be: 'EHT' };
+const FAMILY_WIDTH = { NOHT: 20, HT: 40, VHT: 160, HE: 160, EHT: 320 };
+const REQUIRE = { n: 'n', ac: 'ac', ax: 'ax' };
+
+// The 802.11ax guard intervals iw takes, by nanoseconds (0089).
+const HE_GI = { '800': '0.8', '1600': '1.6', '3200': '3.2' };
+
+function clone(v) {
+	return json(sprintf('%J', v));
+}
+
+function owned(name) {
+	return substr(name ?? '', 0, 7) == 'aeolus_';
+}
+
+// iface_name is the wifi-iface for a network on a radio (0039).
+function iface_name(network, radio) {
+	return 'aeolus_' + replace(network, '-', '_') + '_' + radio;
+}
+
+function interface_name(network) {
+	return 'aeolus_' + replace(network, '-', '_');
+}
+
+// steered is how a network's clients are steered (0138): each way a switch
+// of its own. band_steering is the older name of suggest (0050). Sticky's
+// settings, each as unset where it is not set: the signal under which a
+// client is weak (0138); and how much more strongly another AP must hear a
+// client to move it there, the signal here under which that is done, and
+// how long one put off is kept off (0289).
+function steered(net) {
+	let s = net.steering ?? {};
+	return {
+		suggest: !!(s.suggest ?? net.band_steering), hold: !!s.hold_back, sticky: !!s.sticky, community: !!s.community, keep: !!s.keep_6g, weak: s.sticky_signal ?? -80,
+		margin: s.sticky_margin ?? 5, floor: s.sticky_floor ?? -65, hold_down: s.sticky_hold_down ?? 10,
+		scan: !!s.sticky_scan,
+	};
+}
+
+// asks says a network's clients are asked to move, which is by 802.11v,
+// to a place named by its neighbour report, which is 802.11k's (0050).
+function asks(net) {
+	let s = steered(net);
+	return s.suggest || s.sticky;
+}
+
+// net_hash names a network's own bridge and veth pairs (0061): FNV-1a of the
+// network's name, as 8 hex digits, so the names fit Linux's 15 characters.
+function net_hash(id) {
+	let h = 0x811c9dc5;
+	for (let i = 0; i < length(id); i++)
+		h = ((h ^ ord(id, i)) * 0x01000193) & 0xffffffff;
+	return sprintf('%08x', h);
+}
+
+// 802.11r's key holders (0224). Each BSS of a network with 802.11r is one,
+// named by a NAS-Identifier of its own: its AP, its radio and its network's
+// hash. hostapd reads the others on the network from a file the agent keeps
+// for the BSS in FT_DIR, and reads it again when it changes, with no restart.
+// hostapd runs as the network user, which /etc/aeolus is closed to.
+const FT_DIR = '/etc/aeolus-ft';
+
+function ft_nasid(ap, radio, id) {
+	return `${ap ?? 'ap'}/${radio}/${net_hash(id)}`;
+}
+
+// The VLAN end of a network's veth pair, which Aeolus puts in the uplink's
+// bridge (0061): av, p or f for the slot, and the network's hash.
+const VLAN_END = /^av[pf][0-9a-f]{8}$/;
+
+function of_type(pkg, typ) {
+	let out = filter(values(pkg), s => s['.type'] == typ);
+	sort(out, (a, b) => a['.index'] - b['.index']);
+	return out;
+}
+
+function list(v) {
+	return v == null ? [] : (type(v) == 'array' ? v : [v]);
+}
+
+// put creates or replaces a section Aeolus owns, keeping its place.
+// A clock before this, in Unix seconds, is one not yet set: an AP that
+// has not heard NTP since it started has no test network on (0179).
+const CLOCK_SET = 1700000000;
+
+// test_on says whether test network id is switched on at now (0179): it is
+// the one test_network names, and its time is not up by the AP's clock.
+function test_on(on, id, now) {
+	return on?.network == id && type(on?.until) in ['int', 'double'] && type(now) in ['int', 'double'] &&
+		now >= CLOCK_SET && now < on.until;
+}
+
+// live is the intent as it renders now (0179): a test network is in it only
+// while it is switched on here and its time is not up; the manager's check
+// leaves the others out by the same rule (compose.Live).
+function live(intent, now) {
+	let nets = intent?.network ?? {}, out = null;
+	for (let id in keys(nets)) {
+		if (nets[id]?.test !== true || test_on(intent.test_network, id, now))
+			continue;
+		if (!out) {
+			out = clone(intent);
+			out.network = clone(nets);
+		}
+		delete out.network[id];
+	}
+	return out ?? intent;
+}
+
+function put(pkg, name, typ, opts) {
+	let index = pkg[name]?.['.index'];
+	if (index == null) {
+		index = 0;
+		for (let k in pkg)
+			index = max(index, pkg[k]['.index'] + 1);
+	}
+	let s = { '.anonymous': false, '.type': typ, '.name': name, '.index': index };
+	for (let k in opts)
+		if (opts[k] != null)
+			s[k] = type(opts[k]) == 'array' ? map(opts[k], v => '' + v) : '' + opts[k];
+	pkg[name] = s;
+}
+
+// htmode is the mode a radio runs at a width: the best family it can, up to
+// cap, the newest the band's generations allow (0089); NOHT for one before
+// 802.11n. Under a cap, a width wider than a family goes is narrowed to its
+// widest: the radio's own width, which no one set, may be.
+function htmode(band, width, current, modes, cap) {
+	if (cap == 'NOHT')
+		return 'NOHT';
+	let fams = FAMILIES[band] ?? ['HT'];
+	if (cap && index(fams, cap) >= 0)
+		fams = slice(fams, index(fams, cap));
+	let at = fam => cap ? min(width, FAMILY_WIDTH[fam]) : width;
+	for (let fam in fams)
+		if (index(modes ?? [], fam + at(fam)) >= 0)
+			return fam + at(fam);
+	// Capabilities unknown: keep the family the radio runs now, within cap.
+	let m = match(current ?? '', /^(HT|VHT|HE|EHT)[0-9]/);
+	let fam = !m ? 'HT' : !cap || index(fams, m[1]) >= 0 ? m[1] : fams[0];
+	return fam + at(fam);
+}
+
+// span reads a band's generations (0089): the oldest and the newest, or
+// null where the list is not one unbroken run of the band's.
+function span(band, modes) {
+	let order = GENERATIONS[band] ?? [], at = [];
+	for (let m in modes ?? []) {
+		let i = index(order, m);
+		if (i < 0)
+			return null;
+		if (index(at, i) < 0)
+			push(at, i);
+	}
+	if (!length(at))
+		return null;
+	sort(at);
+	for (let i = 1; i < length(at); i++)
+		if (at[i] != at[i - 1] + 1)
+			return null;
+	return { oldest: order[at[0]], newest: order[at[length(at) - 1]] };
+}
+
+// BLOCKS5 are the 5 GHz channels joined at each width, by their lowest and
+// highest 20 MHz channel, as internal/radio has them: the upper ones,
+// 165–177, among them (0232).
+const BLOCKS5 = {
+	'40': [[36, 40], [44, 48], [52, 56], [60, 64], [100, 104], [108, 112], [116, 120], [124, 128], [132, 136], [140, 144], [149, 153], [157, 161], [165, 169], [173, 177]],
+	'80': [[36, 48], [52, 64], [100, 112], [116, 128], [132, 144], [149, 161], [165, 177]],
+	'160': [[36, 64], [100, 128]],
+};
+
+// BLOCKS6 are the 6 GHz channels joined at each width, 1–233, as
+// internal/radio has them (0087): a 40 MHz block every 8, 80 every 16, 160
+// every 32, and two families of 320 that overlap by 160.
+const BLOCKS6 = (() => {
+	let b = { '40': [], '80': [], '160': [], '320': [] };
+	for (let w in [[40, 8, 229], [80, 16, 221], [160, 32, 221]])
+		for (let lo = 1; lo + w[1] - 4 <= w[2]; lo += w[1])
+			push(b['' + w[0]], [lo, lo + w[1] - 4]);
+	for (let lo in [1, 33, 65, 97, 129, 161])
+		push(b['320'], [lo, lo + 60]);
+	return b;
+})();
+
+// CHANNELS5 are 5 GHz's 20 MHz channels, 36–177, the upper ones too (0232).
+const CHANNELS5 = [36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144, 149, 153, 157, 161, 165, 169, 173, 177];
+
+// CHANNELS6 are 6 GHz's 20 MHz channels, 1–233.
+const CHANNELS6 = (() => {
+	let out = [];
+	for (let c = 1; c <= 233; c += 4)
+		push(out, c);
+	return out;
+})();
+
+// psc says whether a 6 GHz channel is a preferred scanning channel: 5, 21,
+// 37 and every 16th to 229, where clients look for 6 GHz networks (0087).
+function psc(c) {
+	return c >= 5 && c <= 229 && (c - 5) % 16 == 0;
+}
+
+// whole keeps, of the channels an automatic channel may be (0075), those a
+// radio at width can use: on 5 and 6 GHz at 40 MHz or more, the blocks
+// wholly in the set, as hostapd checks only a block's primary channel
+// against its list. Sorted, without repeats, as strings for UCI.
+function whole(band, set, width) {
+	let have = {};
+	for (let c in set)
+		have['' + c] = true;
+	let blocks = band == '5g' ? BLOCKS5['' + width] : band == '6g' ? BLOCKS6['' + width] : null;
+	let out = [];
+	if (!blocks || width <= 20)
+		out = map(keys(have), c => +c);
+	else
+		for (let b in blocks) {
+			let all = true;
+			for (let c = b[0]; c <= b[1]; c += 4)
+				all = all && have['' + c];
+			if (all)
+				for (let c = b[0]; c <= b[1]; c += 4)
+					if (index(out, c) < 0)
+						push(out, c);
+		}
+	return map(sort(out, (a, b) => a - b), c => '' + c);
+}
+
+// pair2g is the channel a 2.4 GHz channel is joined with at 40 MHz (0117):
+// four above for 1 to 6, four below from 7 up, as OpenWrt joins a set one.
+function pair2g(c) {
+	return c < 7 ? c + 4 : c - 4;
+}
+
+// usable2g is usable on 2.4 GHz, which has no blocks: the set, or with
+// spread the channels of it that do not overlap at the width, from the
+// lowest: five apart at 20 MHz; at 40 MHz, their middles eight apart.
+function usable2g(set, width, spread) {
+	let list = uniq(sort(map(set, c => +c), (a, b) => a - b));
+	if (!spread)
+		return map(list, c => '' + c);
+	// Twice the middle, to stay in whole numbers.
+	let middle = c => width > 20 ? c + pair2g(c) : 2 * c, gap = width > 20 ? 16 : 10;
+	let out = [];
+	for (let c in list)
+		if (!length(out) || middle(c) - middle(out[length(out) - 1]) >= gap)
+			push(out, c);
+	return map(out, c => '' + c);
+}
+
+// block_primary is a block's primary channel (0243): its lowest on 5 GHz,
+// its second on 6 GHz.
+function block_primary(band, b) {
+	return band == '6g' ? b[0] + 4 : b[0];
+}
+
+// primary is the 20 MHz channel a radio on channel, at width, beacons on
+// (0243), as internal/radio's Primary has it: on 5 GHz at 40 MHz or more,
+// its block's lowest; on 6 GHz, its block's second, at 80 and 160 MHz a
+// preferred scanning channel. Elsewhere, and at 20 MHz, the channel.
+function primary(band, channel, width) {
+	let blocks = band == '5g' ? BLOCKS5['' + width] : band == '6g' ? BLOCKS6['' + width] : null;
+	if (!blocks || width <= 20)
+		return channel;
+	for (let b in blocks)
+		if (channel >= b[0] && channel <= b[1])
+			return block_primary(band, b);
+	return channel;
+}
+
+// outside5 says a 5 GHz radio on channel at width keeps off the DFS
+// channels, 52–144, as internal/radio's Fits and Radar have it: at 40 MHz
+// or more, the channel is in a block at the width, and that block is
+// outside them.
+function outside5(channel, width) {
+	let b = width > 20 ? null : [channel, channel];
+	for (let x in (width > 20 ? BLOCKS5['' + width] ?? [] : []))
+		if (channel >= x[0] && channel <= x[1]) {
+			b = x;
+			break;
+		}
+	return b != null && !(b[0] <= 144 && b[1] >= 52);
+}
+
+// dfs_way is how a 5 GHz radio, its section s as rendered, uses the DFS
+// channels (0328), as internal/radio's DFSWay has it: avoid, keeping an
+// automatic channel off them (0071); look, starting outside them, for
+// radio resource management to move it to one that is clearly the best
+// once it has looked (0120); or pick, where hostapd may pick one as the
+// radio starts. allow, the default, as unset, and look-first, its name
+// from before, look where the channel is automatic, RRM moves radios, and
+// a whole block outside DFS at the radio's width is among its channels;
+// elsewhere nothing would look, or the radio has nowhere outside DFS to
+// start, as at 160 MHz, and they pick. A channel set by hand is used as
+// set.
+function dfs_way(intent, s) {
+	if (intent.radio?.['5g']?.dfs == 'avoid')
+		return 'avoid';
+	let r = intent.rrm;
+	if ((s.channel ?? 'auto') != 'auto' || r?.enabled != true || r.moves == false)
+		return 'pick';
+	let width = int(match(s.htmode ?? '', /([0-9]+)$/)?.[1] ?? 20);
+	for (let c in (length(s.channels ?? []) ? s.channels : CHANNELS5))
+		if (outside5(int(c), width))
+			return 'look';
+	return 'pick';
+}
+
+// usable is what an automatic channel may be, as internal/radio's Usable
+// has it (0075, 0087): the primaries (0243) of the set's whole blocks at
+// the width; on 6 GHz, with only_psc, preferred scanning channels alone;
+// and with spread, one block's to a block, the blocks apart, so radios on
+// different channels never share one. As strings for UCI.
+function usable(band, set, width, only_psc, spread) {
+	if (band == '2g')
+		return usable2g(set, width, spread);
+	let list = map(whole(band, set, width), c => +c);
+	only_psc = only_psc && band == '6g';
+	let ok = c => !only_psc || psc(c);
+	let blocks = band == '5g' ? BLOCKS5['' + width] : band == '6g' ? BLOCKS6['' + width] : null;
+	let out = [];
+	if (!blocks || width <= 20)
+		out = filter(list, ok);
+	else {
+		let last = 0;
+		for (let b in sort([...blocks], (x, y) => x[0] - y[0])) {
+			let p = block_primary(band, b);
+			if (index(list, b[0]) < 0 || index(list, b[1]) < 0 || !ok(p) || (spread && b[0] <= last))
+				continue;
+			if (index(out, p) < 0)
+				push(out, p);
+			last = b[1];
+		}
+		out = sort(out, (x, y) => x - y);
+	}
+	return map(out, c => '' + c);
+}
+
+// NARROW is the width a 5 GHz radio set to 160 MHz starts at where DFS is
+// allowed (0329), as internal/radio's Narrow.
+const NARROW = 80;
+
+// start_width is the width a 5 GHz radio set to set.width starts at
+// (0329), as internal/radio's StartWidth has it. Every 160 MHz block on
+// 5 GHz holds DFS channels, so a radio started at 160 MHz waits a minute
+// for its radar check at every start. Where DFS is allowed, the channel is
+// automatic (auto), radio resource management moves radios, and the set
+// (all of 5 GHz's where it has none, without the upper channels unless
+// compatibility is off, 0232) has a whole 80 MHz block outside DFS, it
+// starts at 80 MHz there, serving at once, and RRM widens it to 160 MHz once
+// it has looked, in the window for moves. Only where the AP's hostapd can
+// switch it to 160 and advertises 160 MHz only once it is there
+// (facts.csa160): stock hostapd refuses the switch, and one that advertised
+// 160 MHz while at 80 dropped some clients' uplink (openwrt#22435).
+// Elsewhere, set.width.
+function start_width(intent, set, auto, facts) {
+	let r = intent.rrm;
+	if (set.width != 160 || set.dfs == 'avoid' || !auto || r?.enabled != true || r.moves == false || facts?.csa160 != true)
+		return set.width;
+	let base = set.channels ?? CHANNELS5;
+	if (set.compatible !== false)
+		base = filter(base, c => +c < 165);
+	for (let c in usable('5g', base, NARROW, false, false))
+		if (outside5(+c, NARROW))
+			return NARROW;
+	return set.width;
+}
+
+// reserved says another service on the AP owns a radio, and Aeolus leaves it
+// alone (0081): no radio settings, no networks. airscan marks the dedicated
+// scan radio it takes out of netifd's hands (option airscan '1').
+function reserved(s) {
+	return s.airscan == '1';
+}
+
+// wide is the width radio resource management widens this AP's 5 GHz radio
+// to (0329), where it starts narrower (start_width), or null.
+function wide(w, intent, facts) {
+	let set = intent.radio?.['5g'] ?? {};
+	for (let s in of_type(w, 'wifi-device'))
+		if (!reserved(s) && s.band == '5g' && set.width == 160 &&
+		    start_width(intent, set, (s.channel ?? 'auto') == 'auto', facts) < set.width)
+			return set.width;
+	return null;
+}
+
+// scan_radio says the AP has a radio another service owns, a scan radio
+// that serves no clients: there its serving radios never scan (0081).
+function scan_radio(w) {
+	return length(filter(of_type(w, 'wifi-device'), reserved)) > 0;
+}
+
+// radios sets each radio Aeolus serves from. On or off: false turns a radio
+// off, true on; unset, the radio stays as the AP has it, which is on unless
+// Aeolus turned it off (0238). What Aeolus turned off it keeps in the
+// aeolus_radios_off section, so a radio it turned off comes on again once
+// nothing says off: the renderer cannot tell otherwise its own disabled
+// from the AP's (the Living Room's 5 GHz stayed off, 2026-10-29).
+// edges are the frequencies, in MHz, of the block a channel takes up at a
+// width on 5 or 6 GHz: its lowest and its highest (0327).
+function edges(band, channel, width) {
+	let blocks = band == '5g' ? BLOCKS5['' + width] : band == '6g' ? BLOCKS6['' + width] : null;
+	let b = [channel, channel];
+	if (blocks && width > 20)
+		for (let x in blocks)
+			if (channel >= x[0] && channel <= x[1]) {
+				b = x;
+				break;
+			}
+	let mhz = c => band == '5g' ? 5000 + 5 * c : c == 2 ? 5935 : 5950 + 5 * c;
+	return [mhz(b[0]) - 10, mhz(b[1]) + 10];
+}
+
+// apart6 keeps an AP's own 5 GHz and 6 GHz apart at start (0327): of an
+// automatic 6 GHz radio's channels, those whose block's lower edge is
+// rrm.apart MHz (250 unless set) or more over the highest its own 5 GHz may
+// use, its channel's block or its list's highest. hostapd picks among them
+// at start, and radio resource management moves within them. Where that
+// would leave none, the list is as it was. On the Living Room C-360, 6 GHz
+// on 5/160 (5945-6105), 130 MHz over 5 GHz 157/40, cut 5 GHz to MCS 0.
+function apart6(w, intent) {
+	let apart = intent.rrm?.apart ?? 250, s5 = null, s6 = null;
+	for (let s in of_type(w, 'wifi-device'))
+		if (!reserved(s)) {
+			if (s.band == '5g')
+				s5 ??= s;
+			else if (s.band == '6g')
+				s6 ??= s;
+		}
+	if (!apart || !s5 || !s6 || (s6.channel ?? 'auto') != 'auto' || !length(s6.channels ?? []))
+		return;
+	let width = s => int(match(s.htmode ?? '', /([0-9]+)$/)?.[1] ?? 20);
+	let five = (s5.channel ?? 'auto') == 'auto' ? s5.channels ?? [] : [s5.channel], top = null;
+	for (let c in five) {
+		let e = edges('5g', int(c), width(s5));
+		if (top == null || e[1] > top)
+			top = e[1];
+	}
+	if (top == null)
+		return;
+	let kept = filter(s6.channels, c => edges('6g', int(c), width(s6))[0] >= top + apart);
+	if (length(kept))
+		s6.channels = kept;
+}
+
+function radios(w, a, intent, facts, keep) {
+	let country = intent.system?.country;
+	let was_off = a.aeolus_radios_off?.radio ?? [];
+	let off = [];
+	for (let s in of_type(w, 'wifi-device')) {
+		if (reserved(s))
+			continue;
+		let set = intent.radio?.[s.band] ?? {};
+		if (country != null)
+			s.country = country;
+		if (set.enabled != null)
+			s.disabled = set.enabled ? '0' : '1';
+		else if (index(was_off, s['.name']) >= 0)
+			s.disabled = '0';
+		if (set.enabled === false)
+			push(off, s['.name']);
+		// The generations clients may use (0089): the oldest is the least a
+		// client must support, through require_mode; 802.11b is the
+		// legacy_rates OpenWrt leaves off; the newest caps the mode.
+		let gens = set.modes != null ? span(s.band, set.modes) : null;
+		if (set.width != null || gens) {
+			let now = match(s.htmode ?? '', /([0-9]+)$/)?.[1];
+			// At 160 MHz with DFS allowed it may start narrower (0329).
+			let auto = set.channel != null ? set.channel == 'auto' : (s.channel ?? 'auto') == 'auto';
+			let width = s.band == '5g' && set.width != null ? start_width(intent, set, auto, facts) : set.width;
+			s.htmode = htmode(s.band, width ?? int(now ?? 20), s.htmode, facts.radios?.[s['.name']]?.htmodes,
+				gens ? FAMILY[gens.newest] : null);
+			// Its 160 MHz capability is hostapd's to add, as it switches
+			// there (0329): never asked for, so no radio at 80 MHz says it.
+			delete s.vht160;
+		}
+		if (gens) {
+			if (s.band == '2g' && gens.oldest == 'b')
+				s.legacy_rates = '1';
+			else if (s.band == '2g')
+				delete s.legacy_rates;
+			if (s.band != '6g' && REQUIRE[gens.oldest])
+				s.require_mode = REQUIRE[gens.oldest];
+			else
+				delete s.require_mode;
+		}
+		// The short guard interval for 802.11n and 802.11ac (0089), on
+		// unless set off.
+		if (set.short_gi != null)
+			for (let w in ['20', '40', '80', '160']) {
+				if (set.short_gi)
+					delete s['short_gi_' + w];
+				else
+					s['short_gi_' + w] = '0';
+			}
+		if (set.channel != null) {
+			// A channel set is its block's primary at the radio's width
+			// (0243): 153 at 40 MHz is 149, as hostapd would otherwise
+			// have it 153 with 149 below.
+			let at = int(match(s.htmode ?? '', /([0-9]+)$/)?.[1] ?? 20);
+			s.channel = '' + (type(set.channel) in ['int', 'double'] ? primary(s.band, int(set.channel), at) : set.channel);
+			// An automatic channel is one of the set's (0075), at the radio's
+			// width; unset, on 2.4 GHz, one of 1, 6 and 11, the only ones that
+			// do not overlap (0045).
+			// On 6 GHz, it may be kept to preferred scanning channels, and to
+			// one channel a block (0087); on 2.4 GHz, to the channels that
+			// do not overlap at the width (0117). On 5 GHz the list is always
+			// written, so that radio resource management, which moves within
+			// it, has the same channels as hostapd's own pick; and with
+			// channel compatibility, as unless it is turned off, it leaves
+			// out the upper channels, 165–177 (0232): hostapd's pick takes
+			// U-NII-4 for the quietest, as few use it, and many clients send
+			// there at reduced power.
+			let width = int(match(s.htmode ?? '', /([0-9]+)$/)?.[1] ?? 20);
+			let only_psc = s.band == '6g' && set.psc === true;
+			let spread = s.band in ['6g', '2g'] && set.non_overlapping === true;
+			let base = set.channels ?? (s.band == '2g' ? [1, 6, 11] : only_psc || spread ? CHANNELS6 : s.band == '5g' ? CHANNELS5 : null);
+			if (s.band == '5g' && set.compatible !== false && base)
+				base = filter(base, c => +c < 165);
+			let list = set.channel != 'auto' || !base ? [] : usable(s.band, base, width, only_psc, spread);
+			if (length(list))
+				s.channels = list;
+			else
+				delete s.channels;
+		}
+		// On 5 GHz hostapd keeps the primary it is given (0243): its scan for
+		// networks a 40 MHz channel overlaps, which swaps the primary and the
+		// secondary where another network's primary is on the secondary, is
+		// off. It put the Living Room AP, set to 149, on 153.
+		if (s.band == '5g')
+			s.noscan = '1';
+		// A power set, or auto, is none of netifd's (0349): a change to its
+		// txpower sets the Wi-Fi up again. aeolus-power holds a set power
+		// with iw from the agent's package (radio_power), and auto is the
+		// radio's own. Unset, the AP's own txpower stays.
+		if (set.power != null)
+			delete s.txpower;
+		// The weakest a client may be heard at and still join (0097): one
+		// further off is refused, and keeps to a nearer AP rather than hold
+		// this radio at its slowest rates. off takes it away.
+		if (set.min_signal == 'off')
+			delete s.rssi_reject_assoc_rssi;
+		else if (set.min_signal != null)
+			s.rssi_reject_assoc_rssi = '' + set.min_signal;
+		// Time between beacons, in TU of 1.024 ms (0097).
+		if (set.beacon_interval != null)
+			s.beacon_int = '' + set.beacon_interval;
+		// The radio's switches below: unset, each is OpenWrt's default again,
+		// its option taken away, so one turned off and then unset is not left
+		// off (0196).
+		let bit = (o, v) => {
+			if (v == null)
+				delete s[o];
+			else
+				s[o] = v ? '1' : '0';
+		};
+		// Target wake time (0191): whether the radio answers a client's
+		// request to agree when it wakes, for every network on it, as
+		// hostapd has it a radio at a time.
+		bit('he_twt_responder', set.twt);
+		// Beamforming (0195), the radio's, one switch each across the
+		// generations hostapd has them for: 802.11ac at 5 GHz only, ax and
+		// be on every band, each heeded only where the radio can. MU-MIMO
+		// steers to several clients at once and rides on steering to one,
+		// so with the beamformer off it is off too.
+		let bf_gens = s.band == '5g' ? ['', 'he_', 'eht_'] : ['he_', 'eht_'];
+		let mu = set.beamformer === false ? false : set.mu_mimo;
+		for (let g in bf_gens) {
+			bit(g + 'su_beamformer', set.beamformer);
+			bit(g + 'su_beamformee', set.beamformee);
+			bit(g + 'mu_beamformer', mu);
+		}
+		// BSS color (0192), the radio's: off, none; auto, one at random at
+		// each start, which hostapd picks for any above 63; else that one.
+		if (set.bss_color == 'off')
+			s.he_bss_color_enabled = '0';
+		else if (set.bss_color != null) {
+			s.he_bss_color_enabled = '1';
+			s.he_bss_color = set.bss_color == 'auto' ? '128' : '' + set.bss_color;
+		}
+		else {
+			delete s.he_bss_color_enabled;
+			delete s.he_bss_color;
+		}
+		// The DFS channels, those shared with radar (0328): avoided (0071),
+		// or looked at first (0120), an automatic channel is picked outside
+		// them as the radio starts, and radio resource management moves it
+		// there or nothing does. Picked, hostapd may start it on one. A set
+		// channel needs nothing: where they are avoided, the config check
+		// refuses one that is DFS.
+		if (s.band == '5g') {
+			if (dfs_way(intent, s) in ['avoid', 'look'] && (s.channel ?? 'auto') == 'auto')
+				s.acs_exclude_dfs = '1';
+			else if (s.acs_exclude_dfs in ['1', 'yes', 'on', 'true', 'enabled'])
+				delete s.acs_exclude_dfs;
+		}
+	}
+	if (length(off)) {
+		put(a, 'aeolus_radios_off', 'radios', { radio: off });
+		keep.aeolus_radios_off = true;
+	}
+	apart6(w, intent);
+}
+
+// The VLAN the uplink's bridge has for what comes to it untagged, where
+// Aeolus has it filter VLANs (0152): 1, which is also the VLAN the bridge
+// itself is in unless told otherwise, so what the AP sends on the bridge
+// goes out untagged as before.
+const UNTAGGED_VLAN = 1;
+
+// keep_clientid has an interface that moves from a device to a VLAN of it
+// (0152) send the DHCP client id it sent before (0288). OpenWrt makes it
+// from the device's name (proto_dhcp_get_default_clientid): ff, the first
+// eight hex digits of the name's MD5, and the AP's DUID. On br-lan.1 the AP
+// would be another client, and a reservation made for it before it was
+// adopted would stop matching. Only where OpenWrt makes that id: a DHCP
+// interface with no client id of its own, the usual one asked for, and a
+// DUID as OpenWrt reads it (hexdump_2hex).
+function keep_clientid(n, i, device) {
+	if (md5 == null || i.proto != 'dhcp' || i.clientid != null || (i.sendclientid ?? 'auto') != 'auto')
+		return;
+	let duid = lc(replace(of_type(n, 'globals')[0]?.dhcp_default_duid ?? '', /\n/g, ' '));
+	if (!match(duid, /^[[:space:]]*[0-9a-f]{2}(([[:space:]]+|[:-]?)[0-9a-f]{2})*[[:space:]]*$/))
+		return;
+	i.clientid = 'ff' + substr(md5(device), 0, 8) + replace(duid, /[[:space:]:-]/g, '');
+}
+
+// filter_vlans has the uplink's bridge filter VLANs, where it does not
+// (0152). A fresh OpenWrt's bridge is one network with no VLANs, and
+// Aeolus's networks are VLANs of the uplink's bridge. What the bridge was
+// stays as it was: each of its ports untagged in one VLAN, and each
+// interface that was on the bridge now on that VLAN of it, so the AP keeps
+// its address, and what is plugged into its other ports stays on its
+// network. It is done once: a bridge with a VLAN of its own is left as it
+// is. So is one with an 802.1Q device on it already, which uplink_bridge
+// then says is not rendered.
+function filter_vlans(n, facts) {
+	let ups = filter(list(facts.uplinks), u => u);
+	for (let d in of_type(n, 'device')) {
+		if (d.type != 'bridge' || !length(filter(ups, u => index(list(d.ports), u) >= 0)))
+			continue;
+		if (length(filter(of_type(n, 'bridge-vlan'), v => v.device == d.name)))
+			return;
+		// A port that is itself a VLAN of something (eth0.1, as a switch
+		// without DSA has them) is not one a bridge's VLANs go on.
+		if (length(filter(list(d.ports), p => index(p, '.') >= 0)))
+			return;
+		let stem = d.name + '.';
+		let on_a_vlan = x => type(x) == 'string' && substr(x, 0, length(stem)) == stem;
+		for (let s in values(n))
+			if (on_a_vlan(s.device) || on_a_vlan(s.ifname) || on_a_vlan(s.name) ||
+			    (s['.type'] == 'device' && s.type == '8021q' && s.ifname == d.name))
+				return;
+		let name = 'vlan' + UNTAGGED_VLAN;
+		if (n[name])
+			name = replace(d.name, /[^A-Za-z0-9_]/g, '_') + '_' + name;
+		if (n[name])
+			return;
+		put(n, name, 'bridge-vlan', { device: d.name, vlan: UNTAGGED_VLAN, ports: map(list(d.ports), p => p + ':u*') });
+		for (let i in of_type(n, 'interface'))
+			if (i.device == d.name) {
+				keep_clientid(n, i, d.name);
+				i.device = stem + UNTAGGED_VLAN;
+			}
+		return;
+	}
+}
+
+// uplink_bridge finds the VLAN-filtering bridge the uplink port is in.
+function uplink_bridge(n, uplink, errors) {
+	let ups = filter(list(uplink), u => u);
+	if (!length(ups)) {
+		push(errors, 'no uplink port is set (aeolus.agent.uplink)');
+		return null;
+	}
+	for (let d in of_type(n, 'device')) {
+		if (d.type != 'bridge' || !length(filter(ups, u => index(list(d.ports), u) >= 0)))
+			continue;
+		if (!length(filter(of_type(n, 'bridge-vlan'), v => v.device == d.name))) {
+			push(errors, `bridge ${d.name} does not filter VLANs; 802.1Q devices on the uplink are not rendered yet`);
+			return null;
+		}
+		return d.name;
+	}
+	push(errors, `the uplink ${join(' and ', ups)} is in no bridge`);
+	return null;
+}
+
+// ensure_vlan makes sure the bridge carries a VLAN on the uplink, on each of
+// its ports where its bond is taken apart (0096), reusing a bridge-vlan that
+// already exists so a VLAN is never defined twice (0040), and returns that
+// section.
+function ensure_vlan(n, bridge, uplink, vlan, keep) {
+	let name = 'aeolus_vlan' + vlan;
+	let ups = list(uplink);
+	for (let v in of_type(n, 'bridge-vlan'))
+		if (v.device == bridge && v.vlan == '' + vlan && v['.name'] != name)
+			return v;
+	// Kept as it is, but for the uplink: ports() sets the ports' entries.
+	let ports = filter(list(n[name]?.ports), e => index(ups, split(e, ':')[0]) < 0);
+	put(n, name, 'bridge-vlan', { device: bridge, vlan: vlan, ports: [...map(ups, u => u + ':t'), ...ports] });
+	keep[name] = true;
+	return n[name];
+}
+
+function iface_options(net, radio, band, network, btm, id, ap) {
+	let o = {
+		device: radio, mode: 'ap', network: network, ssid: net.ssid,
+		encryption: (band == '6g' ? SIX_GHZ[net.security] : null) ?? ENCRYPTION[net.security] ?? 'none',
+	};
+	// Each device's passphrase from the RADIUS server (0115), with MAC
+	// authentication on a WPA2 network: OpenWrt's ppsk, which has hostapd
+	// take the Tunnel-Password the server gives for the device's MAC, and
+	// refuse a device it gives none. The network's own passphrase is not
+	// used then, so none is written.
+	let ppsk = net.security == 'wpa2-psk' && net.radius?.mac_auth && net.radius?.passphrases;
+	if (ppsk)
+		o.ppsk = '1';
+	else if (NEEDS_KEY[net.security])
+		o.key = net.passphrase;
+	// WPA Enterprise: each client signs in against the RADIUS server, which
+	// accounting goes to as well where one is set (0098). On another
+	// network with MAC authentication, the server is asked of each device
+	// by its MAC before it is let on (0112): OpenWrt does that for a
+	// network that is not WPA Enterprise and has a server.
+	if (ENTERPRISE[net.security] || net.radius?.mac_auth) {
+		let r = net.radius ?? {};
+		o.auth_server = r.auth_server;
+		o.auth_port = '' + (r.auth_port ?? 1812);
+		o.auth_secret = r.auth_secret;
+		if (r.acct_server) {
+			o.acct_server = r.acct_server;
+			o.acct_port = '' + (r.acct_port ?? 1813);
+			o.acct_secret = r.acct_secret ?? r.auth_secret;
+		}
+		if (r.nas_id)
+			o.nasid = r.nas_id;
+		// The VLAN the server names puts its client there, if the network
+		// offers it (0111): optional, or with vlan_required, the client is
+		// refused without one.
+		if (length(r.vlans ?? []))
+			o.dynamic_vlan = r.vlan_required ? '2' : '1';
+		// A Disconnect-Request from the one server named (RFC 5176), so a NAC
+		// can have a client sign in again (0111): WPA Enterprise only, as
+		// OpenWrt gives hostapd its secret nowhere else.
+		if (ENTERPRISE[net.security] && r.das?.client) {
+			o.radius_das_client = r.das.client;
+			o.radius_das_secret = r.das.secret ?? r.auth_secret;
+			o.radius_das_port = '' + (r.das.port ?? 3799);
+		}
+	}
+	// Every network's beacons list the AP's other networks, on every band,
+	// in a Reduced Neighbor Report, so a client hearing one band learns the
+	// others: a phone on 5 GHz finds 6 GHz this way (0087).
+	o.rnr = '1';
+	if (net.hidden)
+		o.hidden = '1';
+	if (net.isolation)
+		o.isolate = '1';
+	// The most clients on each of the network's Wi-Fi interfaces, one a
+	// band, and the beacons between DTIMs (0097). Unset, OpenWrt's own.
+	// Clients blocked from the network, by MAC (0100): hostapd refuses
+	// them on every band.
+	if (length(net.blocked ?? [])) {
+		o.macfilter = 'deny';
+		o.maclist = sort(map(net.blocked, m => lc(m)));
+	}
+	if (net.max_clients != null)
+		o.maxassoc = '' + net.max_clients;
+	if (net.dtim != null)
+		o.dtim_period = '' + net.dtim;
+	// WPA Enterprise keeps its clients' keys, and lets a client sign in
+	// with another AP ahead of a roam, through the AP it is on, over the
+	// wire (0224).
+	if (ENTERPRISE[net.security]) {
+		o.okc = '1';
+		o.rsn_preauth = '1';
+	}
+	if (net.roaming?.ft) {
+		o.ieee80211r = '1';
+		o.ft_over_ds = '0';
+		// A passphrase's keys are made on each AP. Those of WPA3 and of WPA
+		// Enterprise come of the client's sign-in with the first AP, which
+		// pushes them to every other key holder of the network as it is done,
+		// and hands them to one that asks: over the network's own VLAN,
+		// unicast to each BSS (0224).
+		o.ft_psk_generate_local = '1';
+		if (o.nasid) {
+			// The RADIUS server is still told the NAS-Identifier set.
+			o.radius_auth_req_attr = [`32:s:${o.nasid}`];
+			o.radius_acct_req_attr = [`32:s:${o.nasid}`];
+		}
+		o.nasid = ft_nasid(ap, radio, id);
+		o.aeolus_ft = id;
+		// WPA Enterprise has no SAE, so no SAE password element (0279).
+		// OpenWrt 25.12's wifi-scripts set sae_pwe=2 on it all the same,
+		// and hostapd then says in its 802.11r answer that it uses an RSNXE
+		// it never sends: the client refuses it (reason 13) and signs in
+		// again in full (B128, OpenWrt fault 67).
+		if (ENTERPRISE[net.security])
+			o.sae_pwe = '0';
+		o.hostapd_bss_options = ['pmk_r1_push=1', `rxkh_file=${FT_DIR}/${iface_name(id, radio)}`];
+	}
+	// Transition Disable where the network says (0297): hostapd's own
+	// option, as OpenWrt 25.12's wifi-scripts have none, so every AP sends it.
+	// A client that can only do the older way is not told.
+	let td = net.transition_disable ? TRANSITION_DISABLE[net.security] : null;
+	if (td)
+		o.hostapd_bss_options = [...(o.hostapd_bss_options ?? []), `transition_disable=${td}`];
+	// Steering asks through 802.11k and 802.11v (0050, 0138).
+	if (net.roaming?.rrm || asks(net))
+		o.ieee80211k = '1';
+	if (btm)
+		o.bss_transition = '1';
+	if (net.multicast_to_unicast != null)
+		o.multicast_to_unicast = net.multicast_to_unicast ? '1' : '0';
+	// Whether a client the radio says stopped acknowledging is sent off at
+	// once (0257); unset, OpenWrt's default, which does.
+	if (net.disassoc_low_ack != null)
+		o.disassoc_low_ack = net.disassoc_low_ack ? '1' : '0';
+	// Protected management frames where the network says (0227). On 6 GHz a
+	// network is WPA3 alone, which OpenWrt has require them.
+	if (PMF[net.pmf] && PMF_CHOICE[net.security] && band != '6g')
+		o.ieee80211w = PMF[net.pmf];
+	return o;
+}
+
+// The interfaces tunnels start from on a VLAN (0063): their routing tables
+// are 1000 plus the VLAN, clear of the kernel's own, and they share a zone.
+const START_TABLE = 1000;
+const START_ZONE = 'aeolus_ul';
+
+// start_on_vlan makes the interface that tunnels start from on a VLAN of the
+// uplink (0063), and returns its name. The VLAN is tagged on the uplink, and
+// the interface takes an address by DHCP. Its routes go in a table of their
+// own, so only the tunnels use its gateway, and its DNS servers are not
+// used. Its zone rejects what comes in but the tunnels' own rules, so a VLAN
+// that also carries clients gives them no way into the AP.
+function start_on_vlan(cfg, where, vlan, facts, errors, keep) {
+	let n = cfg.network, fw = cfg.firewall;
+	let bridge = uplink_bridge(n, facts.uplinks, errors);
+	if (!bridge)
+		return null;
+	let device = `${bridge}.${vlan}`;
+	ensure_vlan(n, bridge, facts.uplinks, vlan, keep);
+	let name = `aeolus_vlan${vlan}_tunnels`;
+	put(n, name, 'interface', { proto: 'dhcp', device: device, ip4table: START_TABLE + vlan, peerdns: 0 });
+	keep[name] = true;
+	let nets = keep.aeolus_zone_ul ? list(fw.aeolus_zone_ul.network) : [];
+	if (index(nets, name) < 0)
+		push(nets, name);
+	put(fw, 'aeolus_zone_ul', 'zone', { name: START_ZONE, input: 'REJECT', output: 'ACCEPT', forward: 'REJECT', network: nets });
+	keep.aeolus_zone_ul = true;
+	return name;
+}
+
+// managed_on says whether the AP is managed on VLAN vlan of the uplink: its
+// management interface is that VLAN of the uplink's bridge.
+function managed_on(n, vlan, facts) {
+	let bridge = uplink_bridge(n, facts.uplinks, []);
+	return bridge != null && n[facts.management]?.device == `${bridge}.${vlan}`;
+}
+
+// tunnel renders a VXLAN transport (0054): an interface named for the VNI,
+// which is also its device, to the concentrator from the management
+// interface, or from a VLAN of the uplink (0063); its own bridge, which the
+// network's Wi-Fi joins; a firewall rule letting it in; and below an MTU of
+// 1500, the MSS clamp. A standby tunnel, a network's fallback, is not
+// started until the AP needs it (0061). It returns the bridge.
+function tunnel(cfg, where, standby, t, conc, facts, errors, keep, bridged) {
+	let n = cfg.network, fw = cfg.firewall;
+	if (!facts.vxlan) {
+		push(errors, `${where}: VXLAN needs the vxlan package, which is not installed on this AP (apk add vxlan)`);
+		return null;
+	}
+	let address = replace(conc?.address ?? '', /^\[|\]$/g, '');
+	let six = index(address, ':') >= 0;
+	if (!six && !match(address, /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/)) {
+		push(errors, `${where}: the concentrator's address "${address}" is not an IP address`);
+		return null;
+	}
+	if (!facts.management) {
+		push(errors, `${where}: the AP's management interface is not known`);
+		return null;
+	}
+	// Where it starts: the management interface, or a VLAN (0063). The VLAN
+	// the AP is managed on is its management interface's, so one value fits
+	// APs managed on different VLANs (0084).
+	let from = facts.management, zone = null;
+	if (conc.underlay_vlan && !managed_on(n, conc.underlay_vlan, facts)) {
+		if (six) {
+			push(errors, `${where}: a tunnel to an IPv6 concentrator starts from the management VLAN for now (0063)`);
+			return null;
+		}
+		from = start_on_vlan(cfg, where, conc.underlay_vlan, facts, errors, keep);
+		if (!from)
+			return null;
+		zone = START_ZONE;
+	}
+	let name = 'aeolus_' + t.vni;
+	let o = { proto: six ? 'vxlan6' : 'vxlan', vid: t.vni, port: conc.port, mtu: conc.mtu, tunlink: from };
+	o[six ? 'peer6addr' : 'peeraddr'] = address;
+	if (standby)
+		o.auto = 0;
+	put(n, name, 'interface', o);
+	keep[name] = true;
+	// A tunnel of a network with a fallback is attached to the network's own
+	// bridge by the prober (0061); others have a bridge of their own.
+	let bridge = bridged === false ? name : 'br-vx' + t.vni;
+	if (bridged !== false) {
+		// Ports on the tunnel stay; ports() sets those it is told about
+		// (0058). The bridge takes the AP's MAC for the segment, so what
+		// answers the prober's DHCP and probes from it stays at the AP (0060).
+		let members = filter(list(n[name + '_br']?.ports), e => e != name);
+		put(n, name + '_br', 'device', {
+			type: 'bridge', name: bridge, bridge_empty: 1, ports: [name, ...members],
+			macaddr: segment_mac(facts.ap, 'vni', t.vni) || null,
+		});
+		keep[name + '_br'] = true;
+	}
+	zone ??= filter(of_type(fw, 'zone'), z => index(list(z.network), facts.management) >= 0)[0]?.name;
+	if (zone)
+		put(fw, 'aeolus_vxlan_' + t.vni, 'rule', {
+			name: 'Aeolus VXLAN ' + t.vni, src: zone, proto: 'udp',
+			src_ip: address, dest_port: conc.port, target: 'ACCEPT',
+		});
+	else
+		push(errors, `${where}: no firewall zone holds the management interface ${facts.management}`);
+	keep['aeolus_vxlan_' + t.vni] = true;
+	if (conc.mtu < 1500) {
+		if (facts.nft_bridge) {
+			put(fw, 'aeolus_clamp', 'include', { type: 'nftables', path: CLAMP, position: 'ruleset-append' });
+			keep.aeolus_clamp = true;
+		} else
+			push(errors, `${where}: an MTU below 1500 needs the MSS clamp, and so kmod-nft-bridge, which is not installed on this AP`);
+	}
+	return bridge;
+}
+
+// BRIDGED is the start of the name and device of a VNI a tunnel carries
+// into the AP's own bridge (0335): with a VNI of seven digits, 15
+// characters, the most a device's name has.
+const BRIDGED = 'aeolus_b';
+
+// untagged_vlan is the VLAN of the uplink's bridge the uplink carries
+// untagged, as a string, where the bridge filters VLANs; null where it does
+// not, or carries none untagged.
+function untagged_vlan(n, bridge, uplinks) {
+	for (let v in of_type(n, 'bridge-vlan'))
+		if (v.device == bridge)
+			for (let e in list(v.ports)) {
+				let parts = split(e, ':');
+				if (index(uplinks, parts[0]) >= 0 && substr(parts[1] ?? '', 0, 1) == 'u')
+					return v.vlan;
+			}
+	return null;
+}
+
+// bridged renders each VNI a tunnel carries into the AP's own bridge (0335),
+// as concentrators.<name>.bridged says: a VXLAN interface aeolus_b<vni> to
+// the tunnel's far end, a port of the uplink's bridge, untagged in its VLAN:
+// the untagged network, as the uplink carries it, or a VLAN by its number.
+// It is bound to no interface (no tunlink) and sets no MTU: netifd gives a
+// bridge's ports the bridge's MTU, and a VXLAN bound to an interface can
+// take at most that interface's less its headers, so on the gate's br-lan,
+// at 2000, netifd took it out of the bridge (2026-11-06). Unbound, it takes
+// the bridge's, so the AP's own network keeps its MTU; what is larger than
+// the path goes in fragments. Whatever is at the far end,
+// as a monitoring server, is then on that network. It is not one of the
+// tunnels the prober probes (aeolus_<vni>, 0060): its segment is the AP's
+// own network, whose DHCP server and gateway answer whatever the tunnel
+// does. A firewall rule lets it in. What such a VNI no longer wanted left
+// in a bridge is taken out first.
+function bridged(cfg, intent, facts, errors, keep) {
+	let n = cfg.network, fw = cfg.firewall;
+	let ours = e => match(split(e, ':')[0], /^aeolus_b[0-9]+$/) != null;
+	for (let d in of_type(n, 'device'))
+		if (d.type == 'bridge' && length(filter(list(d.ports), ours)))
+			d.ports = filter(list(d.ports), e => !ours(e));
+	for (let v in of_type(n, 'bridge-vlan'))
+		if (length(filter(list(v.ports), ours)))
+			v.ports = filter(list(v.ports), e => !ours(e));
+	for (let id in sort(keys(intent.concentrators ?? {}))) {
+		let conc = intent.concentrators[id];
+		for (let where in sort(keys(conc.bridged ?? {}))) {
+			let vni = conc.bridged[where].vni, at = `concentrators.${id}.bridged.${where}`;
+			if (!facts.vxlan) {
+				push(errors, `${at}: VXLAN needs the vxlan package, which is not installed on this AP (apk add vxlan)`);
+				continue;
+			}
+			let address = replace(conc.address ?? '', /^\[|\]$/g, '');
+			let six = index(address, ':') >= 0;
+			if (!six && !match(address, /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/)) {
+				push(errors, `${at}: the tunnel's address "${address}" is not an IP address`);
+				continue;
+			}
+			if (!facts.management) {
+				push(errors, `${at}: the AP's management interface is not known`);
+				continue;
+			}
+			if (conc.underlay_vlan) {
+				push(errors, `${at}: a VNI carried into the AP's bridge starts from the management interface for now, not VLAN ${conc.underlay_vlan} (0063)`);
+				continue;
+			}
+			let bridge = uplink_bridge(n, facts.uplinks, []);
+			let br = filter(of_type(n, 'device'), d => d.type == 'bridge' && d.name == bridge)[0];
+			if (!br) {
+				push(errors, `${at}: the AP's uplink is in no bridge, so there is nothing to carry the VNI into`);
+				continue;
+			}
+			let filters = length(filter(of_type(n, 'bridge-vlan'), v => v.device == bridge)) > 0;
+			let vlan = where == 'untagged' ? untagged_vlan(n, bridge, facts.uplinks) : where;
+			let bv = filters && vlan != null ? filter(of_type(n, 'bridge-vlan'), v => v.device == bridge && v.vlan == vlan)[0] : null;
+			if (filters && !bv) {
+				push(errors, `${at}: ${where == 'untagged' ? 'the uplink carries no VLAN untagged' : `VLAN ${where} is not on the AP's bridge ${bridge}`}, so there is nothing to carry the VNI into`);
+				continue;
+			}
+			if (!filters && where != 'untagged') {
+				push(errors, `${at}: the AP's bridge ${bridge} has no VLANs, so only its untagged network can carry the VNI`);
+				continue;
+			}
+			let name = BRIDGED + vni;
+			let o = { proto: six ? 'vxlan6' : 'vxlan', vid: vni, port: conc.port };
+			o[six ? 'peer6addr' : 'peeraddr'] = address;
+			put(n, name, 'interface', o);
+			keep[name] = true;
+			br.ports = [...list(br.ports), name];
+			if (bv)
+				bv.ports = [...list(bv.ports), name + ':u*'];
+			let zone = filter(of_type(fw, 'zone'), z => index(list(z.network), facts.management) >= 0)[0]?.name;
+			if (zone)
+				put(fw, 'aeolus_bridged_' + vni, 'rule', {
+					name: 'Aeolus bridged VXLAN ' + vni, src: zone, proto: 'udp',
+					src_ip: address, dest_port: conc.port, target: 'ACCEPT',
+				});
+			else
+				push(errors, `${at}: no firewall zone holds the management interface ${facts.management}`);
+			keep['aeolus_bridged_' + vni] = true;
+		}
+	}
+}
+
+// leave_uplink takes the VLAN ends of veth pairs Aeolus made out of every
+// bridge and its VLANs; those still wanted join again (0061).
+function leave_uplink(n) {
+	for (let d in of_type(n, 'device'))
+		if (d.type == 'bridge' && length(filter(list(d.ports), e => match(e, VLAN_END))))
+			d.ports = filter(list(d.ports), e => !match(e, VLAN_END));
+	for (let v in of_type(n, 'bridge-vlan'))
+		if (length(filter(list(v.ports), e => match(split(e, ':')[0], VLAN_END))))
+			v.ports = filter(list(v.ports), e => !match(split(e, ':')[0], VLAN_END));
+}
+
+// ap_mac is the MAC an AP enrolled with, as its ID has it: ap-a0046082275e,
+// a0:04:60:82:27:5e. Null for an ID that is not an AP's.
+function ap_mac(ap) {
+	let m = match(ap ?? '', /^ap-([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/);
+	return m ? join(':', slice(m, 1)) : null;
+}
+
+// join_uplink puts a veth's VLAN end in the uplink's bridge, untagged in its
+// VLAN, as a VLAN network's Wi-Fi is (0061). A bridge takes the lowest MAC
+// of its ports unless it is given one, and the kernel gives a veth's a
+// random one: lower than the port's, it became the bridge's, the management
+// interface's with it, so the AP took another address by DHCP and was no
+// longer known by the MAC it enrolled with (an OpenWrt 25.12.6 VM,
+// 2026-11-01, 0283). So the bridge keeps the AP's own, mac, where nothing
+// gave it one.
+function join_uplink(n, bridge, end, vlan, mac) {
+	let up = filter(of_type(n, 'device'), d => d.name == bridge)[0];
+	let v = filter(of_type(n, 'bridge-vlan'), x => x.device == bridge && x.vlan == '' + vlan)[0];
+	if (up && index(list(up.ports), end) < 0)
+		up.ports = [...list(up.ports), end];
+	if (up && mac && !up.macaddr)
+		up.macaddr = mac;
+	if (v && index(list(v.ports), end + ':u*') < 0)
+		v.ports = [...list(v.ports), end + ':u*'];
+}
+
+// switching renders a network with a fallback (0061): a bridge of its own,
+// br-n and its hash, which its Wi-Fi joins and neither transport is
+// configured in. The prober attaches the transport that carries the network
+// at run time, and moves it when it switches. A VLAN transport reaches the
+// bridge through a veth pair whose configured end is in the uplink's bridge,
+// untagged in the VLAN; a VXLAN transport is its tunnel's device. The bridge
+// takes the primary's segment MAC (0060). The prober's plan says which
+// device is which, and how the network switches: in report mode never; in
+// automatic mode, with HA mode, failback and hold-down (0022). A tunnel
+// fallback is started only in HA mode; otherwise the prober starts it when
+// the primary goes down. It returns the bridge.
+function switching(cfg, id, net, intent, facts, errors, keep, uplink) {
+	let n = cfg.network, a = cfg.aeolus;
+	let h = net_hash(id), sect = 'aeolus_n' + h, br = 'br-n' + h;
+	if (!facts.prober)
+		push(errors, `network.${id}.transport: a network with a fallback needs the prober, and so ucode-mod-socket, which is not installed on this AP (0061)`);
+	let tr = net.transport, auto = tr.switching == 'automatic';
+	let plan = { network: id, bridge: br, mode: auto ? 'automatic' : 'report' }, mac = null;
+	if (auto) {
+		plan.ha = tr.ha ? 1 : 0;
+		plan.failback = tr.failback ?? 'revertive';
+		plan.holddown = tr.holddown ?? 300;
+	}
+	for (let slot in ['primary', 'fallback']) {
+		let t = net.transport?.[slot], where = `network.${id}.transport.${slot}`;
+		if (t?.type == 'vlan') {
+			let bridge = uplink();
+			if (!bridge)
+				continue;
+			if (!facts.veth)
+				push(errors, `${where}: a VLAN transport of a network with a fallback needs kmod-veth, which is not installed on this AP (apk add kmod-veth)`);
+			ensure_vlan(n, bridge, facts.uplinks, t.vlan, keep);
+			let s = substr(slot, 0, 1), name = `${sect}_${s}`;
+			put(n, name, 'device', { type: 'veth', name: `av${s}${h}`, peer_name: `an${s}${h}` });
+			keep[name] = true;
+			join_uplink(n, bridge, `av${s}${h}`, t.vlan, ap_mac(facts.ap));
+			plan[slot] = `an${s}${h}`;
+			plan[slot + '_vlan'] = t.vlan;
+			mac ??= segment_mac(facts.ap, 'vlan', t.vlan);
+		} else if (t?.type == 'vxlan') {
+			let dev = tunnel(cfg, where, slot == 'fallback' && !(auto && tr.ha), t, intent.concentrators?.[t.concentrator], facts, errors, keep, false);
+			if (!dev)
+				continue;
+			plan[slot] = dev;
+			plan[slot + '_vni'] = t.vni;
+			mac ??= segment_mac(facts.ap, 'vni', t.vni);
+		}
+	}
+	put(n, sect, 'device', { type: 'bridge', name: br, bridge_empty: 1, macaddr: mac || null });
+	put(a, sect, 'switch', plan);
+	keep[sect] = true;
+	return br;
+}
+
+// same_network says a section of the AP's own is a network of Aeolus's over
+// again (0137): an access point's, not Aeolus's, with the network's SSID,
+// its security, and its key where it has one, or, where it signs clients
+// in, its RADIUS server. One of the same name with another key is another
+// network, whose clients Aeolus's would turn away, and is left as it is.
+// So is one that does what Aeolus's would not: it carries another AP's
+// uplink (WDS), lets on only the clients in a list, or gives its devices
+// passphrases or VLANs of their own. six says every radio it is on is a
+// 6 GHz one, where a WPA2/WPA3 network is WPA3 alone (0086).
+function same_network(s, net, six) {
+	if (owned(s['.name']) || (s.mode ?? 'ap') != 'ap' || (s.ssid ?? '') != net.ssid)
+		return false;
+	// On, as OpenWrt reads a Wi-Fi option: 1 or true.
+	let is = (v) => v in ['1', 'true'];
+	if (is(s.wds) || is(s.ppsk) || is(s.owe_transition) || s.macfilter in ['allow', 'radius'] || s.wpa_psk_file != null || s.vlan_file != null ||
+		s.sae_password != null || s.sae_password_file != null || (s.dynamic_vlan ?? '0') != '0' || (s.multi_ap ?? '0') != '0')
+		return false;
+	let enc = split(s.encryption ?? 'none', '+')[0];
+	if (enc != ENCRYPTION[net.security] && !(six && enc == 'sae' && net.security == 'wpa2-wpa3'))
+		return false;
+	if (NEEDS_KEY[net.security])
+		return net.passphrase != null && s.key == net.passphrase;
+	if (ENTERPRISE[net.security])
+		return net.radius?.auth_server != null && (s.auth_server ?? s.server) == net.radius.auth_server;
+	return true;
+}
+
+// replace_own takes out the AP's own sections that are the network over
+// again, where it says to (0137), and every radio such a section is on is
+// one the network is now on: on, the radios Aeolus's interfaces for it were
+// just put on. It says which it took, for the agent to keep before they go.
+function replace_own(w, id, net, on, replaced) {
+	for (let s in of_type(w, 'wifi-iface')) {
+		let radios = filter(type(s.device) == 'array' ? s.device : split(s.device ?? '', /[ \t]+/), r => length(r) > 0);
+		if (!length(radios) || length(filter(radios, r => index(on, r) < 0)))
+			continue;
+		if (!same_network(s, net, !length(filter(radios, r => w[r]?.band != '6g'))))
+			continue;
+		// Passphrases or VLANs of its devices' own hang on the section,
+		// and would hang on nothing: one that names it, alone or among
+		// others. One that names no interface is every interface's.
+		let named = (x) => filter(type(x.iface) == 'array' ? x.iface : split(x.iface ?? '', /[ \t]+/), i => length(i) > 0);
+		if (length(filter(values(w), x => x['.type'] in ['wifi-station', 'wifi-vlan'] && !owned(x['.name']) && index(named(x), s['.name']) >= 0)))
+			continue;
+		push(replaced, { section: s['.name'], ssid: net.ssid, network: id });
+		delete w[s['.name']];
+	}
+}
+
+function networks(cfg, intent, facts, errors, keep, replaced) {
+	let w = cfg.wireless, n = cfg.network;
+	let bridge = null, looked = false;
+	let uplink = () => {
+		if (!looked)
+			bridge = uplink_bridge(n, facts.uplinks, errors);
+		looked = true;
+		return bridge;
+	};
+	let nets = intent.network ?? {};
+	leave_uplink(n);
+	for (let id in sort(keys(nets))) {
+		let net = nets[id];
+		if (net.enabled === false)
+			continue;
+		// WPA Enterprise needs hostapd built with EAP, which the full wpad
+		// is and wpad-basic is not (0088, 0098).
+		if (ENTERPRISE[net.security] && facts.eap === false)
+			push(errors, `network.${id}: WPA Enterprise needs hostapd with EAP, which this AP's wpad lacks; the full wpad has it`);
+		let iface = interface_name(id);
+		// The device the network's interface is on: its primary's, or with a
+		// fallback, its own bridge (0061).
+		let path = net.transport?.fallback?.type ? switching(cfg, id, net, intent, facts, errors, keep, uplink) : null;
+		for (let slot in (path ? [] : ['primary', 'fallback'])) {
+			let t = net.transport?.[slot];
+			let where = `network.${id}.transport.${slot}`;
+			let device = null;
+			if (t?.type == 'vlan') {
+				if (!uplink())
+					continue;
+				ensure_vlan(n, bridge, facts.uplinks, t.vlan, keep);
+				device = `${bridge}.${t.vlan}`;
+			} else if (t?.type == 'vxlan')
+				device = tunnel(cfg, where, slot != 'primary', t, intent.concentrators?.[t.concentrator], facts, errors, keep);
+			if (slot == 'primary')
+				path = device;
+		}
+		if (path != null) {
+			put(n, iface, 'interface', { proto: 'none', device: path });
+			keep[iface] = true;
+		}
+		// BSS transition (802.11v), which band steering uses too, is left
+		// out where hostapd lacks it: there, the line makes hostapd refuse
+		// its whole config, so every network on the AP goes down (0057).
+		// The render check then refuses the config.
+		let btm = !!(net.roaming?.btm || asks(net));
+		if (btm && facts.bss_transition === false) {
+			push(errors, `network.${id}: band steering and BSS transition need 802.11v, which this AP's hostapd lacks (install wpad-mbedtls)`);
+			btm = false;
+		}
+		// Named on 6 GHz, a network 6 GHz does not take is refused; left to
+		// every band, it is not offered there (0086).
+		if (!SIX_GHZ[net.security] && index(net.bands ?? [], '6g') >= 0)
+			push(errors, `network.${id}: 6 GHz takes WPA3 or OWE only, not ${net.security}; take 6g out of its bands, or make it wpa3-sae, wpa2-wpa3 or owe`);
+		if (net.pmf != null && !PMF_CHOICE[net.security])
+			push(errors, `network.${id}: pmf is for a network that takes WPA2; ${net.security} has ${net.security == 'open' ? 'no keys to protect them with' : 'them required always'}`);
+		let names = [], no_ap_vlan = [], on = [];
+		for (let d in of_type(w, 'wifi-device')) {
+			if (reserved(d) || (net.bands && index(net.bands, d.band) < 0))
+				continue;
+			if (d.band == '6g' && !SIX_GHZ[net.security])
+				continue;
+			let name = iface_name(id, d['.name']);
+			let o = iface_options(net, d['.name'], d.band, iface, btm, id, facts.ap);
+			// A test network's SSIDs carry when they go off (0179): the agent
+			// turns them off by itself then, the manager reached or not.
+			if (net.test === true)
+				o.aeolus_until = sprintf('%d', intent.test_network.until);
+			put(w, name, 'wifi-iface', o);
+			keep[name] = true;
+			push(names, name);
+			push(on, d['.name']);
+			if (facts.radios?.[d['.name']]?.ap_vlan === false)
+				push(no_ap_vlan, d['.name']);
+		}
+		// It takes the place of the AP's own network that is this one
+		// over again, where it says to (0137).
+		if (net.replace_own === true)
+			replace_own(w, id, net, on, replaced);
+		// A key's VLAN is an AP/VLAN interface hostapd makes for its clients.
+		// On a radio whose driver makes none (ath11k), hostapd fails every
+		// network on the radio, and the apply is reverted (0082): refused here
+		// instead, before anything is applied.
+		// The VLANs a client may be put in: by its per-user key (0070), k, and
+		// by the RADIUS server, r, on WPA Enterprise (0111) or with MAC
+		// authentication (0112).
+		let offered = [];
+		if (!ENTERPRISE[net.security])
+			push(offered, ['k', 'keys.vlans', net.keys?.vlans ?? [], 'give its keys no VLANs']);
+		if (ENTERPRISE[net.security] || net.radius?.mac_auth)
+			push(offered, ['r', 'radius.vlans', net.radius?.vlans ?? [], 'take them out of radius.vlans']);
+		for (let o in offered)
+			if (length(o[2]) && length(no_ap_vlan))
+				push(errors, `network.${id}.${o[1]}: ${join(', ', no_ap_vlan)} cannot put clients in VLANs of their own (the driver has no AP/VLAN interfaces); offer the network on other bands, or ${o[3]}`);
+		// Each VLAN is tagged on the uplink, with an interface on it and a
+		// wifi-vlan on the network's Wi-Fi. hostapd makes the VLAN's Wi-Fi
+		// interface, <bss>-k<vlan> or <bss>-r<vlan>, and netifd puts it on
+		// that interface.
+		for (let o in offered)
+			for (let v in o[2]) {
+				if (!uplink())
+					break;
+				ensure_vlan(n, bridge, facts.uplinks, v, keep);
+				let vi = `${iface}_${o[0]}${v}`, wv = `${iface}_${o[0]}v${v}`;
+				put(n, vi, 'interface', { proto: 'none', device: `${bridge}.${v}` });
+				put(w, wv, 'wifi-vlan', { iface: names, name: `${o[0]}${v}`, vid: '' + v, network: [vi] });
+				keep[vi] = keep[wv] = true;
+			}
+	}
+}
+
+// leave_tunnels takes a port off every tunnel's bridge Aeolus made: the port
+// itself, and its 802.1Q devices (0058).
+function leave_tunnels(n, p) {
+	for (let d in of_type(n, 'device'))
+		if (owned(d['.name']) && d.type == 'bridge')
+			d.ports = filter(list(d.ports), e => e != p && substr(e, 0, length(p) + 1) != p + '.');
+}
+
+// tunnel_port puts a port on tunnels (0058): out of the uplink's bridge and
+// its VLANs, and each VNI it carries onto its tunnel's bridge, the port
+// itself for the untagged one and an 802.1Q device <port>.<vlan> for each
+// tagged one. The tunnels are the ones networks' transports make (0054).
+function tunnel_port(cfg, p, set, bridge, up, intent, facts, errors, keep) {
+	let n = cfg.network;
+	up.ports = filter(list(up.ports), e => e != p);
+	for (let v in of_type(n, 'bridge-vlan'))
+		if (v.device == bridge)
+			v.ports = filter(list(v.ports), e => split(e, ':')[0] != p);
+	leave_tunnels(n, p);
+	let safe = replace(p, /[^a-z0-9_]/g, '_');
+	for (let vlan in sort(keys(set.vxlan ?? {}))) {
+		let m = set.vxlan[vlan];
+		let br = tunnel(cfg, `ports.${p}.vxlan.${vlan}`, false, { vni: m.vni, concentrator: m.tunnel },
+			intent.concentrators?.[m.tunnel], facts, errors, keep);
+		if (!br)
+			continue;
+		let member = p;
+		if (vlan != 'untagged') {
+			member = `${p}.${vlan}`;
+			let name = `aeolus_port_${safe}_${vlan}`;
+			put(n, name, 'device', { type: '8021q', ifname: p, vid: vlan, name: member });
+			keep[name] = true;
+		}
+		let b = n[`aeolus_${m.vni}_br`];
+		b.ports = [...list(b.ports), member];
+	}
+}
+
+// hold_bridges puts an interface on each started tunnel's bridge that no
+// network's interface is on: a VNI that only ports carry (0058). netifd makes
+// a bridge only for an interface on it, so without one the bridge is never
+// made, and its ports are on nothing. The interface takes no address. A
+// fallback's bridge waits, as its tunnel does.
+function hold_bridges(n, keep) {
+	let used = {};
+	for (let s in of_type(n, 'interface'))
+		if (keep[s['.name']] || !owned(s['.name']))
+			used[s.device] = true;
+	for (let d in of_type(n, 'device')) {
+		let vni = match(d['.name'], /^aeolus_([0-9]+)_br$/)?.[1];
+		let t = vni ? n['aeolus_' + vni] : null;
+		if (!t || !keep[d['.name']] || t.auto == '0' || used[d.name])
+			continue;
+		let name = `aeolus_${vni}_ports`;
+		put(n, name, 'interface', { proto: 'none', device: d.name });
+		keep[name] = true;
+	}
+}
+
+// ports applies the intent's Ethernet port settings (0053): a port's VLANs,
+// as its entries in the bridge's bridge-vlan sections, and whether it is on.
+// Only ports in the uplink's bridge count; the uplink itself is the AP's
+// management and is left alone. Each VLAN a port uses is tagged on the
+// uplink as well. A port in tunnel mode carries VNIs over tunnels instead,
+// and leaves the uplink's bridge; set back to access or trunk, it returns
+// (0058). LACP is not applied yet; the manager holds it.
+//
+// A setting left unset leaves the port as it is, as with a radio, so a VLAN
+// Aeolus added stays while a port is still on it, and so does a tunnel.
+function ports(cfg, intent, facts, errors, keep) {
+	let n = cfg.network;
+	let want = intent.ports ?? {};
+	let bridge = length(keys(want)) ? uplink_bridge(n, facts.uplinks, errors) : null;
+	let up = filter(of_type(n, 'device'), d => d.name == bridge)[0];
+	// A port is on this AP if it is in the uplink's bridge, or on a tunnel's
+	// bridge or an 802.1Q device Aeolus made (0058).
+	let on_ap = p => index(list(up?.ports), p) >= 0 ||
+		length(filter(of_type(n, 'device'), d => owned(d['.name']) &&
+			(index(list(d.ports), p) >= 0 || (d.type == '8021q' && d.ifname == p)))) > 0;
+	for (let p in (bridge ? sort(keys(want)) : [])) {
+		let set = want[p];
+		if (!on_ap(p))
+			continue;   // not on this AP
+		if (index(facts.uplinks, p) >= 0) {
+			push(errors, `ports.${p}: the uplink carries the AP's management; Aeolus leaves it alone`);
+			continue;
+		}
+		// On or off, and its speed (0094), go on the port's own device
+		// section, or on one Aeolus adds to turn it off or set its speed; a
+		// port with neither is on, at every speed it can. A speed is offered
+		// alone, full duplex, and still negotiated: netifd advertises only
+		// it.
+		if (set.enabled != null || set.speed != null) {
+			let own = 'aeolus_port_' + replace(p, /[^a-z0-9_]/g, '_');
+			let d = filter(of_type(n, 'device'), x => x.name == p && x.type == null && x['.name'] != own)[0];
+			let fixed = set.speed != null && set.speed != 'auto';
+			if (d) {
+				delete n[own];
+				if (set.enabled != null)
+					d.enabled = set.enabled ? '1' : '0';
+				if (fixed) {
+					d.speed = '' + set.speed;
+					d.duplex = '1';
+				}
+				else if (set.speed == 'auto') {
+					delete d.speed;
+					delete d.duplex;
+				}
+			}
+			else {
+				// Aeolus's own section holds what it sets, and what it set
+				// before that this change leaves alone.
+				let was = n[own];
+				let off = set.enabled != null ? !set.enabled : was?.enabled == '0';
+				let speed = set.speed != null ? (fixed ? set.speed : null) : was?.speed;
+				if (off || speed != null)
+					put(n, own, 'device', { name: p, enabled: off ? 0 : null, speed: speed, duplex: speed != null ? 1 : null });
+				else
+					delete n[own];
+			}
+		}
+		if (set.mode == 'tunnel') {
+			tunnel_port(cfg, p, set, bridge, up, intent, facts, errors, keep);
+			continue;
+		}
+		// On the uplink's untagged network (0335): in its bridge, untagged
+		// in the VLAN the uplink carries untagged where the bridge filters
+		// VLANs, and in no other; no VLAN is asked of the uplink.
+		if (set.mode == 'native') {
+			leave_tunnels(n, p);
+			if (index(list(up.ports), p) < 0)
+				up.ports = [...list(up.ports), p];
+			for (let v in of_type(n, 'bridge-vlan'))
+				if (v.device == bridge)
+					v.ports = filter(list(v.ports), e => split(e, ':')[0] != p);
+			let filters = length(filter(of_type(n, 'bridge-vlan'), v => v.device == bridge)) > 0;
+			let vlan = untagged_vlan(n, bridge, facts.uplinks);
+			let v = vlan != null ? filter(of_type(n, 'bridge-vlan'), x => x.device == bridge && x.vlan == vlan)[0] : null;
+			if (v)
+				v.ports = [...list(v.ports), p + ':u*'];
+			else if (filters)
+				push(errors, `ports.${p}: the uplink carries no VLAN untagged, so the port has no untagged network to be on`);
+			continue;
+		}
+		if (set.mode != 'access' && set.mode != 'trunk')
+			continue;
+		// Back from tunnels, if it was on them, into the uplink's bridge.
+		leave_tunnels(n, p);
+		if (index(list(up.ports), p) < 0)
+			up.ports = [...list(up.ports), p];
+		for (let v in of_type(n, 'bridge-vlan'))
+			if (v.device == bridge)
+				v.ports = filter(list(v.ports), e => split(e, ':')[0] != p);
+		let untagged = set.untagged ?? 0;
+		if (untagged) {
+			let v = ensure_vlan(n, bridge, facts.uplinks, untagged, keep);
+			v.ports = [...list(v.ports), p + ':u*'];
+		}
+		for (let vlan in (set.mode == 'trunk' ? set.tagged ?? [] : [])) {
+			let v = ensure_vlan(n, bridge, facts.uplinks, vlan, keep);
+			v.ports = [...list(v.ports), p + ':t'];
+		}
+	}
+	// What Aeolus added that a port is still on stays, and so does a port
+	// Aeolus turned off.
+	for (let v in of_type(n, 'bridge-vlan'))
+		if (owned(v['.name']) && length(filter(list(v.ports), e => index(facts.uplinks, split(e, ':')[0]) < 0)))
+			keep[v['.name']] = true;
+	for (let d in of_type(n, 'device'))
+		if (substr(d['.name'], 0, 12) == 'aeolus_port_' && d.type != '8021q')
+			keep[d['.name']] = true;
+	// So does a tunnel a port is still on: its bridge, the tunnel, the rule
+	// that lets it in, the clamp, and the port's 802.1Q devices on it (0058).
+	for (let b in of_type(n, 'device')) {
+		let m = match(b['.name'], /^aeolus_([0-9]+)_br$/);
+		let others = m ? filter(list(b.ports), e => e != 'aeolus_' + m[1]) : [];
+		if (!length(others))
+			continue;
+		keep[b['.name']] = keep['aeolus_' + m[1]] = keep['aeolus_vxlan_' + m[1]] = true;
+		if (int(n['aeolus_' + m[1]]?.mtu ?? '1500') < 1500 && cfg.firewall?.aeolus_clamp)
+			keep.aeolus_clamp = true;
+		for (let d in of_type(n, 'device'))
+			if (owned(d['.name']) && d.type == '8021q' && index(others, d.name) >= 0)
+				keep[d['.name']] = true;
+	}
+}
+
+// probes renders the prober's plan (0059) into the agent's own package: for
+// each tunnel Aeolus made, a probe section named for it, aeolus_<VNI>, with
+// its tunnel's probe interval, the addresses on its segment to ask, from
+// every network and port that uses the VNI, and the MAC the AP uses there,
+// for its lease (0060); and for each port on a tunnel,
+// a guard section, aeolus_guard_<port>, naming the devices the loop guard
+// sends on: the port itself, and its 802.1Q devices. Both come from the
+// network config as rendered, so a port left on a tunnel is guarded too.
+function probes(cfg, intent, facts, keep) {
+	let n = cfg.network, a = cfg.aeolus;
+	let uses = {};
+	let use = (vni, conc, address) => {
+		let u = uses['' + vni] ??= { interval: null, address: [] };
+		u.interval ??= conc?.probe_interval;
+		if (address != null && index(u.address, '' + address) < 0)
+			push(u.address, '' + address);
+	};
+	for (let id in sort(keys(intent.network ?? {}))) {
+		let net = intent.network[id];
+		if (net.enabled === false)
+			continue;
+		for (let slot in ['primary', 'fallback']) {
+			let t = net.transport?.[slot];
+			if (t?.type == 'vxlan')
+				use(t.vni, intent.concentrators?.[t.concentrator], t.probe);
+		}
+	}
+	for (let p in sort(keys(intent.ports ?? {}))) {
+		let set = intent.ports[p];
+		if (set.mode != 'tunnel')
+			continue;
+		for (let vlan in sort(keys(set.vxlan ?? {})))
+			use(set.vxlan[vlan].vni, intent.concentrators?.[set.vxlan[vlan].tunnel], set.vxlan[vlan].probe);
+	}
+	for (let s in of_type(n, 'interface')) {
+		let vni = match(s['.name'], /^aeolus_([0-9]+)$/)?.[1];
+		if (!vni || !(s.proto in { vxlan: 1, vxlan6: 1 }))
+			continue;
+		let u = uses[vni] ?? { address: [] };
+		put(a, s['.name'], 'probe', {
+			vni: vni, interval: u.interval ?? 30, address: length(u.address) ? sort(u.address) : null,
+			mac: segment_mac(facts.ap, 'vni', vni),
+		});
+		keep[s['.name']] = true;
+	}
+	// The VLAN transports of networks with a fallback (0061), and of those
+	// that go off the air when they cannot reach their way on (0201):
+	// probed from the VLAN's own MAC, on the uplink, tagged as the uplink
+	// carries it.
+	let on = {}, probed = {};
+	for (let id in sort(keys(intent.network ?? {}))) {
+		let net = intent.network[id];
+		if (net.enabled === false || !(net.transport?.fallback?.type || net.transport?.down_when_lost === true))
+			continue;
+		for (let slot in ['primary', 'fallback']) {
+			let t = net.transport[slot];
+			if (t?.type != 'vlan')
+				continue;
+			on['' + t.vlan] ??= [];
+			if (t.probe != null && index(on['' + t.vlan], '' + t.probe) < 0)
+				push(on['' + t.vlan], '' + t.probe);
+		}
+	}
+	for (let vlan in sort(keys(on))) {
+		let entry = null;
+		for (let v in of_type(n, 'bridge-vlan'))
+			if (v.vlan == vlan)
+				for (let e in list(v.ports))
+					if (split(e, ':')[0] == facts.uplink)
+						entry = split(e, ':')[1] ?? '';
+		if (entry == null)
+			continue;   // the uplink does not carry it: the render says so
+		put(a, 'aeolus_vlan' + vlan, 'probe', {
+			vlan: vlan, device: facts.uplink, tagged: index(entry, 't') >= 0 ? 1 : 0, interval: 30,
+			address: length(on[vlan]) ? sort(on[vlan]) : null, mac: segment_mac(facts.ap, 'vlan', +vlan) || null,
+		});
+		keep['aeolus_vlan' + vlan] = true;
+		probed['aeolus_vlan' + vlan] = true;
+	}
+	// A VLAN's probe has the name of the VLAN's bridge-vlan in the network
+	// config, which keep holds while any network is on the VLAN: one no
+	// longer probed goes here, as the sweep after would keep it.
+	for (let k in keys(a))
+		if (a[k]['.type'] == 'probe' && match(k, /^aeolus_vlan[0-9]+$/) && !probed[k])
+			delete a[k];
+	let vlans = {};
+	for (let d in of_type(n, 'device'))
+		if (owned(d['.name']) && d.type == '8021q' && d.name && d.ifname)
+			vlans[d.name] = d.ifname;
+	let guards = {};
+	for (let b in of_type(n, 'device')) {
+		if (!match(b['.name'], /^aeolus_[0-9]+_br$/))
+			continue;
+		for (let e in list(b.ports)) {
+			if (owned(e))
+				continue;   // the tunnel itself
+			let p = vlans[e] ?? e;
+			guards[p] ??= [];
+			if (index(guards[p], e) < 0)
+				push(guards[p], e);
+		}
+	}
+	for (let p in sort(keys(guards))) {
+		let name = 'aeolus_guard_' + replace(p, /[^a-z0-9_]/g, '_');
+		put(a, name, 'guard', { port: p, device: sort(guards[p]) });
+		keep[name] = true;
+	}
+}
+
+// watches renders the VLANs the prober watches on the uplink (0064): each one
+// the intent needs there, for a network's VLAN transport, a port's VLANs on
+// this AP, or the start of a tunnel (0063), as the uplink carries it. A
+// section aeolus_watch<N> says whether it is tagged there, and the AP's MAC
+// on it, which nudges come from (0060). A VLAN the uplink doesn't carry is
+// left out: the render says so elsewhere.
+// downs renders, for each network that goes off the air while it cannot
+// reach its way on (0201), what the prober judges that by, and the
+// network's Wi-Fi sections on this AP: switch for a network with a
+// fallback, the transport it is on now; else its tunnel's probe, by VNI,
+// or its VLAN's, vlan<N>.
+function downs(cfg, intent, keep) {
+	let radios = map(of_type(cfg.wireless, 'wifi-device'), r => r['.name']);
+	for (let id in sort(keys(intent.network ?? {}))) {
+		let net = intent.network[id];
+		if (net.enabled === false || net.transport?.down_when_lost !== true)
+			continue;
+		let t = net.transport.primary;
+		let via = net.transport.fallback?.type ? 'switch' : t?.type == 'vxlan' ? '' + t.vni : t?.type == 'vlan' ? 'vlan' + t.vlan : null;
+		let ifaces = filter(map(radios, r => iface_name(id, r)), name => cfg.wireless[name]?.['.type'] == 'wifi-iface');
+		if (!via || !length(ifaces))
+			continue;
+		let name = 'aeolus_down_' + net_hash(id);
+		put(cfg.aeolus, name, 'down', { network: id, via: via, iface: sort(ifaces) });
+		keep[name] = true;
+	}
+}
+
+function watches(cfg, intent, facts, keep) {
+	let n = cfg.network, a = cfg.aeolus;
+	let up = filter(of_type(n, 'device'), d => d.type == 'bridge' && facts.uplink && index(list(d.ports), facts.uplink) >= 0)[0];
+	if (!up)
+		return;
+	let need = {};
+	for (let id in keys(intent.network ?? {})) {
+		let net = intent.network[id];
+		if (net.enabled === false)
+			continue;
+		for (let slot in ['primary', 'fallback'])
+			if (net.transport?.[slot]?.type == 'vlan')
+				need['' + net.transport[slot].vlan] = true;
+	}
+	for (let p in keys(intent.ports ?? {})) {
+		let set = intent.ports[p];
+		if (!(set.mode in { access: 1, trunk: 1 }) || index(facts.uplinks, p) >= 0 || index(list(up.ports), p) < 0)
+			continue;   // not on this AP, or not on VLANs
+		if (set.untagged)
+			need['' + set.untagged] = true;
+		for (let v in (set.mode == 'trunk' ? set.tagged ?? [] : []))
+			need['' + v] = true;
+	}
+	for (let s in of_type(n, 'interface')) {
+		let m = match(s['.name'], /^aeolus_vlan([0-9]+)_tunnels$/);
+		if (m)
+			need[m[1]] = true;
+	}
+	for (let vlan in sort(keys(need), (x, y) => +x - +y)) {
+		let entry = null;
+		for (let v in of_type(n, 'bridge-vlan'))
+			if (v.device == up.name && v.vlan == vlan)
+				for (let e in list(v.ports))
+					if (split(e, ':')[0] == facts.uplink)
+						entry = split(e, ':')[1] ?? '';
+		if (entry == null)
+			continue;
+		put(a, 'aeolus_watch' + vlan, 'watch', {
+			vlan: vlan, device: facts.uplink, tagged: index(entry, 't') >= 0 ? 1 : 0,
+			mac: segment_mac(facts.ap, 'vlan', +vlan) || null,
+		});
+		keep['aeolus_watch' + vlan] = true;
+	}
+}
+
+// stp turns spanning tree on or off on the uplink's bridge (0095), as on a
+// switch: RSTP, by ustp, so a second link to the same network is blocked,
+// not looped. ustp gives every bridge the default priority, 32768, whatever
+// netifd's priority says, so the root is the switch whose priority is set
+// lower, as a network's should be. The kernel's own STP has no edge ports,
+// and would hold each Wi-Fi network for twice the root's forward delay
+// whenever it starts, so without ustp the bridge stays as it is, and the
+// agent installs ustp; the render check holds the config until then. An
+// uplink in no bridge is one port, which cannot loop: there is nothing to
+// do. Unset leaves the bridge as it is.
+//
+// On, the bridge's hello time is 2 seconds where the AP has set none. Left
+// to netifd it is 1, and ustp before 2026-05-27 forgets a neighbour after
+// three of the bridge's own hello times, whatever the neighbour's is: with
+// a switch that speaks every 2 seconds, as the standard has it, one hello a
+// few ms late and the AP calls itself the root, until the next hello comes.
+// The switch then takes the AP's port out of forwarding and back, and the
+// whole network sees a topology change (0095).
+function stp(n, intent, facts, errors, needs) {
+	let on = intent.uplink?.stp;
+	if (on == null)
+		return;
+	let up = filter(of_type(n, 'device'), d => d.type == 'bridge' && facts.uplink && index(list(d.ports), facts.uplink) >= 0)[0];
+	if (!up)
+		return;
+	if (!on) {
+		delete up.stp;
+		delete up.stp_proto;
+		return;
+	}
+	if (!facts.ustp) {
+		push(errors, 'uplink.stp: spanning tree needs ustp, for RSTP, which the agent is installing; the bridge stays as it is until then');
+		push(needs, 'ustp');
+		return;
+	}
+	up.stp = '1';
+	up.stp_proto = 'rstp';
+	up.hello_time ??= '2';
+}
+
+// rrm turns radio resource management on (0073): the agent's daemon then
+// advertises this AP in its beacons, keeps neighbours with the others, and
+// moves its radios as the policy says, defaults written out. Off, there is
+// no section, and the daemon stays idle. On an AP with a scan radio, whose
+// serving radios never scan (0081), the daemon is told to listen through
+// that radio instead, which airscan runs (0116).
+function rrm(a, w, intent, facts, keep) {
+	let r = intent.rrm;
+	// Taken away here, where it is off, and not left to what is kept by
+	// name: a network called rrm keeps a section of that name elsewhere.
+	if (r?.enabled != true) {
+		delete a.aeolus_rrm;
+		return;
+	}
+	// Power control (0077) runs in the same daemon, with RRM's neighbours.
+	let p = intent.apc?.enabled == true ? intent.apc : null;
+	put(a, 'aeolus_rrm', 'rrm', {
+		enabled: 1, ap: facts.ap || null, moves: r.moves == false ? 0 : 1,
+		scan: scan_radio(w) ? 'airscan' : null,
+		// Where a 5 GHz radio looks before it uses a DFS channel (0120,
+		// 0328), the daemon may move it to one.
+		dfs: length(filter(of_type(w, 'wifi-device'), s => !reserved(s) && s.band == '5g' && dfs_way(intent, s) == 'look')) ? 1 : null,
+		// The width it widens the 5 GHz radio to, where that starts
+		// narrower (0329).
+		wide: wide(w, intent, facts),
+		window: r.window ?? '02:00-05:00', margin: r.margin ?? 20,
+		// How far apart its own 5 and 6 GHz are kept (0327).
+		apart: r.apart ?? 250,
+		apc: p ? 1 : null, apc_neighbours: p ? p.neighbours ?? 3 : null, apc_target: p ? p.target ?? -70 : null,
+		// What it does for clients (0206): guard, ignore, or ask; how
+		// strongly a lonely client should hear the AP; and how long a step
+		// back holds.
+		apc_clients: p ? p.clients ?? 'ask' : null, apc_client_floor: p ? p.client_floor ?? -80 : null, apc_hold: p ? p.hold ?? 24 : null,
+	});
+	keep['aeolus_rrm'] = true;
+}
+
+// hold writes a test window (0344), as the manager sends it: when it ends,
+// in Unix seconds, and why. aeolus-rrm and aeolus-steer hold still until
+// then, by the AP's clock. The section is kept over a sysupgrade with the
+// rest of the package, so an AP flashed in its window holds still from its
+// start. None, and there is no section.
+function hold(a, intent, keep) {
+	let h = intent.hold, until = h?.until;
+	if (!(type(until) in ['int', 'double']) || until <= 0) {
+		delete a.aeolus_hold;
+		return;
+	}
+	put(a, 'aeolus_hold', 'hold', {
+		until: sprintf('%d', until),
+		why: type(h.why) == 'string' && length(h.why) ? h.why : null,
+	});
+	keep['aeolus_hold'] = true;
+}
+
+// guard_interval holds, for each band an AP serves, the 802.11ax guard
+// interval set for it (0089), which aeolus-gi sets with iw: OpenWrt has no
+// option for it. Automatic, the radio's own, is none.
+function guard_interval(a, w, intent, keep) {
+	let opts = {}, any = false;
+	for (let s in of_type(w, 'wifi-device')) {
+		let gi = HE_GI['' + intent.radio?.[s.band]?.he_gi];
+		if (!reserved(s) && gi) {
+			opts['he_gi_' + s.band] = gi;
+			any = true;
+		}
+	}
+	if (!any) {
+		delete a.aeolus_gi;
+		return;
+	}
+	put(a, 'aeolus_gi', 'gi', opts);
+	keep['aeolus_gi'] = true;
+}
+
+// radio_power is the transmit power set for each radio the AP serves with
+// (0349), by the radio's section's name, which aeolus-power holds it to
+// with iw: a running radio takes it at once, where netifd's txpower would
+// set the Wi-Fi up again. auto, the radio's own, is none; and so is a power
+// left unset, where the AP's own txpower stays.
+function radio_power(a, w, intent, keep) {
+	let opts = {}, any = false;
+	for (let s in of_type(w, 'wifi-device')) {
+		let p = intent.radio?.[s.band]?.power;
+		if (!reserved(s) && type(p) in ['int', 'double']) {
+			opts[s['.name']] = sprintf('%d', p);
+			any = true;
+		}
+	}
+	if (!any) {
+		delete a.aeolus_power;
+		return;
+	}
+	put(a, 'aeolus_power', 'power', opts);
+	keep['aeolus_power'] = true;
+}
+
+// captures holds aeolus-journey from keeping a capture of each attempt
+// that fails (0135), where the config says not to. It keeps them unless
+// told otherwise, so with them on there is no section. A capture's radio
+// side is read from hostapd's rings (0146), which takes the service that
+// hands them out and what reads them: the agent installs them where the
+// AP says it has not got them. Nothing waits for that: until then a
+// capture has the wire side.
+function captures(a, intent, keep, facts, needs) {
+	// Taken away here, and not left to what is kept by name: a network
+	// called journey keeps a section of that name in its own package.
+	if (intent.system?.captures != false) {
+		if (facts.udebug === false)
+			push(needs, 'udebugd');
+		delete a.aeolus_journey;
+		return;
+	}
+	put(a, 'aeolus_journey', 'journey', { captures: 0 });
+	keep['aeolus_journey'] = true;
+}
+
+// ble lends the AP's Bluetooth radio to Home Assistant (0156) where the
+// config says to: aeolus-ble is idle until its section says it is on. The
+// section is there whether or not the AP has such a radio; the daemon says
+// where it has none.
+function ble(a, intent, keep) {
+	if (intent.system?.ble_proxy !== true) {
+		delete a.aeolus_ble;
+		return;
+	}
+	put(a, 'aeolus_ble', 'ble', { enabled: 1 });
+	keep['aeolus_ble'] = true;
+}
+
+// way_out names the internet to the prober (0142): what the AP asks, to say
+// whether the internet answers and how long it takes, where the config
+// names one. With none there is no section, and nothing of the internet is
+// asked.
+function way_out(a, intent, keep) {
+	let target = intent.system?.internet;
+	if (target == null || target == '') {
+		delete a.aeolus_path;
+		return;
+	}
+	put(a, 'aeolus_path', 'path', { internet: target });
+	keep['aeolus_path'] = true;
+}
+
+// host_port splits "host", "host:port", "[v6]" or "[v6]:port".
+function host_port(s) {
+	let m = match(s, /^\[([^\]]+)\](:([0-9]+))?$/);
+	if (m)
+		return [m[1], m[3]];
+	m = match(s, /^([^:]+):([0-9]+)$/);
+	return m ? [m[1], m[2]] : [s, null];
+}
+
+function system(pkg, intent, facts) {
+	let want = intent.system ?? {};
+	let s = of_type(pkg, 'system')[0];
+	// The AP's name in Aeolus is its hostname (0076).
+	if (s && intent.ap?.hostname)
+		s.hostname = intent.ap.hostname;
+	if (s && want.tz != null) {
+		s.zonename = want.tz;
+		if (facts.timezone)
+			s.timezone = facts.timezone;
+	}
+	if (s && want.syslog != null) {
+		let hp = host_port(want.syslog);
+		s.log_ip = hp[0];
+		if (hp[1])
+			s.log_port = hp[1];
+		else
+			delete s.log_port;
+	}
+	if (want.ntp != null) {
+		if (pkg.ntp?.['.type'] != 'timeserver')
+			put(pkg, 'ntp', 'timeserver', {});
+		pkg.ntp.server = map(want.ntp, v => '' + v);
+	}
+	else if (pkg.ntp?.['.type'] == 'timeserver' && pkg.ntp.server != null) {
+		// Never OpenWrt's internet pool (0069): without time servers of
+		// its own, the AP takes those its DHCP gives it.
+		let left = filter(type(pkg.ntp.server) == 'array' ? pkg.ntp.server : [pkg.ntp.server], v => !match(v, POOL));
+		if (length(left))
+			pkg.ntp.server = left;
+		else
+			delete pkg.ntp.server;
+	}
+}
+
+// rebind lets the AP resolve to a private address each name Aeolus uses on
+// it (0069): the manager's host, the time servers and the syslog host.
+// dnsmasq's rebind protection drops a private answer to any other name. The
+// names it adds are kept in its own package, so one no longer used is taken
+// out again; the rest of the list is the site's, and left alone.
+function rebind(cfg, intent) {
+	let want = [];
+	// The manager's host, from the agent's URL: scheme://host[:port]/...
+	let url = cfg.aeolus.agent?.url ?? '', at = index(url, '://');
+	if (at >= 0) {
+		let host = substr(url, at + 3);
+		for (let sep in ['/', ':', '?'])
+			if (index(host, sep) >= 0)
+				host = substr(host, 0, index(host, sep));
+		push(want, host);
+	}
+	for (let v in intent.system?.ntp ?? [])
+		push(want, '' + v);
+	if (intent.system?.syslog != null)
+		push(want, host_port(intent.system.syslog)[0]);
+	want = uniq(filter(want, n => match(n, /^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*$/) && !match(n, /^[0-9.]+$/)));
+	let d = of_type(cfg.dhcp, 'dnsmasq')[0];
+	let agent = cfg.aeolus.agent;
+	let had = agent?.rebind ?? [];
+	if (type(had) != 'array')
+		had = [had];
+	if (!d) {
+		if (agent)
+			delete agent.rebind;
+		return;
+	}
+	let list = d.rebind_domain ?? [];
+	if (type(list) != 'array')
+		list = [list];
+	list = filter(list, n => !(n in had) || n in want);
+	for (let n in want)
+		if (!(n in list))
+			push(list, n);
+	if (length(list))
+		d.rebind_domain = list;
+	else
+		delete d.rebind_domain;
+	if (agent) {
+		if (length(want))
+			agent.rebind = want;
+		else
+			delete agent.rebind;
+	}
+}
+
+// agent renders the settings meant for the agent itself (0040).
+function agent(pkg, intent) {
+	let poll = intent.system?.poll;
+	if (poll == null)
+		return;
+	if (pkg.agent?.['.type'] != 'agent')
+		put(pkg, 'agent', 'agent', {});
+	pkg.agent.poll = '' + poll;
+}
+
+// steering keeps usteer, which the agent's installer adds (0050), from
+// steering anything: Aeolus's own daemon steers (0138), a network at a
+// time, and two that ask a client at once would ask it for different
+// things. Aeolus owns three of usteer's options: band_steering_interval,
+// 0, so that it steers nothing on its own; ssid_list, which it leaves
+// empty; and max_neighbor_reports, so that each network's 802.11k list
+// names every BSS of it usteer knows, not usteer's 8 (0228). An AP
+// without usteer is none the worse.
+function steering(u) {
+	let s = of_type(u, 'usteer')[0];
+	if (!s)
+		return;
+	s.band_steering_interval = '0';
+	delete s.ssid_list;
+	s.max_neighbor_reports = '' + NEIGHBOUR_REPORTS;
+}
+
+// homes is where each client belongs (0319), one entry a client, by MAC:
+// here where this AP is one it belongs on, as the manager marks it; the APs
+// it belongs on; the bands there, where some are named; and how long it is
+// kept off an AP it does not belong on once put off. They are written only
+// where some network is steered: a rule acts on no other.
+function homes(intent) {
+	let out = [];
+	for (let mac in sort(keys(intent.homes ?? {}))) {
+		let h = intent.homes[mac];
+		let aps = type(h?.aps) == 'array' ? h.aps : [];
+		if (!match(mac, /^[0-9a-f]{2}(:[0-9a-f]{2}){5}$/) || (!length(aps) && h?.nearest !== true))
+			continue;
+		let e = [mac];
+		if (h.here === true)
+			push(e, 'here');
+		// Wherever it is heard best (0321).
+		if (h.nearest === true)
+			push(e, 'nearest');
+		if (length(aps))
+			push(e, 'aps=' + join(',', aps));
+		if (type(h.bands) == 'array' && length(h.bands))
+			push(e, 'bands=' + join(',', h.bands));
+		push(e, sprintf('hold=%d', h.hold ?? HOME_HOLD));
+		push(out, join(' ', e));
+	}
+	return out;
+}
+
+// steer tells the agent's steering daemon which networks to steer, and how
+// (0138): each of the three ways lists the networks it is on for, sticky
+// the signal under which a client is weak, and sticky_with the rest of
+// sticky's settings for each (0289); community the networks whose APs
+// share what their clients can use (0299); and keep_6g those whose 6 GHz
+// clients are kept there (0300). With none on, there is no
+// section, and the daemon stays idle.
+function steer(a, intent, keep) {
+	let suggest = [], hold = [], sticky = [], sticky_with = [], community = [], keep6 = [], scan = [];
+	for (let id in sort(keys(intent.network ?? {}))) {
+		let net = intent.network[id], s = steered(net);
+		if (net.enabled === false)
+			continue;
+		if (s.suggest)
+			push(suggest, id);
+		if (s.hold)
+			push(hold, id);
+		if (s.community)
+			push(community, id);
+		if (s.keep)
+			push(keep6, id);
+		if (s.sticky) {
+			push(sticky, `${id}=${s.weak}`);
+			push(sticky_with, `${id} margin=${s.margin} floor=${s.floor} hold_down=${s.hold_down}`);
+			// On the scan radios' readings too (0324).
+			if (s.scan)
+				push(scan, id);
+		}
+	}
+	// Taken away here, where nothing is on, and not left to what is kept
+	// by name: a network called steer keeps a section of that name
+	// elsewhere.
+	if (!length(suggest) && !length(hold) && !length(sticky) && !length(community) && !length(keep6)) {
+		delete a.aeolus_steer;
+		return;
+	}
+	let home = homes(intent);
+	put(a, 'aeolus_steer', 'steer', {
+		suggest: length(suggest) ? suggest : null, hold_back: length(hold) ? hold : null, sticky: length(sticky) ? sticky : null,
+		sticky_with: length(sticky_with) ? sticky_with : null, sticky_scan: length(scan) ? scan : null,
+		community: length(community) ? community : null, keep_6g: length(keep6) ? keep6 : null,
+		home: length(home) ? home : null,
+	});
+	keep['aeolus_steer'] = true;
+}
+
+
+// snmp renders snmpd's config (0052). Aeolus owns all of it, as the agent's
+// installer added snmpd: it answers read-only, with the intent's v2c
+// community, its v3 user (SHA and AES), or both, and while SNMP is off the
+// config is only that it is off, so none of OpenWrt's default communities
+// is left behind.
+function snmp(cfg, intent, facts, errors) {
+	let want = intent.system?.snmp ?? {};
+	if (!length(keys(cfg.snmpd ?? {}))) {
+		if (want.enabled)
+			push(errors, 'SNMP needs snmpd, which is not installed on this AP');
+		return;
+	}
+	let pkg = {};
+	if (want.enabled) {
+		put(pkg, 'agent', 'agent', { agentaddress: 'UDP:161,UDP6:161' });
+		if (want.community != null) {
+			put(pkg, 'aeolus_v2c', 'com2sec', { secname: 'ro', source: 'default', community: want.community });
+			put(pkg, 'aeolus_v2c6', 'com2sec6', { secname: 'ro', source: 'default', community: want.community });
+			put(pkg, 'aeolus_ro_v2c', 'group', { group: 'ro', version: 'v2c', secname: 'ro' });
+			put(pkg, 'all', 'view', { viewname: 'all', type: 'included', oid: '.1' });
+			put(pkg, 'aeolus_ro', 'access', {
+				group: 'ro', context: 'none', version: 'any', level: 'noauth', prefix: 'exact',
+				read: 'all', write: 'none', notify: 'none',
+			});
+		}
+		put(pkg, 'system', 'system', { sysLocation: want.location, sysContact: want.contact });
+		if (facts.uplink)
+			put(pkg, 'engineid', 'engineid', { engineidtype: 3, engineidnic: facts.uplink });
+		if (want.v3?.user != null)
+			put(pkg, 'aeolus_v3', 'v3', {
+				username: want.v3.user, auth_type: 'SHA', auth_pass: want.v3.auth,
+				privacy_type: 'AES', privacy_pass: want.v3.privacy, allow_write: 0,
+			});
+	}
+	let versions = want.community != null ? (want.v3?.user != null ? 'v1/v2c/v3' : 'v1/v2c') : 'v3';
+	put(pkg, 'general', 'snmpd', { enabled: want.enabled ? 1 : 0, snmp_version: want.enabled ? versions : null });
+	cfg.snmpd = pkg;
+}
+
+// clamp makes the MSS clamp's nftables file from the rendered network
+// config (0054): on each tunnel's bridge whose MTU is below 1500, TCP's MSS
+// is held to the MTU less 40 for IPv4 and less 60 for IPv6. It replaces the
+// whole table each time fw4 loads it. With no such tunnel, the table is
+// empty.
+function clamp(network, aeolus) {
+	let rules = [];
+	let rule = (bridge, mtu) => {
+		for (let fam in [['ip', 40], ['ip6', 60]])
+			push(rules, sprintf('\t\tmeta ibrname "%s" ether type %s tcp flags & (syn | rst) == syn tcp option maxseg size > %d tcp option maxseg size set %d',
+				bridge, fam[0], mtu - fam[1], mtu - fam[1]));
+	};
+	let mtu_of = {};
+	for (let s in of_type(network ?? {}, 'interface')) {
+		let vni = match(s['.name'], /^aeolus_([0-9]+)$/)?.[1];
+		let mtu = int(s.mtu ?? '1500');
+		if (!vni || !(s.proto in { vxlan: 1, vxlan6: 1 }) || mtu >= 1500)
+			continue;
+		mtu_of[vni] = mtu;
+		if (network['aeolus_' + vni + '_br'])
+			rule('br-vx' + vni, mtu);
+	}
+	// A network with a fallback carries its tunnel in its own bridge (0061).
+	for (let sw in of_type(aeolus ?? {}, 'switch'))
+		for (let slot in ['primary', 'fallback'])
+			if (mtu_of[sw[slot + '_vni']])
+				rule(sw.bridge, mtu_of[sw[slot + '_vni']]);
+	return join('\n', [
+		'# Made by the Aeolus agent from its VXLAN tunnels (0054); fw4 loads it.',
+		'table bridge aeolus',
+		'delete table bridge aeolus',
+		'table bridge aeolus {',
+		'\tchain forward {',
+		'\t\ttype filter hook forward priority filter; policy accept;',
+		...rules,
+		'\t}',
+		'}',
+		'',
+	]);
+}
+
+// UNBOND is where a bond Aeolus took apart is kept, as it was (0096).
+const UNBOND = 'aeolus_unbond';
+
+// swap_ports puts, in every bridge's ports and every bridge-vlan's entries,
+// the ports to in place of the ports from, where the first of them was, each
+// entry with the first one's flags ("bond0:t" becomes "eth0:t" and
+// "eth1:t", and back).
+function swap_ports(n, from, to) {
+	let swap = (entries) => {
+		let out = [], seen = {}, done = false;
+		let add = (p, e) => {
+			if (!seen[p]) {
+				seen[p] = true;
+				push(out, e);
+			}
+		};
+		for (let e in entries) {
+			let i = index(e, ':');
+			let p = i < 0 ? e : substr(e, 0, i), flags = i < 0 ? '' : substr(e, i);
+			if (index(from, p) < 0)
+				add(p, e);
+			else if (!done) {
+				done = true;
+				for (let t in to)
+					add(t, t + flags);
+			}
+		}
+		return out;
+	};
+	for (let d in of_type(n, 'device'))
+		if (d.type == 'bridge' && length(filter(list(d.ports), p => index(from, p) >= 0)))
+			d.ports = swap(list(d.ports));
+	for (let v in of_type(n, 'bridge-vlan'))
+		if (length(filter(list(v.ports), e => index(from, split(e, ':')[0]) >= 0)))
+			v.ports = swap(list(v.ports));
+}
+
+// bonding takes the uplink's LACP bond apart, or puts it back (0096), and
+// returns the uplink's ports, the primary first. With uplink.bond false, the
+// bond's members each join the bridge on their own, where the bond was, and
+// carry every VLAN it carried, as it did; the bond's section is kept as it
+// was, in the agent's package, and the AP's uplink is its first member, the
+// primary: the agent and its prober take whichever member is the path out.
+// Two ports in one bridge to the same network loop without spanning tree, so
+// the bond stays until it runs. Otherwise a bond Aeolus took apart is put
+// back as it was. An uplink that is no bond is left alone, and so is a bond
+// something but its bridge uses.
+function bonding(cfg, intent, facts, errors, keep) {
+	let n = cfg.network, a = cfg.aeolus;
+	let kept = a[UNBOND];
+	if (intent.uplink?.bond === false) {
+		if (kept) {
+			keep[UNBOND] = true;
+			return list(kept.ports);
+		}
+		let bond = filter(of_type(n, 'device'), d => d.type == 'bonding' && d.name && d.name == facts.uplink)[0];
+		if (!bond)
+			return [facts.uplink];
+		let members = list(bond.ports);
+		let bridges = filter(of_type(n, 'device'), d => d.type == 'bridge' && index(list(d.ports), bond.name) >= 0);
+		let others = filter(of_type(n, 'interface'), s => s.device == bond.name || substr(s.device ?? '', 0, length(bond.name) + 1) == bond.name + '.');
+		if (length(members) < 2 || length(bridges) != 1 || length(others)) {
+			push(errors, `uplink.bond: ${bond.name} is not one bridge's port alone, so Aeolus does not take it apart`);
+			return [facts.uplink];
+		}
+		if (intent.uplink?.stp !== true || !facts.ustp) {
+			push(errors, `uplink.bond: ${bond.name}'s ports, apart in one bridge, loop without spanning tree, so the bond stays until it runs (uplink.stp)`);
+			return [facts.uplink];
+		}
+		let s = { bond_section: bond['.name'], bond_index: bond['.index'] };
+		for (let k, v in bond)
+			if (substr(k, 0, 1) != '.')
+				s[k] = v;
+		put(a, UNBOND, 'unbond', s);
+		keep[UNBOND] = true;
+		delete n[bond['.name']];
+		swap_ports(n, [bond.name], members);
+		if (a.agent)
+			a.agent.uplink = members[0];
+		return members;
+	}
+	if (!kept)
+		return [facts.uplink];
+	// Put back as it was, in its place.
+	let name = kept.bond_section;
+	let s = { '.anonymous': false, '.type': 'device', '.name': name, '.index': int(kept.bond_index ?? '0') };
+	for (let k, v in kept)
+		if (substr(k, 0, 1) != '.' && substr(k, 0, 5) != 'bond_')
+			s[k] = v;
+	n[name] = s;
+	swap_ports(n, list(kept.ports), [s.name]);
+	if (a.agent)
+		a.agent.uplink = s.name;
+	delete a[UNBOND];
+	return [s.name];
+}
+
+// render returns the new packages, the names of those that changed, what it
+// could not render, and the OpenWrt packages it needs for that, which the
+// agent installs (needs, 0095). facts: { uplink, management: the interface the
+// AP reaches the manager through, radios: { <radio>: { htmodes } },
+// timezone: the POSIX string for intent's time zone, vxlan: whether netifd
+// has loaded the vxlan package, nft_bridge: whether kmod-nft-bridge is
+// installed, bss_transition: whether hostapd has 802.11v, null if not known,
+// ap: the AP's ID, which its segment MACs are made from (0060), prober:
+// whether the prober can run, which a network with a fallback needs, and
+// veth: whether kmod-veth is installed, for its VLAN transports (0061),
+// ustp: whether ustp is installed, for spanning tree (0095), udebug:
+// whether hostapd's rings can be handed out and read, for captures (0146) }. The renderer
+// adds uplinks, the uplink's ports (0096).
+function render(intent, current, facts) {
+	let cfg = {};
+	for (let p in PACKAGES)
+		cfg[p] = clone(current[p] ?? {});
+	let errors = [];
+	let needs = [];   // the packages the config needs that the AP lacks (0095)
+	let keep = {};
+	// The uplink's ports, its bond's members where it is taken apart (0096).
+	facts = clone(facts ?? {});
+	// A test network only while it is on (0179).
+	intent = live(intent, facts.now);
+	facts.uplinks = bonding(cfg, intent, facts, errors, keep);
+	facts.uplink = facts.uplinks[0];
+	// A bridge as a fresh OpenWrt has it is made to filter VLANs (0152).
+	filter_vlans(cfg.network, facts);
+	radios(cfg.wireless, cfg.aeolus, intent, facts ?? {}, keep);
+	// The AP's own sections a network took the place of (0137).
+	let replaced = [];
+	networks(cfg, intent, facts ?? {}, errors, keep, replaced);
+	ports(cfg, intent, facts ?? {}, errors, keep);
+	bridged(cfg, intent, facts ?? {}, errors, keep);
+	hold_bridges(cfg.network, keep);
+	// What Aeolus made earlier and no longer needs goes. The prober's plan
+	// follows what is left, and then goes the same way.
+	for (let pkg in [cfg.wireless, cfg.network, cfg.firewall])
+		for (let k in keys(pkg))
+			if (owned(k) && !keep[k] && pkg[k]['.type'] != 'wifi-station')
+				delete pkg[k];
+	probes(cfg, intent, facts ?? {}, keep);
+	downs(cfg, intent, keep);
+	watches(cfg, intent, facts ?? {}, keep);
+	rrm(cfg.aeolus, cfg.wireless, intent, facts ?? {}, keep);
+	hold(cfg.aeolus, intent, keep);
+	stp(cfg.network, intent, facts ?? {}, errors, needs);
+	guard_interval(cfg.aeolus, cfg.wireless, intent, keep);
+	radio_power(cfg.aeolus, cfg.wireless, intent, keep);
+	captures(cfg.aeolus, intent, keep, facts ?? {}, needs);
+	// A capture someone starts (0148) is taken with tcpdump, and is not to
+	// wait for it to be installed: it is had ahead.
+	if (facts?.tcpdump === false)
+		push(needs, 'tcpdump-mini');
+	ble(cfg.aeolus, intent, keep);
+	way_out(cfg.aeolus, intent, keep);
+	steer(cfg.aeolus, intent, keep);
+	for (let k in keys(cfg.aeolus))
+		if (owned(k) && !keep[k])
+			delete cfg.aeolus[k];
+	system(cfg.system, intent, facts ?? {});
+	agent(cfg.aeolus, intent);
+	rebind(cfg, intent);
+	steering(cfg.usteer);
+	snmp(cfg, intent, facts ?? {}, errors);
+	let changed = filter(PACKAGES, p => text(p, cfg[p]) != text(p, current[p] ?? {}));
+	return { config: cfg, changed: changed, errors: errors, needs: needs, replaced: replaced };
+}
+
+// without_keys is a wireless package without the key agent's wifi-station
+// sections (0070): keys are not config, and never go to the render check.
+function without_keys(pkg) {
+	let out = {};
+	for (let k, v in pkg ?? {})
+		if (v['.type'] != 'wifi-station')
+			out[k] = v;
+	return out;
+}
+
+// Exported in one statement: this ucode version cannot parse a comment
+// that follows an exported function declaration.
+export { PACKAGES, CLAMP, VLAN_END, FT_DIR, iface_name, render, clamp, without_keys };

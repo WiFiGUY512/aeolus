@@ -1,0 +1,75 @@
+== What this AP has to say, from aeolus-steer's file
+  four seconds after it was written, made older, the old and the bad left out: [ [ "02:00:00:00:00:0a", "5g", "86:2d:ef:2f", -61, 4 ], [ "02:00:00:00:00:0b", "2g", "86:2d:ef:2f", -70, 24 ] ]
+  a file twenty seconds old says nothing: [ ]; nor none: [ ]; nor one from the future: [ ]
+
+== Its message, fitted to one frame
+  { "v": 1, "t": "probed", "ap": "ap-30862def2fff", "at": 1791770000, "seq": 7, "clients": [ [ "02:00:00:00:00:0a", "5g", "86:2d:ef:2f", -61, 4 ], [ "02:00:00:00:00:0b", "2g", "86:2d:ef:2f", -70, 24 ] ] }
+  nothing to say, no message: null
+  eighty readings: 22 fit, 1357 bytes signed, a frame being 1400
+  read back: "probed", 22 readings
+
+== What another AP said, checked
+  [ [ "02:00:00:00:00:0a", "5g", "86:2d:ef:2f", -61, 4 ] ]
+  not such a message: [ ] [ ]
+
+== What aeolus-steer reads: each client's readings, by when this AP took them
+{
+	"at": 1791770000,
+	"clients": {
+		"02:00:00:00:00:0a": [
+			{
+				"ap": "ap-2005b6df64e0",
+				"band": "5g",
+				"middle": "05:b6:df:64",
+				"signal": -64,
+				"at": 1791769986,
+				"kind": "probe"
+			},
+			{
+				"ap": "ap-30862d46348f",
+				"band": "5g",
+				"middle": "86:2d:46:34",
+				"signal": -70,
+				"at": 1791769997,
+				"kind": "probe"
+			}
+		],
+		"02:00:00:00:00:0b": [
+			{
+				"ap": "ap-2005b6df64e0",
+				"band": "2g",
+				"middle": "05:b6:df:64",
+				"signal": -58,
+				"at": 1791769972,
+				"kind": "probe"
+			}
+		]
+	}
+}
+
+== What a scan radio heard, marked s (0321): taken, carried and read as such; any other mark is no reading
+  [ [ "02:00:00:00:00:0a", "5g", "86:2d:ef:2f", -62, 3, "s" ] ]
+  mine, made older: [ [ "02:00:00:00:00:0a", "5g", "86:2d:ef:2f", -62, 7, "s" ], [ "02:00:00:00:00:0a", "2g", "86:2d:ef:2f", -70, 6 ] ]
+{
+	"at": 1791770000,
+	"clients": {
+		"02:00:00:00:00:0a": [
+			{
+				"ap": "ap-2005b6df64e0",
+				"band": "5g",
+				"middle": "86:2d:ef:2f",
+				"signal": -62,
+				"at": 1791769995,
+				"kind": "scan"
+			},
+			{
+				"ap": "ap-2005b6df64e0",
+				"band": "2g",
+				"middle": "86:2d:ef:2f",
+				"signal": -70,
+				"at": 1791769996,
+				"kind": "probe"
+			}
+		]
+	}
+}

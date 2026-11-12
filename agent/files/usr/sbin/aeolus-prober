@@ -1,0 +1,2304 @@
+#!/usr/bin/ucode -S
+// aeolus-prober: the Aeolus agent's prober (0059).
+//
+// For each tunnel Aeolus made, it probes the tunnel's segment every
+// interval, straight on the tunnel device. It takes a DHCP lease there, from
+// the AP's own MAC for the segment (0060), and asks by ARP the probe
+// addresses set, or else the gateway its lease names, or else the DHCP
+// server; with no lease, it sends an echo to IPv6 all-nodes. Only answers
+// that come back in on that device count. The probes are the tunnel's keepalive too:
+// a concentrator that learns tunnel ends from traffic keeps this AP. It
+// pings each concentrator over the management interface as well, to tell an
+// unreachable concentrator from a VNI that does not answer.
+//
+// On each tunnel port it runs the loop guard: a frame of its own every 2
+// seconds on the port and on its 802.1Q devices. If one comes back in on the
+// AP, the segment loops, and the port is taken off its tunnels until its
+// settings change or the agent restarts.
+//
+// For each network with a fallback (0061), it keeps one transport in the
+// network's bridge: the primary, or in automatic mode, the fallback while
+// the primary is down, by the probes' verdicts.
+//
+// It tells which of the VLANs the AP carries reach it from the switch (0064):
+// once a minute it listens on the uplink until a frame has come in on each,
+// and nudges one that stays quiet. It reads the switch's LLDP too, on each
+// Ethernet port under the uplink. Where the uplink is two ports, its bond
+// taken apart (0096), it does all that on the one that is the path out.
+//
+// On the Wi-Fi interfaces of Aeolus's networks it watches the clients' DHCP
+// (0065): a client that doesn't use it, requests nothing answers, and
+// requests more than one server answers. It lists every Wi-Fi client on the
+// AP too (0066), with what it said of itself and the 802.11 features it
+// supports (0067).
+//
+// Its plan is the agent's own UCI package, as the renderer made it: probe
+// and guard sections. What it finds goes to /var/run/aeolus/probes.json,
+// which the agent reports. procd runs it beside the agent.
+//
+//	aeolus-prober [-c <UCI directory>] [-o <results file>] [-n]
+//
+// -n never takes a port off its tunnels: for trying it out.
+
+'use strict';
+
+import * as fs from 'fs';
+import * as socket from 'socket';
+import * as math from 'math';
+import { cursor } from 'uci';
+import { connect } from 'ubus';
+import { openlog, syslog, LOG_PID, LOG_DAEMON, LOG_INFO, LOG_WARNING, LOG_ERR } from 'log';
+import * as probe from 'aeolus.probe';
+import * as radius from 'aeolus.radius';
+import * as uplinks from 'aeolus.uplink';   // not uplink: a local of that name would hide it
+import * as sentoff from 'aeolus.sentoff';   // what Aeolus sent a client off for (0255)
+import * as wifinames from 'aeolus.wifinames';   // netifd's Wi-Fi status through a radio being set up again (0301)
+
+// nl80211 says when each Wi-Fi client joined (0065). OpenWrt installs it; an
+// AP without it watches DHCP without judging which clients don't use it.
+let nl80211 = null;
+try {
+	nl80211 = require('nl80211');
+} catch (e) {
+}
+
+// rtnl lists the routes in a table tunnels start from (0063), so routes
+// the kernel dropped are put back. OpenWrt installs it with its Wi-Fi
+// scripts; an AP without it doesn't look.
+let rtnl = null;
+try {
+	rtnl = require('rtnl');
+} catch (e) {
+}
+
+let confdir = null, out = '/var/run/aeolus/probes.json', act = true;
+for (let i = 0; i < length(ARGV); i++) {
+	if (ARGV[i] == '-c')
+		confdir = ARGV[++i];
+	else if (ARGV[i] == '-o')
+		out = ARGV[++i];
+	else if (ARGV[i] == '-n')
+		act = false;
+}
+
+const SHUT = '/var/run/aeolus/shut.json';   // ports the loop guard took off their tunnels
+const GUARD_EVERY = 2;                       // seconds between loop guard frames
+const WRITE_EVERY = 5;                       // seconds between writes of the results
+const COLLECT_EVERY = 60;                    // seconds between two runs of the garbage collector
+const PLAN_EVERY = 10;                       // seconds between looks at the plan
+const STAY_GAP = 15;                         // seconds from last seen on a network's radios to rejoining, for the same stay
+const USER_WAIT = 60;                        // seconds from joining in which a client with no user name yet is asked about again
+const ATTACH_EVERY = 2;                      // seconds between looks at the networks' bridges (0061)
+const SPELL_EVERY = 60;                      // seconds between spells of listening on the uplink (0064)
+const SPELL_MAX = 10;                        // seconds a spell lasts at most
+const BOUNCE_EVERY = 300;                    // seconds between starting an interface tunnels start from again (0063)
+
+// A socket can wake the poll with an error and nothing to read. A read
+// reports the error and clears it; unread, the poll would return at once,
+// again and again.
+const WAKE = socket.POLLIN | socket.POLLERR | socket.POLLHUP;
+
+let bus = connect();
+let wifi_names = wifinames.keeper();   // what netifd's Wi-Fi status last said of each radio it is not setting up (0301)
+openlog('aeolus-prober', LOG_PID, LOG_DAEMON);
+
+// The name the AP gives with its leases, as a DHCP host name allows.
+const HOST = replace(trim(fs.readfile('/proc/sys/kernel/hostname') ?? '') || 'aeolus', /[^A-Za-z0-9-]/g, '-');
+
+function log(fmt, ...args) {
+	syslog(LOG_INFO, fmt, ...args);
+}
+
+function note(fmt, ...args) {
+	syslog(LOG_WARNING, fmt, ...args);
+}
+
+function fail(fmt, ...args) {
+	syslog(LOG_ERR, fmt, ...args);
+}
+
+function read(path) {
+	let v = fs.readfile(path);
+	return v == null ? null : trim(v);
+}
+
+// ath11k_phy is the phy of an interface on an ath11k radio, with the
+// radio's extended tx stats turned on (0164): ath11k fills no retries in
+// what nl80211 says of a client, and counts them in debugfs only while
+// those are on, for each client that joins after. null on another radio,
+// and on one whose driver fills them (0270), as stations, a dump of
+// nl80211's, show: its stats are not turned on.
+const ATH11K = '/sys/kernel/debug/ieee80211/';
+let own_retries = {};
+function ath11k_phy(ifname, stations) {
+	let phy = read(`/sys/class/net/${ifname}/phy80211/name`);
+	if (!phy || !match(phy, /^phy[0-9]+$/) || !fs.access(`${ATH11K}${phy}/ath11k/ext_tx_stats`))
+		return null;
+	if (probe.counts_retries(own_retries, phy, stations))
+		return null;
+	if (+(read(`${ATH11K}${phy}/ath11k/ext_tx_stats`) ?? '0') == 0)
+		fs.writefile(`${ATH11K}${phy}/ath11k/ext_tx_stats`, '1');
+	return phy;
+}
+
+function store(path, data) {
+	let tmp = path + '.new';
+	if (fs.writefile(tmp, data) == null)
+		return false;
+	return fs.rename(tmp, path);
+}
+
+function list(v) {
+	return v == null ? [] : (type(v) == 'array' ? v : [v]);
+}
+
+// now is monotonic time in seconds, to the microsecond.
+function now() {
+	let c = clock(true);
+	return c[0] + c[1] / 1e9;
+}
+
+function close(s) {
+	s?.close();
+}
+
+// tenth rounds a time in milliseconds to a tenth of one.
+function tenth(ms) {
+	return ms == null ? null : int(ms * 10 + 0.5) / 10.0;   // an int over an int would truncate
+}
+
+// What this run's echoes and loop guard frames carry, so their answers, and
+// only this run's frames, are known.
+math.srand(time() ^ int(now() * 1e6));
+const ID = math.rand() & 0xffff;
+let NONCE = '';
+{
+	let r = fs.open('/dev/urandom', 'r');
+	let b = r?.read(8) ?? '';
+	r?.close();
+	for (let i = 0; i < length(b); i++)
+		NONCE += sprintf('%02x', ord(b, i));
+	if (length(NONCE) < 16)
+		NONCE = sprintf('%04x%04x%08x', math.rand() & 0xffff, math.rand() & 0xffff, time());
+}
+
+function is_up(dev) {
+	let flags = read(`/sys/class/net/${dev}/flags`);
+	return flags != null && !!(hex(replace(flags, /^0x/, '')) & 1);
+}
+
+// ifindex is a device's index, or null without the device. A device that
+// netifd deletes and makes again gets a new one, and the kernel unbinds a
+// packet socket from the old device for good: the socket must be opened
+// again on the new one.
+function ifindex(dev) {
+	let i = read(`/sys/class/net/${dev}/ifindex`);
+	return i == null ? null : +i;
+}
+
+// linklocal is the IPv6 link-local address a device holds, or null.
+function linklocal(dev) {
+	for (let line in split(fs.readfile('/proc/net/if_inet6') ?? '', '\n')) {
+		let f = split(trim(line), /[ \t]+/);
+		if (length(f) >= 6 && f[5] == dev && f[3] == '20' && length(f[0]) == 32)
+			return join(':', map([0, 1, 2, 3, 4, 5, 6, 7], i => substr(f[0], 4 * i, 4)));
+	}
+	return null;
+}
+
+// plan reads what to probe and guard from the agent's UCI package, with the
+// tunnels' far ends from the network config.
+function plan() {
+	let c = confdir ? cursor(confdir) : cursor();
+	let tunnels = {}, guards = {}, vni_of = {};
+	// The uplink's ports, and the one the AP's traffic takes now (0096): a
+	// probe or watch on the uplink is made there.
+	let ups = uplinks.ports(c), out = uplinks.path_out(ups);
+	let on_uplink = d => index(ups, d) >= 0 ? out : d;
+	c.foreach('aeolus', 'probe', s => {
+		// A VLAN transport of a network with a fallback (0061), probed on the
+		// uplink, tagged as the uplink carries the VLAN.
+		if (s.vlan) {
+			tunnels['vlan' + s.vlan] = {
+				device: on_uplink(s.device), vlan: +s.vlan, tagged: s.tagged == '1',
+				interval: max(5, min(300, int(s.interval ?? '30') || 30)),
+				address: sort(list(s.address)),
+				mac: s.mac,
+			};
+			return;
+		}
+		let vni = s.vni ?? match(s['.name'], /^aeolus_([0-9]+)$/)?.[1];
+		let n = vni ? c.get_all('network', 'aeolus_' + vni) : null;
+		if (!n)
+			return;
+		let peer = n.peeraddr ?? n.peer6addr;
+		// A tunnel that starts from a VLAN (0063) pings its concentrator from
+		// that VLAN's device, the path the tunnel takes.
+		let start = match(n.tunlink ?? '', /^aeolus_vlan[0-9]+_tunnels$/) ? c.get('network', n.tunlink, 'device') : null;
+		tunnels['' + vni] = {
+			device: 'aeolus_' + vni, bridge: 'br-vx' + vni,
+			peer: peer ? replace(peer, /^\[|\]$/g, '') : null, six: n.peer6addr != null, start: start,
+			interval: max(5, min(300, int(s.interval ?? '30') || 30)),
+			address: sort(list(s.address)),
+			mac: s.mac,
+		};
+	});
+	c.foreach('network', 'device', d => {
+		let m = match(d['.name'], /^aeolus_([0-9]+)_br$/);
+		if (m)
+			for (let e in list(d.ports))
+				vni_of[e] = +m[1];
+	});
+	c.foreach('aeolus', 'guard', s => {
+		if (s.port)
+			guards[s.port] = { devices: sort(list(s.device)), vnis: map(sort(list(s.device)), d => vni_of[d]) };
+	});
+	// The networks with a fallback (0061): each one's bridge, the device of
+	// each of its transports, and which probe tells how each is doing.
+	let switches = {};
+	c.foreach('aeolus', 'switch', s => {
+		if (!s.network || !s.bridge)
+			return;
+		let key = slot => s[slot + '_vni'] ?? (s[slot + '_vlan'] ? 'vlan' + s[slot + '_vlan'] : null);
+		switches[s.network] = {
+			bridge: s.bridge, mode: s.mode ?? 'report', primary: s.primary, fallback: s.fallback,
+			ha: s.ha == '1', failback: s.failback ?? 'revertive',
+			holddown: s.holddown != null ? max(0, min(3600, int(s.holddown))) : 300,
+			probes: { primary: key('primary'), fallback: key('fallback') },
+		};
+	});
+	// The networks that go off the air while they cannot reach their way on
+	// (0201): what each is judged by, and its Wi-Fi sections.
+	let downs = {};
+	c.foreach('aeolus', 'down', s => {
+		if (s.network && s.via)
+			downs[s.network] = { via: s.via, ifaces: sort(list(s.iface)) };
+	});
+	// The VLANs the AP watches on its uplink (0064), and the uplink, whose
+	// LLDP it reads.
+	let watches = {};
+	c.foreach('aeolus', 'watch', s => {
+		if (s.vlan && s.device)
+			watches['' + s.vlan] = { vlan: +s.vlan, device: on_uplink(s.device), tagged: s.tagged == '1', mac: s.mac };
+	});
+	// The interfaces tunnels start from on a VLAN (0063), whose routes it
+	// keeps.
+	let starts = [];
+	c.foreach('network', 'interface', s => {
+		if (match(s['.name'], /^aeolus_vlan[0-9]+_tunnels$/))
+			push(starts, s['.name']);
+	});
+	// The Ethernet ports the switch's LLDP comes in on: a bond's members each
+	// say their own switch port.
+	let lldp = [];
+	for (let u in ups)
+		for (let p in uplinks.physical(u))
+			if (index(lldp, p) < 0)
+				push(lldp, p);
+	return {
+		tunnels: tunnels, guards: guards, switches: switches, downs: downs, watches: watches, starts: sort(starts),
+		uplink: out, lldp: lldp,
+	};
+}
+
+let tun = {};      // VNI, or vlan and the VLAN -> { plan, sock, index, src, running, started, answered, from, rtt, sent, seq, next, said, dhcp }
+let sw = {};       // network -> { plan, active, said, want, up_since, last, cannot, asked }
+let offair = {};   // network that goes off the air when lost (0201) -> { plan, off, since, why, off_since, stopped }
+let peers = {};    // concentrator address, and where it is pinged from -> { addr, start, six, interval, sent, seq, ok, rtt, since, next }
+let guards = {};   // port -> { plan, devices: [{ name, sock, index, mac }], next }
+let starts = {};   // interface tunnels start from on a VLAN -> { put_back, failing, bounced }
+let lost = {};     // tunnel device netifd has up that the kernel lost -> { seen, made, remade, failing } (0187)
+let loops = {};    // port -> { port, device, vni, came_in, at }
+let raws = {};     // "4" or "6", and the device it is bound to -> { sock, six, start }
+let guard_rx = null;
+// The uplink (0064): the VLANs watched there -> { plan, started, heard,
+// heard_now, quiet, gateway, xid, seq, said }; the socket of a spell of
+// listening and when it ends; when the next is due; the LLDP socket on each
+// Ethernet port under the uplink, and what the switch last said on each.
+let watch = { uplink: null, vlans: {}, sock: null, until: 0, next: 0, lldp: {}, lldp_ports: [], neighbors: {} };
+
+// The clients' DHCP on the Wi-Fi interfaces of Aeolus's networks (0065): by
+// interface, its socket, network and when the watch began there; by network,
+// the requests waiting for answers, its servers, the unanswered and answered
+// requests in the window, its duplicates, its clients, when each client last
+// asked. Every Wi-Fi client on the AP, with what nl80211 and hostapd said of
+// it at the last scan (0066, 0067). And, by MAC, what each client said of
+// itself in DHCP, on any of the AP's networks: its host name, vendor class
+// and fingerprint, and the address it uses (0067).
+let dw = { ifaces: {}, nets: {}, clients: [], ident: {} };
+
+// Who each client signed in as on WPA Enterprise (0113), by network
+// interface and MAC: { joined, user }, asked of hostapd once a session.
+let users = {};
+const HOSTAPD_CTL = '/var/run/hostapd/';
+const CTL_SOCKET = '/var/run/aeolus/hostapd-ctl';
+
+// hostapd_ctl asks one of hostapd's networks a question on its control
+// socket, and returns the answer, or null where none comes within 300 ms.
+// hostapd answers to the asking socket's own path, as its own user, which
+// must be able to write there.
+function hostapd_ctl(bss, ask) {
+	let k = socket.create(socket.AF_UNIX, socket.SOCK_DGRAM);
+	if (!k)
+		return null;
+	fs.unlink(CTL_SOCKET);
+	let answer = null;
+	if (k.bind({ path: CTL_SOCKET }) && fs.chmod(CTL_SOCKET, 0o666) && k.connect({ path: HOSTAPD_CTL + bss }) && k.send(ask) != null) {
+		socket.poll(300, [k, socket.POLLIN]);
+		answer = k.recv(8192, socket.MSG_DONTWAIT);
+	}
+	k.close();
+	fs.unlink(CTL_SOCKET);
+	return answer;
+}
+
+// Who a client signed in as is asked of hostapd (sta_said, below): its control socket
+// answers STA <mac> with the 802.1X session's user name, the one the RADIUS
+// server's Access-Accept gave, or else the identity the client showed.
+// OpenWrt's hostapd says it nowhere on ubus, and ships no hostapd_cli (the
+// C-360, 2026-10-10). Null for a client that signed in with no name, as on
+// a passphrase network, or where hostapd does not answer.
+// The key managements that are a fast transition's (802.11r), by the last
+// number of hostapd's AKMSuiteSelector: FT over 802.1X, with a passphrase,
+// with SAE, over 802.1X with SHA-384, and with SAE's longer keys.
+const FT_AKMS = [3, 4, 9, 13, 25];
+
+// sta_said is what hostapd says of a client on its control socket (STA
+// <mac>): user, who it signed in as (above), and ft, whether the key
+// management it chose is a fast transition's (0150), which says whether
+// its connection uses 802.11r. ft is null where hostapd did not answer, and
+// false where it answered and named none, as on a network with no keys.
+function sta_said(bss, mac) {
+	let said = hostapd_ctl(bss, 'STA ' + mac);
+	let out = { user: null, ft: null };
+	if (type(said) != 'string' || index(said, mac) != 0)
+		return out;
+	let a = match(said, /(^|\n)AKMSuiteSelector=00-0f-ac-([0-9]+)/);
+	out.ft = a ? (int(a[2]) in FT_AKMS) : false;
+	let m = match(said, /(^|\n)dot1xAuthSessionUserName=([^\n]*)/);
+	if (!m || !length(m[2]))
+		return out;
+	out.user = '';
+	for (let i = 0; i < length(m[2]) && i < 64; i++) {
+		let c = ord(m[2], i);
+		out.user += c >= 32 && c < 127 ? chr(c) : '?';
+	}
+	return out;
+}
+
+// The RADIUS servers the AP's networks sign clients in against (0114), by
+// server, port and secret: { server, port, secret, networks, sock, id,
+// auth, sent, answered, rtt, misses, ever, next }. Each is asked for its
+// status every RADIUS_EVERY, and is silent once RADIUS_MISSES asks in a row
+// go unanswered. Two networks may share a server and not its secret: an
+// answer under one secret says nothing of the other, so each is asked.
+const RADIUS_EVERY = 30;
+const RADIUS_MISSES = 3;
+// How long a sign-in that timed out, with none answered since, keeps a
+// server that takes no status requests silent.
+const RADIUS_HOLD = 600;
+let rad = {};
+// What hostapd counted of each network's sign-ins when last read, and when
+// the server last answered one and last let one time out.
+let rad_nets = {};
+// The AP's Wi-Fi interfaces, as the last scan found them: { ifname, network }.
+let bsses = [];
+
+// radius_plan takes up the servers /etc/config/wireless names on Aeolus's
+// networks: a new one is asked at once, one no network names any more is
+// dropped.
+function radius_plan(at) {
+	// Without MD5 there is no asking.
+	if (!radius.able())
+		return;
+	let want = {};
+	cursor().foreach('wireless', 'wifi-iface', i => {
+		let n = filter(list(i.network), x => match(x, /^aeolus_/))[0];
+		if (!n || !i.auth_server || !i.auth_secret)
+			return;
+		let port = int(i.auth_port ?? '1812') || 1812, key = i.auth_server + ' ' + port + ' ' + i.auth_secret;
+		want[key] ??= { server: i.auth_server, port: port, secret: i.auth_secret, networks: {} };
+		want[key].networks[replace(substr(n, 7), /_/g, '-')] = true;
+	});
+	for (let key in keys(rad))
+		if (!want[key]) {
+			close(rad[key].sock);
+			delete rad[key];
+		}
+	for (let key, w in want) {
+		let r = rad[key] ??= { server: w.server, port: w.port, sock: null, id: math.rand() & 255, misses: 0, ever: false, next: at };
+		r.secret = w.secret;
+		r.networks = w.networks;
+	}
+	for (let id in keys(rad_nets))
+		if (!length(filter(values(rad), r => r.networks[id])))
+			delete rad_nets[id];
+}
+
+// radius_ask sends a server a Status-Server request (RFC 5997). An ask
+// before it that went unanswered is a miss.
+function radius_ask(r, at) {
+	if (r.sent != null)
+		r.misses++;
+	r.sent = null;
+	if (!r.sock) {
+		// By address, or by name as the resolver has it now.
+		let to = { address: r.server, port: r.port };
+		if (!match(r.server, /^[0-9.]+$/) && index(r.server, ':') < 0) {
+			let found = socket.addrinfo(r.server, '' + r.port, { socktype: socket.SOCK_DGRAM })?.[0]?.addr;
+			if (!found) {
+				r.misses++;
+				return;
+			}
+			to = found;
+		}
+		r.sock = socket.create(index(to.address ?? '', ':') >= 0 ? socket.AF_INET6 : socket.AF_INET, socket.SOCK_DGRAM);
+		if (!r.sock?.connect(to)) {
+			close(r.sock);
+			r.sock = null;
+			r.misses++;
+			return;
+		}
+	}
+	let f = fs.open('/dev/urandom', 'r');
+	r.auth = f?.read(16);
+	f?.close();
+	if (length(r.auth ?? '') != 16) {
+		r.auth = '';
+		for (let i = 0; i < 16; i++)
+			r.auth += chr(math.rand() & 255);
+	}
+	r.id = (r.id + 1) & 255;
+	if (r.sock.send(radius.status_request(r.id, r.auth, r.secret)) == null) {
+		// The route or the socket went: opened again at the next ask.
+		close(r.sock);
+		r.sock = null;
+		r.misses++;
+		return;
+	}
+	r.sent = at;
+}
+
+// on_radius reads a server's answers: one that fits the last ask and the
+// secret, whatever it says, shows the server is there and knows this AP.
+function on_radius(r, at) {
+	while (true) {
+		let reply = r.sock?.recv(4096, socket.MSG_DONTWAIT);
+		if (!length(reply ?? ''))
+			return;
+		if (r.sent == null || !(radius.status_answer(reply, r.id, r.auth, r.secret) in ['ok', 'refused']))
+			continue;
+		r.rtt = (at - r.sent) * 1000;
+		r.answered = at;
+		r.sent = null;
+		r.misses = 0;
+		r.ever = true;
+	}
+}
+
+// radius_counts reads, from hostapd, what each network's sign-ins got from
+// the server, summed over the network's radios, and notes when the counts
+// of answers and of timeouts grew. They start again when hostapd does.
+function radius_counts(at) {
+	let sum = {};
+	for (let b in bsses) {
+		if (!b.network || b.vlan || !length(filter(values(rad), r => r.networks[b.network])))
+			continue;
+		let m = radius.mib(hostapd_ctl(b.ifname, 'MIB'));
+		if (!m)
+			continue;
+		let s = sum[b.network] ??= { requests: 0, accepts: 0, rejects: 0, challenges: 0, timeouts: 0, bad: 0 };
+		for (let k in keys(s))
+			s[k] += m[k];
+	}
+	for (let id, s in sum) {
+		let n = rad_nets[id] ??= { counts: s };
+		let was = n.counts;
+		if (s.accepts + s.rejects + s.challenges > was.accepts + was.rejects + was.challenges)
+			n.answered = at;
+		if (s.timeouts > was.timeouts)
+			n.timed_out = at;
+		n.counts = s;
+	}
+}
+
+// radius_report says, for each network that signs clients in against a
+// RADIUS server (0114), how the server is doing from here: up, silent (it
+// is down, unreachable, or does not know this AP or its secret), unverified
+// (it takes no status requests, and no client has needed it lately) or
+// unknown (not asked three times yet), as aeolus.radius's verdict has it.
+function radius_report(at) {
+	let out = [];
+	for (let key in sort(keys(rad))) {
+		let r = rad[key];
+		for (let id in sort(keys(r.networks))) {
+			let n = rad_nets[id] ?? {};
+			let answered = max(r.answered ?? -1, n.answered ?? -1);
+			let verdict = radius.verdict(at, { answered: r.answered, signed: n.answered, timed_out: n.timed_out, misses: r.misses, ever: r.ever },
+				{ every: RADIUS_EVERY, misses: RADIUS_MISSES, hold: RADIUS_HOLD });
+			// Said in the log when it goes silent and when it is back.
+			if (r.said?.[id] != null && r.said[id] != verdict && 'silent' in [verdict, r.said[id]]) {
+				let how = verdict == 'silent' ? note : log;
+				how('RADIUS server %s for network %s: %s, was %s', r.server, id, verdict, r.said[id]);
+			}
+			r.said ??= {};
+			r.said[id] = verdict;
+			let c = n.counts ?? {};
+			push(out, {
+				network: id, server: r.server, port: r.port, verdict: verdict,
+				rtt_ms: tenth(r.rtt), answered_ago: answered >= 0 ? int(at - answered) : null,
+				requests: c.requests ?? 0, accepts: c.accepts ?? 0, rejects: c.rejects ?? 0, timeouts: c.timeouts ?? 0, bad: c.bad ?? 0,
+			});
+		}
+	}
+	return slice(out, 0, 64);
+}
+
+// The AP's own way out (0142): the gateway of the interface that holds its
+// default route, the name servers that interface was given, and the
+// internet, where the config names a target. Each is asked every OUT_EVERY
+// seconds, and is silent once OUT_MISSES asks in a row go unanswered.
+// wayout.pings are the gateway and the internet, pinged as tunnels' far
+// ends are: { addr, six, start, interval, sent, seq, ok, rtt, since }.
+// wayout.dns are the name servers, by address: { server, sock, id, sent,
+// answered, rtt, rcode, since }. wayout.found is the internet target's own
+// address, where it is a name: the name servers are asked for it, so it is
+// never looked up in a way that could hold everything else here up.
+const OUT_EVERY = 30;
+const OUT_MISSES = 3;
+let wayout = { plan: null, pings: {}, dns: {}, found: null, next: 0 };
+
+function is_address(s) {
+	return match(s ?? '', /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) != null;
+}
+
+// host_of is the host a URL names, where it names one that is no IPv6
+// address.
+function host_of(url) {
+	let m = match(url ?? '', /^[a-z]+:\/\/([^\/:\[\]]+)/);
+	return m ? m[1] : null;
+}
+
+// out_plan reads where the AP's own traffic goes out: the interface with
+// its default route, as netifd has it, its gateway and name servers; and
+// from the agent's config, the internet target and the manager. The name
+// the servers are asked for is the internet target's, where that is a name;
+// else the manager's own; else a time server's: one the AP has to find to
+// work, so that the servers are asked wherever it has any such name.
+function out_plan(at) {
+	let c = confdir ? cursor(confdir) : cursor();
+	// Of several default routes, as with a second uplink kept for when the
+	// first fails, the one of the lowest metric: the one the kernel takes.
+	let m = null, gw = null, least = null;
+	for (let i in bus.call('network.interface', 'dump')?.interface ?? []) {
+		if (i.ip4table)
+			continue;
+		for (let r in i.route ?? [])
+			if (r.target == '0.0.0.0' && r.mask == 0 && r.nexthop && (least == null || (r.metric ?? 0) < least)) {
+				m = i;
+				gw = r.nexthop;
+				least = r.metric ?? 0;
+			}
+	}
+	if (!m) {
+		for (let s, d in wayout.dns)
+			close(d.sock);
+		wayout = { plan: null, pings: {}, dns: {}, found: null, next: wayout.next };
+		return;
+	}
+	let a = m['ipv4-address']?.[0];
+	let internet = c.get('aeolus', 'aeolus_path', 'internet');
+	let host = host_of(c.get('aeolus', 'agent', 'url'));
+	let names = [internet, host, ...list(c.get('system', 'ntp', 'server'))];
+	let name = filter(names, n => type(n) == 'string' && length(n) && !is_address(n) && index(n, ':') < 0)[0];
+	let p = {
+		interface: m.interface, device: m.l3_device ?? m.device, address: a?.address, mask: a?.mask, gateway: gw,
+		servers: slice(filter(m['dns-server'] ?? [], is_address), 0, 3), internet: internet, name: name,
+	};
+	if (wayout.plan?.name != name || wayout.plan?.internet != internet) {
+		wayout.found = null;
+		delete wayout.pings.internet;
+	}
+	// Another gateway is another thing, asked afresh.
+	if (wayout.plan?.gateway != gw)
+		delete wayout.pings.gateway;
+	wayout.plan = p;
+	let want = { gateway: gw, internet: internet ? (is_address(internet) ? internet : wayout.found) : null };
+	// What is new is asked at once, and not left to the next turn.
+	let made = false;
+	for (let k in ['gateway', 'internet']) {
+		if (!want[k])
+			delete wayout.pings[k];
+		else if (!wayout.pings[k]) {
+			wayout.pings[k] = { addr: want[k], six: false, start: null, interval: OUT_EVERY, sent: {}, seq: 0, ok: null, rtt: null, since: at };
+			made = true;
+		}
+		else if (wayout.pings[k].addr != want[k]) {
+			// Another address for the same thing: asked from now on, and
+			// silent still until it answers.
+			wayout.pings[k].addr = want[k];
+			wayout.pings[k].sent = {};
+		}
+	}
+	for (let s in keys(wayout.dns))
+		if (!name || !(s in p.servers)) {
+			close(wayout.dns[s].sock);
+			delete wayout.dns[s];
+		}
+	if (name)
+		for (let s in p.servers)
+			if (!wayout.dns[s]) {
+				wayout.dns[s] = { server: s, sock: null, id: math.rand() & 0xffff, sent: null, answered: null, rtt: null, rcode: null, since: at };
+				made = true;
+			}
+	if (made)
+		wayout.next = at;
+}
+
+// on_out reads a name server's answers: one to the last question, whatever
+// it says, shows the server answers, and how long it took.
+function on_out(d, at) {
+	while (true) {
+		let reply = d.sock?.recv(1500, socket.MSG_DONTWAIT);
+		if (!length(reply ?? ''))
+			return;
+		let a = d.sent != null ? probe.dns_answer(reply, d.id) : null;
+		if (!a)
+			continue;
+		d.rtt = (at - d.sent) * 1000;
+		d.answered = at;
+		d.rcode = a.rcode;
+		d.sent = null;
+		// The internet target's own address, where it was the name asked
+		// for. A name with several gives them in turn: the first is kept
+		// while it answers, and another taken only once it has gone silent.
+		if (a.address && wayout.plan?.internet && wayout.plan.internet == wayout.plan.name) {
+			let p = wayout.pings.internet;
+			if (wayout.found == null || (p && probe.out_state(at, p.since, p.ok, OUT_EVERY, OUT_MISSES) == 'silent'))
+				wayout.found = a.address;
+		}
+	}
+}
+
+// out_report is the AP's own way out as it is now: the interface and its
+// address, then the gateway, each name server and the internet, each with
+// whether it answers (up, silent, or unknown until asked long enough), how
+// long its last answer took in ms while it answers, and how many seconds
+// ago that was. An internet target that is a name no server has given an
+// address for is unresolved.
+function out_report(at) {
+	let p = wayout.plan;
+	if (!p)
+		return null;
+	let one = function(x) {
+		let state = probe.out_state(at, x.since, x.ok, OUT_EVERY, OUT_MISSES);
+		return { address: x.addr, state: state, ms: state == 'up' ? tenth(x.rtt) : null, ago: x.ok != null ? int(at - x.ok) : null };
+	};
+	let r = { interface: p.interface, device: p.device, address: p.address, mask: p.mask };
+	if (wayout.pings.gateway)
+		r.gateway = one(wayout.pings.gateway);
+	r.dns = [];
+	for (let s in p.servers) {
+		let d = wayout.dns[s];
+		if (!d) {
+			push(r.dns, { server: s });
+			continue;
+		}
+		let state = probe.out_state(at, d.since, d.answered, OUT_EVERY, OUT_MISSES);
+		push(r.dns, { server: s, state: state, ms: state == 'up' ? tenth(d.rtt) : null, ago: d.answered != null ? int(at - d.answered) : null, rcode: d.rcode });
+	}
+	if (p.name)
+		r.name = p.name;
+	if (p.internet)
+		r.internet = wayout.pings.internet ? { target: p.internet, ...one(wayout.pings.internet) } : { target: p.internet, state: 'unresolved' };
+	return r;
+}
+
+// heard notes that a frame came in on a watched VLAN (0064).
+function heard(vlan, at) {
+	let w = vlan != null ? watch.vlans['' + vlan] : null;
+	if (w) {
+		w.heard = at;
+		w.heard_now = true;
+	}
+}
+
+// peer_key names a tunnel's concentrator as it is pinged: by its address,
+// and the device it is pinged from when the tunnel starts from a VLAN.
+function peer_key(t) {
+	return t.start ? `${t.peer}%${t.start}` : t.peer;
+}
+
+
+function filter_on(s, prog) {
+	return s.setopt(socket.SOL_SOCKET, socket.SO_ATTACH_FILTER, { len: length(prog), filter: prog });
+}
+
+// unopened keeps what was said of each device a packet socket could not
+// be opened on: one not there yet, as a network while its radio listens
+// for radar, is said of once, and again only where what is wrong changes.
+let unopened = {};
+
+// packet opens a packet socket on dev, or on every device with dev null,
+// that sees what prog keeps; with prog null, one that only sends.
+function packet(dev, prog) {
+	let s = socket.create(socket.AF_PACKET, socket.SOCK_RAW, 0);
+	if (!s)
+		return null;
+	let addr = { family: socket.AF_PACKET, protocol: prog ? 3 : 0, address: '00:00:00:00:00:00' };
+	if (dev)
+		addr.interface = dev;
+	let on = dev ?? 'every device';
+	if (!s.bind(addr) || (prog && !filter_on(s, prog))) {
+		let said = sprintf('cannot open a packet socket on %s: %s', on, socket.error());
+		if (unopened[on] != said)
+			fail('%s', said);
+		unopened[on] = said;
+		s.close();
+		return null;
+	}
+	delete unopened[on];
+	// What arrived before the filter took hold goes.
+	while (prog && s.recv(2048, socket.MSG_DONTWAIT) != null)
+		;
+	return s;
+}
+
+// save_shut keeps the ports the loop guard took off their tunnels, so the
+// next run puts them back.
+function save_shut() {
+	if (act)
+		store(SHUT, sprintf('%J', keys(loops)));
+}
+
+function set_deferred(port, value) {
+	if (act)
+		bus.call('network.device', 'set_state', { name: port, defer: value });
+}
+
+function release(port) {
+	if (!loops[port])
+		return;
+	set_deferred(port, false);
+	log('loop guard: %s is back on its tunnels', port);
+	delete loops[port];
+	save_shut();
+}
+
+// with_tag gives a frame sent on the uplink for a VLAN the VLAN's tag, where
+// the uplink carries it tagged (0061, 0064). p: { vlan, tagged }.
+function with_tag(frame, p) {
+	if (!p.vlan || !p.tagged)
+		return frame;
+	return substr(frame, 0, 12) + chr(0x81, 0x00, (p.vlan >> 8) & 0x0f, p.vlan & 0xff) + substr(frame, 12);
+}
+
+// tx sends a frame on a probe's socket, tagged as with_tag says.
+function tx(t, frame) {
+	return t.sock.send(with_tag(frame, t.plan));
+}
+
+// rx reads the next frame for a probe, or null. A VLAN probe's socket on the
+// uplink sees every VLAN: the tag the kernel keeps beside each frame
+// (PACKET_AUXDATA) says whether it is this VLAN's (0061).
+function rx(t) {
+	if (!t.plan.vlan)
+		return t.sock.recv(2048, socket.MSG_DONTWAIT);
+	let m;
+	while ((m = t.sock.recvmsg(2048, 256, socket.MSG_DONTWAIT)) != null) {
+		let aux = filter(m.ancillary ?? [], x => x.type == socket.PACKET_AUXDATA)[0]?.data;
+		let tagged = aux != null && (aux.status & 0x10) != 0;   // TP_STATUS_VLAN_VALID
+		if (t.plan.tagged ? tagged && (aux.vlan_tci & 0xfff) == t.plan.vlan : !tagged)
+			return m.data;
+	}
+	return null;
+}
+
+// A DHCP transaction ID of the prober's own.
+function xid() {
+	return math.rand() & 0x7fffffff;
+}
+
+// The Wi-Fi interfaces taken off the air, by network, kept where a restart
+// of the prober finds them, so it can put them back (0201).
+const OFFAIR = '/var/run/aeolus/offair.json';
+
+// wireless is netifd's account of the radios, a radio it is setting up
+// again seen as it last was, where its interfaces are still there (0301).
+function wireless() {
+	return wifi_names.view(bus.call('network.wireless', 'status')) ?? {};
+}
+
+// ifnames_of is the Wi-Fi interfaces netifd made for a network's sections.
+function ifnames_of(sections) {
+	let out = [];
+	for (let r, v in wireless())
+		for (let i in v.interfaces ?? [])
+			if (i.ifname && index(sections, i.section) >= 0)
+				push(out, i.ifname);
+	return sort(out);
+}
+
+// beaconing says whether a Wi-Fi interface is on the air, sending beacons:
+// nl80211 names its frequency only then. Null where nl80211 cannot say.
+function beaconing(ifname) {
+	if (!nl80211)
+		return null;
+	let i = nl80211.request(nl80211.const.NL80211_CMD_GET_INTERFACE, 0, { dev: ifname });
+	return i ? i.wiphy_freq != null : null;
+}
+
+// take_off takes a Wi-Fi interface off the air (0201): its clients are let
+// go first, each told it is, so it looks elsewhere at once; then hostapd
+// stops its beacons. The radio and its other networks go on as they were.
+function take_off(ifname) {
+	for (let mac in keys(bus.call('hostapd.' + ifname, 'get_clients')?.clients ?? {})) {
+		sentoff.note('prober', mac, ifname, 'off-air');
+		bus.call('hostapd.' + ifname, 'del_client', { addr: mac, reason: 3, deauth: true, ban_time: 0 });
+	}
+	return trim(hostapd_ctl(ifname, 'STOP_AP') ?? '') == 'OK';
+}
+
+// put_back puts a Wi-Fi interface taken off the air back on it: hostapd
+// sends its beacons again, which starts it.
+function put_back(ifname) {
+	return trim(hostapd_ctl(ifname, 'UPDATE_BEACON') ?? '') == 'OK';
+}
+
+// lost_why says what a network that went off the air cannot reach.
+function lost_why(via, t) {
+	if (t?.plan.vlan)
+		return `its VLAN ${t.plan.vlan} does not answer`;
+	if (t)
+		return `its tunnel ${t.plan.device}${t.plan.peer ? ' to ' + t.plan.peer : ''} does not answer`;
+	return 'its way on does not answer';
+}
+
+function apply_plan(p) {
+	// A network that no longer goes off the air when lost is put back on
+	// it (0201); one that newly does starts on it.
+	for (let id, o in offair)
+		if (!p.downs[id]) {
+			for (let i in keys(o.stopped))
+				if (act)
+					put_back(i);
+			delete offair[id];
+		}
+	for (let id, d in p.downs) {
+		offair[id] ??= { plan: d, off: false, since: null, why: null, off_since: null, stopped: {} };
+		offair[id].plan = d;
+	}
+	let kept = {};
+	for (let vni in keys(tun))
+		if (sprintf('%J', tun[vni].plan) != sprintf('%J', p.tunnels[vni])) {
+			let t = tun[vni], l = t.dhcp.lease, next = p.tunnels[vni];
+			// A tunnel that goes, or takes another MAC, gives its lease back
+			// (0060); one whose other settings change keeps it.
+			if (next && next.mac == t.plan.mac && next.device == t.plan.device)
+				kept[vni] = t.dhcp;
+			else if (l && t.sock && t.src)
+				tx(t, probe.dhcp(t.src, 'release', xid(), { ciaddr: l.address, server: l.server, to: l.server }));
+			close(t.sock);
+			delete tun[vni];
+		}
+	for (let vni, t in p.tunnels)
+		tun[vni] ??= { plan: t, sock: null, index: null, src: null, running: false, started: now(), answered: null,
+			from: null, rtt: null, sent: {}, seq: 0, next: now(), said: null,
+			dhcp: kept[vni] ?? { state: 'init', xid: xid(), tries: 0, next: now(), offer: null, lease: null } };
+	let want = {};
+	for (let vni, t in p.tunnels)
+		if (t.peer) {
+			let k = peer_key(t);
+			want[k] = { addr: t.peer, start: t.start, interval: min(want[k]?.interval ?? 300, t.interval) };
+		}
+	for (let k in keys(peers))
+		if (!(k in want))
+			delete peers[k];
+	for (let k, w in want) {
+		peers[k] ??= { addr: w.addr, start: w.start, six: index(w.addr, ':') >= 0, sent: {}, seq: 0, ok: null, rtt: null, since: now(), next: now() };
+		peers[k].interval = w.interval;
+	}
+	// A network whose settings change starts again from what its bridge
+	// holds, and keeps its last switch.
+	let last = {};
+	for (let id in keys(sw))
+		if (sprintf('%J', sw[id].plan) != sprintf('%J', p.switches?.[id])) {
+			last[id] = sw[id].last;
+			delete sw[id];
+		}
+	for (let id, s in p.switches ?? {})
+		sw[id] ??= { plan: s, active: null, said: null, want: null, up_since: null, last: last[id], cannot: null, asked: null };
+	// A port whose settings changed, or that left its tunnels, gets a fresh
+	// start: the loop guard lets it go.
+	for (let port in keys(guards))
+		if (sprintf('%J', guards[port].plan) != sprintf('%J', p.guards[port])) {
+			for (let d in guards[port].devices)
+				close(d.sock);
+			delete guards[port];
+			release(port);
+		}
+	for (let port in keys(loops))
+		if (!p.guards[port])
+			release(port);
+	for (let port, g in p.guards)
+		guards[port] ??= { plan: g, devices: [], next: now() };
+	// The VLANs watched on the uplink (0064): one whose settings change is
+	// watched afresh. A new uplink gets new sockets.
+	for (let v in keys(watch.vlans))
+		if (sprintf('%J', watch.vlans[v].plan) != sprintf('%J', p.watches?.[v]))
+			delete watch.vlans[v];
+	for (let v, w in p.watches ?? {})
+		watch.vlans[v] ??= { plan: w, started: now(), heard: null, heard_now: false, quiet: false, gateway: null, xid: xid(), seq: 0, said: null };
+	if (p.uplink != watch.uplink) {
+		close(watch.sock);
+		watch.sock = null;
+		watch.uplink = p.uplink;
+		watch.next = 0;
+	}
+	for (let port in keys(watch.lldp))
+		if (index(p.lldp ?? [], port) < 0) {
+			close(watch.lldp[port]);
+			delete watch.lldp[port];
+			delete watch.neighbors[port];
+		}
+	watch.lldp_ports = p.lldp ?? [];
+	if (length(guards) && !guard_rx)
+		guard_rx = packet(null, probe.GUARD_FILTER);
+	else if (!length(guards) && guard_rx) {
+		close(guard_rx);
+		guard_rx = null;
+	}
+}
+
+// what names a probe in the log: its tunnel, or its VLAN (0061).
+function what(t) {
+	return t.plan.vlan ? `VLAN ${t.plan.vlan}` : `tunnel ${t.plan.device}`;
+}
+
+// host is the name the AP's lease on a tunnel's segment carries.
+function host(t) {
+	if (t.plan.vlan)
+		return substr(`${HOST}-vlan${t.plan.vlan}`, 0, 63);
+	return substr(`${HOST}-vni${match(t.plan.device, /([0-9]+)$/)?.[1] ?? ''}`, 0, 63);
+}
+
+// targets is what the probes ask on a tunnel's segment (0060): the probe
+// addresses set, which override; else the gateway the lease names; else the
+// DHCP server that gave it. Empty without a lease: then IPv6 all-nodes.
+function targets(t) {
+	let l = t.dhcp.lease;
+	if (length(t.plan.address))
+		return t.plan.address;
+	return l?.router ? [l.router] : l?.server ? [l.server] : [];
+}
+
+// dhcp_tick keeps the AP's lease on a tunnel's segment (0060): a discover
+// while it has none, every interval for three tries and every ten
+// intervals after; a request for an offer; and at half the lease, a renewal.
+function dhcp_tick(t, at) {
+	let d = t.dhcp;
+	let send = (type, o) => {
+		o.host = host(t);
+		return tx(t, probe.dhcp(t.src, type, d.xid, o));
+	};
+	if (d.lease && at >= d.lease.at + d.lease.lease) {
+		note('%s: its lease on %s ran out', what(t), d.lease.address);
+		d.lease = null;
+		d.state = 'init';
+		d.tries = 0;
+		d.next = at;
+	}
+	if (at < d.next)
+		return;
+	if (d.lease) {
+		if (at >= d.lease.at + d.lease.lease / 2) {
+			d.xid = xid();
+			send('request', { ciaddr: d.lease.address });
+			d.next = at + max(60, d.lease.lease / 8);
+		}
+		return;
+	}
+	if (d.state == 'requesting' && d.offer && d.tries < 3)
+		send('request', { requested: d.offer.address, server: d.offer.server });
+	else {
+		d.state = 'init';
+		d.offer = null;
+		d.xid = xid();
+		send('discover', {});
+	}
+	d.tries++;
+	d.next = at + (d.tries <= 3 ? 1 : 10) * t.plan.interval;
+}
+
+// dhcp_answer takes a DHCP answer on a tunnel's segment, which shows the
+// segment works as any answer does: an offer is taken up, an ack is the
+// lease, a nak starts again.
+function dhcp_answer(t, r) {
+	let d = t.dhcp, at = now();
+	t.answered = at;
+	heard(t.plan.vlan, at);
+	t.from = r.server ?? t.from;
+	if (r.type == 'offer' && !d.lease && d.state != 'requesting') {
+		d.state = 'requesting';
+		d.offer = r;
+		d.tries = 0;
+		tx(t, probe.dhcp(t.src, 'request', d.xid, { requested: r.address, server: r.server, host: host(t) }));
+		d.next = at + t.plan.interval;
+	} else if (r.type == 'ack') {
+		let was = d.lease?.address;
+		d.lease = {
+			address: r.address, server: r.server ?? d.offer?.server ?? d.lease?.server,
+			router: r.router, mask: r.mask, lease: max(60, r.lease ?? 3600), at: at,
+		};
+		d.state = 'bound';
+		d.offer = null;
+		d.tries = 0;
+		d.next = at;
+		if (was != r.address)
+			log('%s: leased %s from %s, gateway %s', what(t), r.address, d.lease.server ?? '?', r.router ?? 'none');
+	} else if (r.type == 'nak') {
+		note('%s: %s refused the lease on %s', what(t), r.server ?? 'the DHCP server', d.lease?.address ?? d.offer?.address ?? '?');
+		d.lease = null;
+		d.offer = null;
+		d.state = 'init';
+		d.tries = 0;
+		d.next = at;
+	}
+}
+
+function send_probes(t, at) {
+	let dev = t.plan.device;
+	if (!is_up(dev)) {
+		// A fallback's tunnel waits, stopped, until the AP switches to it.
+		close(t.sock);
+		t.sock = null;
+		t.running = false;
+		return;
+	}
+	let index = ifindex(dev);
+	if (t.sock && t.index != index) {
+		log('tunnel %s: its device was made again; probing the new one', dev);
+		close(t.sock);
+		t.sock = null;
+	}
+	if (!t.sock) {
+		t.sock = packet(dev, probe.OVERLAY_FILTER);
+		t.index = index;
+		if (t.sock && t.plan.vlan)
+			t.sock.setopt(socket.SOL_PACKET, socket.PACKET_AUXDATA, 1);
+	}
+	if (!t.sock)
+		return;
+	if (!t.running) {
+		t.running = true;
+		t.started = at;
+	}
+	// The AP's MAC for the segment, which the bridge takes too (0060); an
+	// older plan without one uses the bridge's.
+	t.src = t.plan.mac ?? read(`/sys/class/net/${t.plan.bridge}/address`);
+	if (!t.src)
+		return;
+	dhcp_tick(t, at);
+	let ask = targets(t);
+	if (length(ask)) {
+		for (let a in ask)
+			if (tx(t, probe.arp_probe(t.src, a, t.dhcp.lease?.address)) != null)
+				t.sent['arp:' + a] = now();
+	} else {
+		let ll = linklocal(t.plan.bridge);
+		t.seq = (t.seq + 1) & 0xffff;
+		if (ll && tx(t, probe.echo6(t.src, ll, ID, t.seq)) != null)
+			t.sent['echo:' + t.seq] = now();
+	}
+	for (let k in keys(t.sent))
+		if (at - t.sent[k] > 3 * t.plan.interval)
+			delete t.sent[k];
+}
+
+function on_tunnel(t) {
+	let pkt;
+	while ((pkt = rx(t)) != null) {
+		let r = probe.dhcp_reply(pkt, t.dhcp.xid);
+		if (r) {
+			dhcp_answer(t, r);
+			continue;
+		}
+		let a = probe.answer(pkt, t.src, ID);
+		if (!a)
+			continue;
+		let at = now();
+		t.answered = at;
+		t.from = a.from;
+		heard(t.plan.vlan, at);
+		if (t.sent[a.key] != null) {
+			t.rtt = (at - t.sent[a.key]) * 1000;
+			delete t.sent[a.key];
+		}
+	}
+}
+
+// raw is the socket a concentrator is pinged with: one for each address
+// family, and for each VLAN device a tunnel starts from (0063), bound to it,
+// so the ping takes the tunnel's path. Without that device, there is none.
+function raw(six, start) {
+	let k = (six ? '6' : '4') + (start ? '%' + start : '');
+	if (!raws[k]) {
+		let s = socket.create(six ? socket.AF_INET6 : socket.AF_INET, socket.SOCK_RAW, six ? 58 : 1);
+		if (s && start && !s.setopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, start)) {
+			s.close();
+			s = null;
+		}
+		if (!s)
+			return null;
+		raws[k] = { sock: s, six: six, start: start };
+	}
+	return raws[k].sock;
+}
+
+function ping(p, at) {
+	let s = raw(p.six, p.start);
+	if (!s)
+		return;
+	p.seq = (p.seq + 1) & 0xffff;
+	let data = p.six ? probe.echo6_plain(ID, p.seq) : probe.echo4(ID, p.seq);
+	if (s.send(data, 0, { family: p.six ? socket.AF_INET6 : socket.AF_INET, address: p.addr, port: 0 }) != null)
+		p.sent[p.seq] = now();
+	else if (p.start) {
+		// A VLAN device made again leaves the socket bound to the old one:
+		// the next ping makes another.
+		let k = (p.six ? '6' : '4') + '%' + p.start;
+		close(raws[k]?.sock);
+		delete raws[k];
+	}
+	for (let k in keys(p.sent))
+		if (at - p.sent[k] > 3 * p.interval)
+			delete p.sent[k];
+}
+
+// same says whether two IPv6 addresses' texts name the same address.
+function same(a, b) {
+	return a == b || (index(a, ':') >= 0 && index(b ?? '', ':') >= 0 && probe.ip6(a) == probe.ip6(b));
+}
+
+// on_raw takes the answers to pings on one socket. A socket bound to no
+// device sees the answers that come in on a VLAN too, so an answer counts
+// only for the pings sent on the socket it came in on.
+function on_raw(r) {
+	let pkt, from = {};
+	while ((pkt = r.sock.recv(2048, socket.MSG_DONTWAIT, from)) != null) {
+		let a = r.six ? probe.echo6_plain_answer(pkt, ID) : probe.echo4_answer(pkt, ID);
+		if (!a)
+			continue;
+		let addr = r.six ? from.address : a.from;
+		// The tunnels' far ends, and the AP's own gateway and internet (0142).
+		for (let set in [peers, wayout.pings])
+			for (let k, p in set)
+				if (p.six == r.six && p.start == r.start && same(p.addr, addr) && p.sent[a.seq] != null) {
+					p.ok = now();
+					p.rtt = (p.ok - p.sent[a.seq]) * 1000;
+					delete p.sent[a.seq];
+				}
+	}
+}
+
+// out_ask pings the gateway and the internet, and asks each name server
+// for the name (0142). It is here, after ping: a function is known only
+// below where it is written.
+function out_ask(at) {
+	for (let k, p in wayout.pings)
+		ping(p, at);
+	for (let s, d in wayout.dns) {
+		d.sent = null;
+		if (!d.sock) {
+			d.sock = socket.create(socket.AF_INET, socket.SOCK_DGRAM);
+			if (!d.sock?.connect({ address: d.server, port: 53 })) {
+				close(d.sock);
+				d.sock = null;
+				continue;
+			}
+		}
+		d.id = (d.id + 1) & 0xffff;
+		let q = probe.dns_query(d.id, wayout.plan?.name);
+		if (q == null || d.sock.send(q) == null) {
+			// The route or the socket went: opened again at the next ask.
+			close(d.sock);
+			d.sock = null;
+			continue;
+		}
+		d.sent = now();
+	}
+}
+
+// health is how a probe's transport is doing (0059): its verdict, or off
+// while its device is down.
+function health(t, at) {
+	if (!t.running)
+		return 'off';
+	let p = t.plan.peer ? peers[peer_key(t.plan)] : null;
+	// A VLAN probe has no concentrator: its underlay is the uplink's link.
+	let carrier = t.plan.vlan ? read(`/sys/class/net/${t.plan.device}/carrier`) == '1' : null;
+	return probe.verdict({ interval: t.plan.interval, started: t.started, answered: t.answered, underlay: t.plan.vlan ? (carrier ? at : null) : p?.ok }, at);
+}
+
+function in_bridge(bridge, dev) {
+	return dev != null && fs.stat(`/sys/class/net/${bridge}/brif/${dev}`) != null;
+}
+
+// decide says which transport carries each network with a fallback (0061),
+// as switch_step rules: in automatic mode, the fallback while the primary is
+// down. A switch is logged, and kept for the report. It starts a tunnel
+// fallback that is needed, and stops one that is not, unless in HA mode. A
+// network the prober finds on its fallback in automatic mode stays there,
+// as after the prober restarts.
+function decide(at) {
+	for (let id, s in sw) {
+		let pt = tun[s.plan.probes.primary], ft = tun[s.plan.probes.fallback];
+		let pv = pt ? health(pt, at) : 'unknown', fv = ft ? health(ft, at) : 'unknown';
+		// A primary off for three of its intervals is down: its device is
+		// gone, as a tunnel the kernel deleted under netifd is (2026-10-10).
+		// Only a fallback is stopped on purpose, and a network must not wait
+		// on a primary that will not come back by itself.
+		if (pt && pv == 'off') {
+			pt.off_since ??= at;
+			if (at - pt.off_since >= 3 * pt.plan.interval)
+				pv = 'down';
+		} else if (pt)
+			pt.off_since = null;
+		if (pv != 'up')
+			s.up_since = null;
+		else
+			s.up_since ??= at;
+		s.want ??= s.plan.mode == 'automatic' && in_bridge(s.plan.bridge, s.plan.fallback) && !in_bridge(s.plan.bridge, s.plan.primary)
+			? 'fallback' : 'primary';
+		let vxlan = ft != null && !ft.plan.vlan;
+		let r = probe.switch_step({
+			mode: s.plan.mode, ha: s.plan.ha, failback: s.plan.failback, holddown: s.plan.holddown,
+			want: s.want, primary: pv, fallback: fv, fallback_vxlan: vxlan, up_since: s.up_since,
+		}, at);
+		if (r.want != s.want) {
+			if (r.why) {
+				s.last = { from: s.want, to: r.want, why: r.why, at: time() };
+				let how = r.want == 'fallback' ? note : log;
+				how('network %s: switching from its %s %s to its %s %s: %s%s',
+					id, s.want, s.plan[s.want], r.want, s.plan[r.want], r.why, act ? '' : ' (not done: -n)');
+			}
+			s.want = r.want;
+		}
+		if (r.cannot != s.cannot) {
+			if (r.cannot)
+				note('network %s: cannot switch: %s', id, r.cannot);
+			s.cannot = r.cannot;
+		}
+		// The fallback's tunnel, asked to go up or down again only after a
+		// while; the probe looks at it soon after.
+		let ask = r.start ? 'up' : r.stop ? 'down' : null;
+		if (ask && act && (s.asked?.what != ask || at - s.asked.at >= 30)) {
+			log('network %s: %s its fallback, tunnel %s', id, ask == 'up' ? 'starting' : 'stopping', ft.plan.device);
+			bus.call('network.interface.' + ft.plan.device, ask, {});
+			s.asked = { what: ask, at: at };
+			ft.next = min(ft.next, at + 2);
+		}
+	}
+}
+
+// keep_off judges each network that goes off the air when lost (0201): the
+// transport it is on, the switch's for one with a fallback, else its
+// tunnel's or VLAN's probe. Down takes it off the air on this AP, up puts it
+// back at once, and unknown or unverified leaves it as it is. Its
+// interfaces are looked at each time, so one a reload put back on the air
+// while the network is lost is taken off again. With -n it only judges.
+function keep_off(at) {
+	let kept = {};
+	for (let id, o in offair) {
+		let t = null;
+		if (o.plan.via == 'switch') {
+			let s = sw[id];
+			t = s ? tun[s.plan.probes[s.want ?? 'primary']] : null;
+		} else
+			t = tun[o.plan.via];
+		let v = t ? health(t, at) : 'unknown';
+		// A device that has been off three of its intervals is lost, as a
+		// primary is to decide().
+		if (v == 'off') {
+			o.off_since ??= at;
+			v = at - o.off_since >= 3 * t.plan.interval ? 'down' : 'unknown';
+		} else
+			o.off_since = null;
+		let off = probe.off_air(v, o.off);
+		if (off != o.off) {
+			o.off = off;
+			o.since = at;
+			o.why = off ? lost_why(o.plan.via, t) : null;
+			(off ? note : log)('network %s: %s%s', id, off ? 'off the air: ' + o.why : 'on the air again: its way on answers', act ? '' : ' (not done: -n)');
+		}
+		if (!act)
+			continue;
+		if (o.off)
+			for (let i in ifnames_of(o.plan.ifaces))
+				if (beaconing(i) ?? !o.stopped[i]) {
+					if (take_off(i)) {
+						o.stopped[i] = true;
+						log('network %s: %s off the air', id, i);
+					}
+				}
+		// What it took off goes back on, whether netifd lists it just now or
+		// not: while a reload sets the network up again, netifd can leave
+		// it out a moment, and one forgotten then would stay off the air.
+		// One that failed is tried again next time.
+		for (let i in keys(o.stopped))
+			if (!o.off && put_back(i)) {
+				delete o.stopped[i];
+				log('network %s: %s on the air again', id, i);
+			} else if (!fs.access(`/sys/class/net/${i}`)) {
+				// Gone, as with its section: no longer this one's to keep.
+				delete o.stopped[i];
+			}
+		if (length(o.stopped))
+			kept[id] = sort(keys(o.stopped));
+	}
+	let text = sprintf('%J', kept);
+	if (text != (fs.readfile(OFFAIR) ?? '{}'))
+		fs.writefile(OFFAIR, text);
+}
+
+// attach keeps the transport that carries each network with a fallback in
+// the network's bridge (0061), as decide says. The other comes out first, so
+// the two are never in at once. It looks every few seconds, so whatever took
+// the transport out, a reload or a tunnel made again, is put right at once.
+// With -n it only looks.
+function attach() {
+	for (let id, s in sw) {
+		let iface = 'network.interface.aeolus_' + replace(id, '-', '_');
+		let want = s.want ?? 'primary', other = want == 'primary' ? 'fallback' : 'primary';
+		let has = d => in_bridge(s.plan.bridge, d);
+		if (act && has(s.plan[other]))
+			bus.call(iface, 'remove_device', { name: s.plan[other], 'link-ext': false });
+		if (act && !has(s.plan[want]) && s.plan[want] && fs.stat(`/sys/class/net/${s.plan[want]}`))
+			bus.call(iface, 'add_device', { name: s.plan[want], 'link-ext': false });
+		s.active = has(s.plan.primary) ? 'primary' : has(s.plan.fallback) ? 'fallback' : 'none';
+		if (s.active != s.said) {
+			let how = s.active == 'primary' ? log : note;
+			how('network %s: %s', id, s.active == 'none' ? `no transport is in ${s.plan.bridge}` : `${s.active} ${s.plan[s.active]} is in ${s.plan.bridge}`);
+			s.said = s.active;
+		}
+	}
+}
+
+// table_routes is the IPv4 routes in a routing table, each { dst, via }.
+function table_routes(table) {
+	let out = [];
+	for (let r in rtnl.request(rtnl.const.RTM_GETROUTE, rtnl.const.NLM_F_DUMP, { family: socket.AF_INET, table: table }) ?? [])
+		if (r.table == table)
+			push(out, { dst: r.dst ?? '0.0.0.0/0', via: r.gateway ?? null });
+	return out;
+}
+
+// keep_routes puts back the routes netifd holds for each interface tunnels
+// start from on a VLAN (0063) that are gone from the interface's table. The
+// kernel drops every route from an address when the address is removed, as
+// when another interface leasing the same address on the VLAN restarts, and
+// netifd doesn't notice: the tunnels are down until the routes are back
+// (2026-10-06, on the office AP). Where one can't be put back, as when the
+// address itself is gone, netifd starts the interface again, at most every
+// BOUNCE_EVERY seconds. With -n it only looks.
+function keep_routes(names, at) {
+	if (!rtnl)
+		return;
+	for (let k in keys(starts))
+		if (!(k in names))
+			delete starts[k];
+	for (let name in names) {
+		let st = bus.call('network.interface.' + name, 'status');
+		let table = st?.ip4table;
+		if (!st?.up || type(table) != 'int' || !st.l3_device)
+			continue;
+		let gone = probe.missing_routes(probe.start_routes(st), table_routes(table));
+		let s = starts[name] ??= { put_back: null, failing: false, bounced: null, gone: false };
+		// Gone at two looks in a row, so not while netifd is still making them.
+		let before = s.gone;
+		s.gone = length(gone) > 0;
+		if (!s.gone)
+			s.failing = false;
+		if (!s.gone || !before)
+			continue;
+		let said = join(', ', map(gone, r => r.dst + (r.via ? ' via ' + r.via : '')));
+		if (!act) {
+			if (!s.failing)
+				note('%s: table %d lacks routes netifd holds: %s (not put back: -n)', name, table, said);
+			s.failing = true;
+			continue;
+		}
+		let back = 0;
+		for (let r in gone) {
+			let args = probe.route_args(r, st.l3_device, table);
+			if (args && system(`ip route replace ${args} 2>/dev/null`) == 0)
+				back++;
+		}
+		if (back)
+			s.put_back = time();
+		if (back == length(gone)) {
+			note('%s: put back routes gone from table %d, though netifd holds them: %s', name, table, said);
+			s.failing = false;
+			continue;
+		}
+		if (!s.failing)
+			note('%s: cannot put back routes gone from table %d: %s', name, table, said);
+		s.failing = true;
+		if (s.bounced == null || at - s.bounced >= BOUNCE_EVERY) {
+			note('%s: starting it again, so netifd makes its address and routes again', name);
+			bus.call('network.interface.' + name, 'down', {});
+			bus.call('network.interface.' + name, 'up', {});
+			s.bounced = at;
+		}
+	}
+}
+
+// keep_tunnels makes again the device of a tunnel netifd has up but the
+// kernel lost (0187). netifd keeps such a device as present, and a member of
+// its bridge, so it never makes it again, and nothing goes over the tunnel:
+// its network's Wi-Fi clients reach nothing (2026-10-20, the shed's and
+// the office's aeolus_50). Starting the tunnel's interface again doesn't make
+// it either, and taking its bridge's interface down restarts the radios, as
+// the office's did. So it is made here, over netlink, as netifd makes it from
+// the interface's settings, and put in its bridge: nothing else is touched.
+// Missing at two looks in a row, so not while netifd is still making it; at
+// most every BOUNCE_EVERY seconds; an IPv4 tunnel's only. With -n it only
+// looks.
+function keep_tunnels(at) {
+	if (!rtnl)
+		return;
+	let c = confdir ? cursor(confdir) : cursor();
+	let seen = {};
+	for (let k, t in tun) {
+		let name = t.plan.device, bridge = t.plan.bridge;
+		if (!bridge)
+			continue;
+		seen[name] = true;
+		let st = bus.call('network.interface.' + name, 'status');
+		let l = lost[name] ??= { seen: 0, made: null, remade: null, failing: false };
+		if (!st?.up || fs.access(`/sys/class/net/${name}`)) {
+			l.seen = 0;
+			l.failing = false;
+			continue;
+		}
+		if (++l.seen < 2 || (l.made != null && at - l.made < BOUNCE_EVERY))
+			continue;
+		let n = c.get_all('network', name) ?? {};
+		if (!act || !n.peeraddr || !n.vid) {
+			if (!l.failing)
+				note('tunnel %s: netifd has it up, but its device is gone%s', name,
+					!act ? ' (not made again: -n)' : '; one with an IPv6 peer is not made again here');
+			l.failing = true;
+			continue;
+		}
+		l.made = at;
+		let info = { type: 'vxlan', id: +n.vid, group: n.peeraddr, port: +(n.port ?? '4789'), learning: 1, udp_csum: true, ttl_inherit: true };
+		let under = n.tunlink ? bus.call('network.interface.' + n.tunlink, 'status')?.l3_device : null;
+		let index = under ? +(read(`/sys/class/net/${under}/ifindex`) ?? '0') : 0;
+		if (index > 0)
+			info.link = index;
+		if (n.ipaddr)
+			info.local = n.ipaddr;
+		if (n.ttl) {
+			info.ttl = +n.ttl;
+			delete info.ttl_inherit;
+		}
+		let link = { ifname: name, linkinfo: info };
+		if (n.mtu)
+			link.mtu = +n.mtu;
+		rtnl.request(rtnl.const.RTM_NEWLINK, rtnl.const.NLM_F_CREATE | rtnl.const.NLM_F_EXCL, link);
+		let err = rtnl.error();
+		if (!err) {
+			rtnl.request(rtnl.const.RTM_NEWLINK, 0, { ifname: name, master: bridge });
+			err = rtnl.error();
+			system(`ip link set ${name} up 2>/dev/null`);
+		}
+		if (err || !fs.access(`/sys/class/net/${name}/brport`)) {
+			if (!l.failing)
+				note('tunnel %s: netifd has it up, but its device is gone, and it could not be made again: %s', name, err ?? `not in ${bridge} after`);
+			l.failing = true;
+			continue;
+		}
+		note('tunnel %s: made its device again, in %s: netifd had it up, but it was gone', name, bridge);
+		l.remade = time();
+		l.failing = false;
+	}
+	for (let k in keys(lost))
+		if (!seen[k])
+			delete lost[k];
+}
+
+// spell_begin opens the uplink for a spell of listening (0064), and nudges
+// each VLAN that wasn't heard in the last one, from its own MAC: a DHCP
+// discover, an ARP to the gateway its last DHCP answer named, and an echo to
+// IPv6 all-nodes. An answer comes in on the VLAN, and so is heard.
+function spell_begin(at) {
+	watch.next = at + SPELL_EVERY;
+	watch.sock = packet(watch.uplink, probe.WATCH_FILTER);
+	if (!watch.sock)
+		return;
+	watch.sock.setopt(socket.SOL_PACKET, socket.PACKET_AUXDATA, 1);
+	watch.until = at + SPELL_MAX;
+	for (let v, w in watch.vlans) {
+		w.heard_now = false;
+		if (!w.quiet || !w.plan.mac)
+			continue;
+		let send = f => watch.sock.send(with_tag(f, w.plan));
+		w.xid = xid();
+		send(probe.dhcp(w.plan.mac, 'discover', w.xid, { host: substr(`${HOST}-vlan${w.plan.vlan}`, 0, 63) }));
+		if (w.gateway)
+			send(probe.arp_probe(w.plan.mac, w.gateway));
+		w.seq = (w.seq + 1) & 0xffff;
+		send(probe.echo6(w.plan.mac, probe.link_local(w.plan.mac), ID, w.seq));
+	}
+}
+
+// spell_end closes the uplink after a spell. A VLAN not heard in it is
+// nudged in the next.
+function spell_end() {
+	close(watch.sock);
+	watch.sock = null;
+	for (let v, w in watch.vlans)
+		w.quiet = !w.heard_now;
+}
+
+// on_watch reads what came in on the uplink in a spell: the VLAN each frame
+// came in on, from its tag (PACKET_AUXDATA), or for one without, the VLAN
+// the uplink carries untagged; and the gateway a nudge's DHCP answer names.
+// Once every VLAN has been heard, the spell ends.
+function on_watch(at) {
+	let native = null;
+	for (let v, w in watch.vlans)
+		if (!w.plan.tagged)
+			native = v;
+	let m;
+	while ((m = watch.sock.recvmsg(2048, 256, socket.MSG_DONTWAIT)) != null) {
+		let aux = filter(m.ancillary ?? [], x => x.type == socket.PACKET_AUXDATA)[0]?.data;
+		let vid = aux != null && (aux.status & 0x10) ? aux.vlan_tci & 0xfff : 0;
+		let w = watch.vlans[vid ? '' + vid : native ?? ''];
+		if (!w)
+			continue;
+		heard(w.plan.vlan, at);
+		let r = probe.dhcp_reply(m.data, w.xid);
+		if (r?.router)
+			w.gateway = r.router;
+	}
+	if (!length(filter(keys(watch.vlans), v => !watch.vlans[v].heard_now)))
+		spell_end();
+}
+
+// open_lldp opens the sockets the switch's LLDP comes in on (0064), one on
+// each Ethernet port under the uplink (0096). Each is tried again at each
+// look at the plan.
+function open_lldp() {
+	for (let port in watch.lldp_ports)
+		watch.lldp[port] ??= packet(port, probe.LLDP_FILTER);
+}
+
+// on_lldp keeps what the switch's LLDP says of itself and of the switch port
+// an Ethernet port under the uplink is on (0064), and logs a new switch, port
+// or list of VLANs for it.
+function on_lldp(port, at) {
+	let f;
+	while ((f = watch.lldp[port].recv(2048, socket.MSG_DONTWAIT)) != null) {
+		let l = probe.lldp(f);
+		if (!l)
+			continue;
+		let was = watch.neighbors[port];
+		if (was?.system != l.system || was?.port != l.port || join(' ', was?.vlans ?? []) != join(' ', l.vlans))
+			log('%s is on %s, port %s%s', length(watch.lldp_ports) > 1 ? `${port}, of the uplink,` : `the uplink ${port}`,
+				l.system ?? l.chassis ?? '?', l.port ?? '?', length(l.vlans) ? `, which carries VLANs ${join(' ', l.vlans)}` : '');
+		l.at = at;
+		watch.neighbors[port] = l;
+	}
+}
+
+// dhcp_net is a network's DHCP watch (0065), made when first needed.
+function dhcp_net(id) {
+	return dw.nets[id] ??= { requests: {}, servers: {}, unanswered: [], answered: [], duplicates: [], clients: {}, asked: {}, silent: false };
+}
+
+// dhcp_scan finds the AP's Wi-Fi interfaces, as netifd has them, and opens
+// a socket on each new one: on Aeolus's networks for the DHCP watch (0065),
+// on the AP's own for what clients say of themselves (0067). Then it reads,
+// from nl80211, the clients on every one (0066): when each joined, its
+// signal, rates and data; and from hostapd, the 802.11 features each
+// supports (0067). On Aeolus's networks, a client that joined after the
+// watch began on its interface is watched for DHCP. One that moves between
+// the AP's radios on the network, or rejoins within STAY_GAP of when a scan
+// last saw it, is still there: it keeps its lease, and needn't ask again.
+// One that rejoins later starts afresh, even if no scan missed it. What a client said of itself is
+// forgotten an hour after it leaves.
+function dhcp_scan(at) {
+	let want = {}, nets = {}, all = [];
+	for (let r, v in wireless())
+		for (let i in v.interfaces ?? []) {
+			if (!i.ifname)
+				continue;
+			let n = filter(i.config?.network ?? [], x => match(x, /^aeolus_/))[0];
+			let id = n ? replace(substr(n, 7), /_/g, '-') : null;
+			push(all, { ifname: i.ifname, ssid: i.config?.ssid, band: v.config?.band, network: id });
+			want[i.ifname] = id;
+			if (id)
+				nets[id] = true;
+		}
+	// A client a per-user key (0070) or the RADIUS server (0111) put in a
+	// VLAN is on that VLAN's own Wi-Fi interface, which hostapd makes as
+	// <bss>-k<vlan> or <bss>-r<vlan>: its stations are read there, and what
+	// it says of itself in DHCP too. The DHCP watch's findings stay with the
+	// network's own segment.
+	let names = fs.lsdir('/sys/class/net') ?? [];
+	for (let a in slice(all))
+		for (let by in ['-k', '-r']) {
+			let prefix = a.ifname + by;
+			for (let name in names) {
+				let vlan = substr(name, 0, length(prefix)) == prefix ? int(substr(name, length(prefix))) : 0;
+				if (vlan > 0 && vlan < 4095 && name == prefix + vlan) {
+					push(all, { ifname: name, ssid: a.ssid, band: a.band, network: a.network, vlan: vlan, parent: a.ifname });
+					want[name] = null;
+				}
+			}
+		}
+	// What hostapd counted of each network's sign-ins is read by these
+	// (0114), with or without nl80211.
+	bsses = all;
+	for (let ifn in keys(dw.ifaces))
+		if (!(ifn in want) || want[ifn] != dw.ifaces[ifn].network || ifindex(ifn) != dw.ifaces[ifn].index) {
+			close(dw.ifaces[ifn].sock);
+			delete dw.ifaces[ifn];
+		}
+	for (let ifn, id in want)
+		if (!dw.ifaces[ifn]) {
+			let sock = packet(ifn, probe.DHCP_FILTER);
+			if (sock)
+				dw.ifaces[ifn] = { sock: sock, network: id, index: ifindex(ifn), started: at };
+		}
+	for (let id in keys(dw.nets))
+		if (!nets[id])
+			delete dw.nets[id];
+	dw.clients = [];
+	if (!nl80211)
+		return;
+	// The 802.11 features a client's association showed hostapd: its
+	// generation; 802.11k, from any RRM bit; 802.11v, from the BSS transition
+	// bit (19) of its extended capabilities; 802.11w; MBO; and WMM. They are
+	// what the connection uses, which the radio and the SSID cap: a Wi-Fi 6
+	// phone shows n on an n-only radio, and no v where hostapd offers none.
+	let features = (x) => x == null ? null : {
+		gen: x.eht ? 'be' : x.he ? 'ax' : x.vht ? 'ac' : x.ht ? 'n' : null,
+		k: length(filter(x.rrm ?? [], b => b != 0)) > 0,
+		v: !!((x.extended_capabilities?.[2] ?? 0) & 0x08),
+		w: !!x.mfp, mbo: !!x.mbo, wmm: !!x.wmm,
+	};
+	let here = {};
+	for (let id, n in dw.nets)
+		for (let mac, c in n.clients)
+			c.here = false;
+	let hcs = {}, known = {};
+	for (let a in all) {
+		let w = dw.ifaces[a.ifname], n = a.network && !a.vlan ? dhcp_net(a.network) : null;
+		let bss = a.parent ?? a.ifname;
+		let sts = nl80211.request(nl80211.const.NL80211_CMD_GET_STATION, nl80211.const.NLM_F_DUMP, { dev: a.ifname }) ?? [];
+		let ath = ath11k_phy(bss, sts);
+		let hc = hcs[bss] ??= bus.call('hostapd.' + bss, 'get_clients')?.clients ?? {};
+		for (let st in sts) {
+			let mac = lc(st.mac ?? ''), s = st.sta_info ?? {};
+			if (!mac || s.connected_time == null)
+				continue;
+			here[mac] = true;
+			// Who it signed in as (0113), on Aeolus's networks: asked once a
+			// session, which a new time of joining marks. A client seen
+			// while it is still signing in has no name yet, so one without
+			// is asked about again while it is new.
+			// And which key management it chose (0150), on every network:
+			// asked with it, once a session.
+			let key = bss + '/' + mac, joined_at = at - s.connected_time, u = users[key];
+			// How far its joining is from the one remembered: ucode has
+			// no abs, and the name alone stopped the prober at every
+			// client that stayed past one look (found 2026-10-13).
+			let apart = u ? u.joined - joined_at : 0;
+			if (!u || apart > STAY_GAP || apart < -STAY_GAP) {
+				let said = sta_said(bss, mac);
+				u = { joined: joined_at, user: said.user, ft: said.ft };
+			}
+			else if ((u.ft == null || (a.network && u.user == null)) && s.connected_time < USER_WAIT) {
+				let said = sta_said(bss, mac);
+				u.user ??= said.user;
+				u.ft ??= said.ft;
+			}
+			known[key] = u;
+			let user = a.network ? u.user : null;
+			// Its retries: on an ath11k radio, what the radio counted, or
+			// null where it counted none for this client (0164).
+			let retries = s.tx_retries;
+			if (ath)
+				retries = probe.ath11k_retries(fs.readfile(`${ATH11K}${ath}/netdev:${a.ifname}/stations/${mac}/tx_stats`) ??
+					fs.readfile(`${ATH11K}${ath}/netdev:${bss}/stations/${mac}/tx_stats`));
+			push(dw.clients, { mac: mac, ssid: a.ssid, band: a.band, network: a.network, vlan: a.vlan, user: user, ft: u.ft, sta: s, retries: retries, features: features(hc[mac]) });
+			if (!n || !w)
+				continue;
+			let joined = at - s.connected_time, c = n.clients[mac];
+			if (!c || joined - c.seen > STAY_GAP)
+				n.clients[mac] = c = { joined: joined, watched: joined >= w.started - 2, asked: null, address: null, said: null };
+			c.here = true;
+			c.seen = at;
+			if (n.asked[mac] != null && n.asked[mac] >= c.joined - 2)
+				c.asked = n.asked[mac];
+		}
+	}
+	// Only the sessions still here are remembered.
+	users = known;
+	for (let id, n in dw.nets)
+		for (let mac in keys(n.clients))
+			if (at - n.clients[mac].seen > STAY_GAP)
+				delete n.clients[mac];
+	for (let mac in keys(dw.ident))
+		if (here[mac])
+			dw.ident[mac].at = at;
+		else if (at - dw.ident[mac].at > probe.DHCP_MEMORY)
+			delete dw.ident[mac];
+}
+
+// on_dhcp reads what crossed a Wi-Fi interface (0065). A request counts when
+// it comes in from a client: the bridge floods the segment's other
+// broadcast requests out to the Wi-Fi clients too, and one client's to the
+// others. What a client says of itself is kept, on any network (0067); the
+// rest only on Aeolus's. A request is kept by its transaction ID. An answer
+// goes with its request, by server, and a second server answering one
+// request is a duplicate; any answer shows its server, whoever it answers
+// on the segment. An ack gives a client its address; so does its ARP.
+function on_dhcp(w, at) {
+	let n = w.network ? dhcp_net(w.network) : null, m;
+	let ident = (mac) => dw.ident[mac] ??= { at: at, host: null, vendor_class: null, params: null, address: null };
+	while ((m = w.sock.recvmsg(2048, 0, socket.MSG_DONTWAIT)) != null) {
+		let f = m.data, d = probe.dhcp_seen(f);
+		if (d && d.op == 1) {
+			if (m.address?.packet_type == 4)
+				continue;   // going out: not this network's Wi-Fi client asking
+			let id = ident(d.client);
+			id.at = at;
+			for (let k in ['host', 'vendor_class', 'params'])
+				if (d[k])
+					id[k] = d[k];
+			if (!n)
+				continue;
+			if (d.type in ['discover', 'request', 'inform'] && !n.requests['' + d.xid])
+				n.requests['' + d.xid] = { at: at, client: d.client, type: d.type, answers: {}, duplicate: null };
+			n.asked[d.client] = at;
+			if (n.clients[d.client])
+				n.clients[d.client].asked = at;
+		} else if (d && d.op == 2) {
+			if (d.type == 'ack' && d.yiaddr != '0.0.0.0' && dw.ident[d.client])
+				dw.ident[d.client].address = d.yiaddr;
+			if (!n)
+				continue;
+			let r = n.requests['' + d.xid], server = d.server ?? d.src_ip;
+			let sv = n.servers[server] ??= { mac: d.src_mac, answers: 0, last: at };
+			sv.mac = d.src_mac;
+			sv.last = at;
+			if (!r || !r.answers[server])
+				sv.answers++;
+			if (r && !r.answers[server]) {
+				r.answers[server] = { type: d.type, mac: d.src_mac };
+				if (length(keys(r.answers)) >= 2) {
+					if (!r.duplicate) {
+						r.duplicate = { at: at, client: r.client, servers: [] };
+						push(n.duplicates, r.duplicate);
+					}
+					r.duplicate.servers = sort(keys(r.answers));
+					note('DHCP on %s: %s all answered %s', w.network, join(' and ', r.duplicate.servers), r.client);
+				}
+			}
+			if (d.type == 'ack' && d.yiaddr != '0.0.0.0' && n.clients[d.client])
+				n.clients[d.client].address = d.yiaddr;
+		} else {
+			let a = probe.arp_seen(f);
+			if (a && m.address?.packet_type != 4)
+				ident(a.mac).address = a.address;   // a client's own; the segment's flood out to every Wi-Fi interface
+			if (a && n?.clients[a.mac])
+				n.clients[a.mac].address = a.address;
+		}
+	}
+}
+
+// dhcp_results judges each network's DHCP (0065): requests that waited their
+// time unanswered, or were answered; the windows they are counted in; and
+// each client's use of DHCP. A network that stops answering, and a client
+// that doesn't use DHCP, are logged once.
+function dhcp_results(at) {
+	let out = {};
+	for (let id, n in dw.nets) {
+		for (let x in keys(n.requests)) {
+			let r = n.requests[x], st = probe.request_state(r, at);
+			if (st == 'unanswered') {
+				push(n.unanswered, { at: r.at, client: r.client });
+				delete n.requests[x];
+			} else if (st == 'answered' && at - r.at > probe.DHCP_WAIT) {
+				push(n.answered, r.at);
+				delete n.requests[x];
+			}
+		}
+		n.unanswered = filter(n.unanswered, u => at - u.at <= probe.DHCP_WINDOW);
+		n.answered = filter(n.answered, t => at - t <= probe.DHCP_WINDOW);
+		n.duplicates = filter(n.duplicates, x => at - x.at <= probe.DHCP_MEMORY);
+		for (let k in keys(n.servers))
+			if (at - n.servers[k].last > probe.DHCP_MEMORY)
+				delete n.servers[k];
+		for (let k in keys(n.asked))
+			if (at - n.asked[k] > probe.DHCP_MEMORY)
+				delete n.asked[k];
+		let silent = length(n.unanswered) > 0 && !length(n.answered);
+		if (silent != n.silent) {
+			let how = silent ? note : log;
+			let k = length(n.unanswered);
+			how('DHCP on %s: %s', id, silent ? `nothing answers: ${k} ${k == 1 ? 'request' : 'requests'} in ${probe.DHCP_WINDOW / 60} minutes` : 'answering again');
+			n.silent = silent;
+		}
+		let without = [];
+		for (let mac, c in n.clients) {
+			if (!c.here)
+				continue;   // between radios, or gone
+			let v = probe.client_dhcp(c, at);
+			if (v != c.said && (v == 'static' || v == 'none'))
+				note('DHCP on %s: client %s asked nothing in %d s, %s', id, mac, probe.DHCP_QUIET, v == 'static' ? `and uses ${c.address}` : 'and shows no address');
+			c.said = v;
+			if (v == 'static' || v == 'none')
+				push(without, { mac: mac, joined_ago: int(at - c.joined), address: c.address });
+		}
+		if (!length(n.servers) && !length(n.unanswered) && !length(n.answered) && !length(without))
+			continue;
+		out[id] = {
+			servers: slice(map(sort(keys(n.servers)), k => ({ id: k, mac: n.servers[k].mac, answers: n.servers[k].answers, ago: int(at - n.servers[k].last) })), 0, 8),
+			answered: length(n.answered), unanswered: length(n.unanswered),
+			unanswered_clients: slice(uniq(map(n.unanswered, u => u.client)), 0, 16),
+			duplicates: slice(map(n.duplicates, x => ({ servers: x.servers, client: x.client, ago: int(at - x.at) })), -8),
+			without: slice(without, 0, 32),
+		};
+	}
+	return out;
+}
+
+// clients_report is every Wi-Fi client on the AP (0066), newest first: its
+// MAC, network (Aeolus's, or null for the AP's own) and SSID, band, signal
+// and its average, rates each way in Mbit/s with MCS and streams, data and
+// packets each way, retries and failures, seconds connected, milliseconds
+// since last heard; the address it uses, the host name, vendor class and
+// fingerprint it gave in DHCP, and its 802.11 features (0067); the VLAN a
+// per-user key put it in, if any (0070); and on Aeolus's networks how it
+// does with DHCP (0065). At most 256.
+function clients_report(at) {
+	let mbit = (b) => (b?.bitrate32 ?? b?.bitrate) != null ? (b.bitrate32 ?? b.bitrate) / 10.0 : null;
+	let mcs = (b) => b?.mcs ?? b?.vht_mcs ?? b?.he_mcs ?? b?.eht_mcs;
+	let nss = (b) => b?.vht_nss ?? b?.he_nss ?? b?.eht_nss;
+	let out = [];
+	for (let c in dw.clients) {
+		let s = c.sta, n = c.network ? dw.nets[c.network] : null, d = n?.clients[c.mac], id = dw.ident[c.mac], x = c.features;
+		push(out, {
+			mac: c.mac, network: c.network, ssid: c.ssid, band: c.band, vlan: c.vlan, user: c.user,
+			signal: s.signal, signal_avg: s.signal_avg,
+			rx_rate: mbit(s.rx_bitrate), rx_mcs: mcs(s.rx_bitrate), rx_nss: nss(s.rx_bitrate),
+			tx_rate: mbit(s.tx_bitrate), tx_mcs: mcs(s.tx_bitrate), tx_nss: nss(s.tx_bitrate),
+			rx_bytes: s.rx_bytes64 ?? s.rx_bytes, tx_bytes: s.tx_bytes64 ?? s.tx_bytes,
+			rx_packets: s.rx_packets, tx_packets: s.tx_packets, tx_retries: c.retries, tx_failed: s.tx_failed,
+			connected: s.connected_time, inactive_ms: s.inactive_time,
+			address: d?.address ?? id?.address, host: id?.host, vendor_class: id?.vendor_class, params: id?.params,
+			dhcp: d ? probe.client_dhcp(d, at) : null,
+			gen: x?.gen, k: x?.k, v: x?.v, w: x?.w, r: c.ft, mbo: x?.mbo, wmm: x?.wmm,
+		});
+	}
+	return slice(sort(out, (x, y) => x.connected - y.connected), 0, 256);
+}
+
+function send_guard(port, g, at) {
+	for (let i = 0; i < length(g.plan.devices); i++) {
+		let name = g.plan.devices[i];
+		let d = g.devices[i] ??= { name: name, sock: null, index: null, mac: null };
+		let index = ifindex(name);
+		if (d.sock && d.index != index) {
+			close(d.sock);
+			d.sock = null;
+		}
+		if (!d.sock && index != null) {
+			d.sock = packet(name, null);
+			d.index = index;
+		}
+		d.mac = read(`/sys/class/net/${name}/address`);
+		if (d.sock && d.mac)
+			d.sock.send(probe.guard_frame(d.mac, NONCE, port, name));
+	}
+}
+
+function on_guard() {
+	let pkt, from = {};
+	while ((pkt = guard_rx.recv(2048, socket.MSG_DONTWAIT, from)) != null) {
+		let g = probe.guard_seen(pkt, NONCE);
+		let port = g?.port;
+		if (!g || loops[port] || !guards[port])
+			continue;
+		let at = now();
+		let i = index(guards[port].plan.devices, g.device);
+		loops[port] = { port: port, device: g.device, vni: guards[port].plan.vnis[i], came_in: from.interface ?? '', at: at };
+		fail('loop guard: a frame sent on %s came back in on %s, so the segment loops; %s is off its tunnels until its settings change or the agent restarts%s',
+			g.device, from.interface ?? 'the AP', port, act ? '' : ' (not done: -n)');
+		set_deferred(port, true);
+		save_shut();
+	}
+}
+
+function results(at) {
+	let tunnels = {}, vlans = {}, verdict_of = {};
+	for (let vni, t in tun) {
+		let p = t.plan.peer ? peers[peer_key(t.plan)] : null;
+		let carrier = t.plan.vlan ? read(`/sys/class/net/${t.plan.device}/carrier`) == '1' : null;
+		let span = 3 * t.plan.interval;
+		let v = health(t, at);
+		if (v != t.said && t.said != null) {
+			let how = v == 'down' ? note : log;
+			if (t.plan.vlan)
+				how('VLAN %d: %s, was %s', t.plan.vlan, v, t.said);
+			else
+				how('tunnel %s (VNI %s): %s, was %s', t.plan.device, vni, v, t.said);
+		}
+		t.said = v;
+		verdict_of[vni] = v;
+		let r = {
+			verdict: v,
+			interval: t.plan.interval,
+			asks: length(targets(t)) ? targets(t) : t.plan.vlan ? [] : ['ff02::1'],
+			underlay: t.plan.vlan ? carrier : p == null ? null : p.ok != null && at - p.ok <= span ? true : at - p.since < span ? null : false,
+			underlay_ms: tenth(p?.rtt),
+			from: t.from,
+			rtt_ms: tenth(t.rtt),
+			answered_ago: t.answered != null ? int(at - t.answered) : null,
+			// And the MAC it holds it with: the probe's own (0186).
+			lease: t.dhcp.lease ? {
+				address: t.dhcp.lease.address, server: t.dhcp.lease.server, router: t.dhcp.lease.router,
+				expires_in: max(0, int(t.dhcp.lease.at + t.dhcp.lease.lease - at)), mac: t.src,
+			} : null,
+		};
+		if (t.plan.vlan) {
+			r.tagged = t.plan.tagged;
+			vlans['' + t.plan.vlan] = r;
+		} else
+			tunnels[vni] = r;
+	}
+	// Each network with a fallback: where it is, how each transport is doing,
+	// its last switch, and why a switch that is due cannot be made (0061).
+	let switches = {};
+	for (let id, s in sw) {
+		let x = {
+			active: s.active ?? 'none', mode: s.plan.mode,
+			primary: verdict_of[s.plan.probes.primary] ?? 'unknown', fallback: verdict_of[s.plan.probes.fallback] ?? 'unknown',
+		};
+		if (s.last)
+			x.last = s.last;
+		if (s.cannot)
+			x.cannot = s.cannot;
+		switches[id] = x;
+	}
+	let lp = map(sort(keys(loops)), k => {
+		let l = loops[k];
+		return { port: l.port, device: l.device, vni: l.vni, came_in: l.came_in, ago: int(at - l.at) };
+	});
+	// The VLANs watched on the uplink, and all the switch says of it (0064).
+	// A switch is forgotten once it has been silent longer than it said to
+	// hold what it said (its TTL), and at once when it says 0.
+	let uv = {};
+	for (let v, w in watch.vlans) {
+		let verdict = probe.watch_verdict(w, at);
+		if (verdict != w.said && w.said != null) {
+			let how = verdict == 'silent' ? note : log;
+			how('VLAN %d on the uplink: %s, was %s', w.plan.vlan, verdict, w.said);
+		}
+		w.said = verdict;
+		uv[v] = { tagged: w.plan.tagged, verdict: verdict, heard_ago: w.heard != null ? int(at - w.heard) : null };
+	}
+	for (let port in keys(watch.neighbors))
+		if (at - watch.neighbors[port].at > (watch.neighbors[port].ttl ?? 120))
+			delete watch.neighbors[port];
+	// The switch the uplink is on, as the path out hears it, or the first of
+	// the ports under it that hears one, a bond's (0096).
+	let heard = filter([watch.uplink, ...watch.lldp_ports], port => watch.neighbors[port])[0];
+	let nb = null;
+	if (heard) {
+		nb = {};
+		for (let k, v in watch.neighbors[heard])
+			if (k != 'at')
+				nb[k] = v;
+		nb.ago = int(at - watch.neighbors[heard].at);
+	}
+	// Where more than one Ethernet port is under the uplink, the switch port
+	// each is on.
+	let on = {};
+	if (length(watch.lldp_ports) > 1)
+		for (let port in sort(keys(watch.neighbors))) {
+			let l = watch.neighbors[port];
+			on[port] = { system: l.system ?? l.chassis, port: l.port, ago: int(at - l.at) };
+		}
+	let uplink = { vlans: uv, neighbor: nb, ports: on };
+	// The interfaces tunnels start from on a VLAN whose routes it put back
+	// (0063): when it last did, and whether some can't be.
+	let st = {};
+	for (let name, s in starts)
+		if (s.put_back != null || s.failing)
+			st[name] = { put_back: s.put_back, failing: s.failing };
+	// The tunnels whose device it made again (0187): when it last did.
+	let remade = {};
+	for (let name, l in lost)
+		if (l.remade != null)
+			remade[name] = l.remade;
+	// Each network that goes off the air when lost (0201): whether it is off
+	// now, since how long, why, and its interfaces taken off.
+	let off_air = {};
+	for (let id, o in offair) {
+		off_air[id] = { off: o.off, stopped: sort(keys(o.stopped)) };
+		if (o.since != null)
+			off_air[id].ago = int(at - o.since);
+		if (o.why)
+			off_air[id].why = o.why;
+	}
+	store(out, sprintf('%J\n', {
+		at: time(), tunnels: tunnels, vlans: vlans, switches: switches, loops: lp, uplink: uplink,
+		dhcp: dhcp_results(at), clients: clients_report(at), starts: st, remade: remade, radius: radius_report(at),
+		out: out_report(at), off_air: off_air,
+	}));
+}
+
+function main() {
+	signal('SIGTERM', () => exit(0));
+	signal('SIGINT', () => exit(0));
+	fs.mkdir('/var/run/aeolus');
+	// A run before this one may have taken ports off their tunnels: a restart
+	// puts them back (0059).
+	let shut = [];
+	try {
+		shut = json(read(SHUT) ?? '[]') ?? [];
+	} catch (e) {
+	}
+	if (act)
+		for (let port in shut)
+			bus.call('network.device', 'set_state', { name: port, defer: false });
+	fs.unlink(SHUT);
+	// What an earlier run took off the air goes back on (0201): a network
+	// is off the air only while a prober that runs judges it lost. A network
+	// that still goes off the air when lost keeps them as its own, so
+	// keep_off puts them back, and tries again where hostapd is not ready.
+	let before = null;
+	try {
+		before = json(fs.readfile(OFFAIR) ?? '{}');
+	} catch (e) {
+	}
+	fs.unlink(OFFAIR);
+	let p = plan(), sig = sprintf('%J', p);
+	apply_plan(p);
+	for (let id, ifs in (type(before) == 'object' ? before : {}))
+		for (let i in (type(ifs) == 'array' ? ifs : []))
+			if (!match(i, /^[A-Za-z0-9._@-]{1,15}$/))
+				continue;
+			else if (offair[id])
+				offair[id].stopped[i] = true;
+			else if (act && put_back(i))
+				log('network %s: %s on the air again, as the prober starts', id, i);
+	open_lldp();
+	dhcp_scan(now());
+	log('probing %d tunnels, guarding %d ports, watching %d VLANs on the uplink', length(keys(tun)), length(keys(guards)), length(keys(watch.vlans)));
+	let next_plan = now() + PLAN_EVERY, next_write = now(), next_attach = now(), next_collect = now();
+	// The agent sends a SIGHUP when it has applied a config, so the plan,
+	// and a network's bridge made again, are taken up at once (0061).
+	signal('SIGHUP', () => { next_plan = 0; next_attach = 0; });
+	while (true) {
+		let at = now();
+		// ucode -S runs with the garbage collector off: what refers to
+		// itself, as a function kept in what it makes does, would never be
+		// freed. It is run here, at the top of the loop, where nothing is
+		// half made, and never started with gc('start'): started, it may run
+		// inside a function filter() or map() calls and free the array being
+		// made, which then comes back null (airscan, 2026-10-16).
+		if (at >= next_collect) {
+			gc('collect');
+			next_collect = at + COLLECT_EVERY;
+		}
+		if (at >= next_plan) {
+			p = plan();
+			let s = sprintf('%J', p);
+			if (s != sig) {
+				apply_plan(p);
+				sig = s;
+				log('the plan changed: probing %d tunnels, guarding %d ports, watching %d VLANs on the uplink', length(keys(tun)), length(keys(guards)), length(keys(watch.vlans)));
+			}
+			open_lldp();
+			dhcp_scan(at);
+			radius_plan(at);
+			out_plan(at);
+			keep_routes(p.starts, at);
+			keep_tunnels(at);
+			next_plan = at + PLAN_EVERY;
+		}
+		let asked = false;
+		for (let k, r in rad)
+			if (at >= r.next) {
+				radius_ask(r, at);
+				r.next = at + RADIUS_EVERY;
+				asked = true;
+			}
+		// hostapd's own counts, as often as the servers are asked.
+		if (asked)
+			radius_counts(at);
+		// The AP's own way out (0142).
+		if (at >= wayout.next) {
+			out_ask(at);
+			wayout.next = at + OUT_EVERY;
+		}
+		for (let vni, t in tun)
+			if (at >= t.next) {
+				send_probes(t, at);
+				t.next = at + t.plan.interval;
+			}
+		for (let k, pe in peers)
+			if (at >= pe.next) {
+				ping(pe, at);
+				pe.next = at + pe.interval;
+			}
+		for (let port, g in guards)
+			if (!loops[port] && at >= g.next) {
+				send_guard(port, g, at);
+				g.next = at + GUARD_EVERY;
+			}
+		if (at >= next_attach) {
+			decide(at);
+			attach();
+			keep_off(at);
+			next_attach = at + ATTACH_EVERY;
+		}
+		if (length(watch.vlans) && !watch.sock && at >= watch.next)
+			spell_begin(at);
+		else if (watch.sock && at >= watch.until)
+			spell_end();
+		if (at >= next_write) {
+			results(at);
+			next_write = at + WRITE_EVERY;
+		}
+		// Wait for answers until the next thing is due.
+		let due = min(next_plan, next_write, length(sw) ? next_attach : next_write);
+		for (let vni, t in tun)
+			due = min(due, t.next);
+		for (let a, pe in peers)
+			due = min(due, pe.next);
+		for (let port, g in guards)
+			if (!loops[port])
+				due = min(due, g.next);
+		for (let k, r in rad)
+			due = min(due, r.next);
+		due = min(due, wayout.next);
+		if (length(watch.vlans))
+			due = min(due, watch.sock ? watch.until : watch.next);
+		let wait = max(10, min(1000, int((due - now()) * 1000)));
+		// What each socket is, by its descriptor: a tunnel, the underlay's
+		// pings, or the loop guard.
+		let by_fd = {};
+		let polls = [];
+		for (let vni in keys(tun))
+			if (tun[vni].sock) {
+				by_fd[tun[vni].sock.fileno()] = vni;
+				push(polls, [tun[vni].sock, socket.POLLIN]);
+			}
+		let by_raw = {};
+		for (let k, r in raws) {
+			by_raw[r.sock.fileno()] = k;
+			push(polls, [r.sock, socket.POLLIN]);
+		}
+		if (guard_rx)
+			push(polls, [guard_rx, socket.POLLIN]);
+		if (watch.sock)
+			push(polls, [watch.sock, socket.POLLIN]);
+		let by_lldp = {};
+		for (let port, s in watch.lldp)
+			if (s) {
+				by_lldp[s.fileno()] = port;
+				push(polls, [s, socket.POLLIN]);
+			}
+		let by_wifi = {};
+		for (let ifn, w in dw.ifaces) {
+			by_wifi[w.sock.fileno()] = ifn;
+			push(polls, [w.sock, socket.POLLIN]);
+		}
+		let by_rad = {};
+		for (let k, r in rad)
+			if (r.sock) {
+				by_rad[r.sock.fileno()] = k;
+				push(polls, [r.sock, socket.POLLIN]);
+			}
+		let by_out = {};
+		for (let k, d in wayout.dns)
+			if (d.sock) {
+				by_out[d.sock.fileno()] = k;
+				push(polls, [d.sock, socket.POLLIN]);
+			}
+		if (!length(polls)) {
+			sleep(wait);
+			continue;
+		}
+		for (let r in socket.poll(wait, ...polls) ?? []) {
+			if (!(r[1] & WAKE))
+				continue;
+			let fd = r[0].fileno();
+			if (by_fd[fd] != null) {   // "fd in by_fd" would miss: in does not make a number a key
+				let t = tun[by_fd[fd]];
+				on_tunnel(t);
+				// An error on a tunnel's socket means its device went down or
+				// went away, which unbinds the socket: it is opened again on
+				// the tunnel's next turn.
+				if (r[1] & (socket.POLLERR | socket.POLLHUP)) {
+					close(t.sock);
+					t.sock = null;
+				}
+			} else if (by_raw[fd] != null)
+				on_raw(raws[by_raw[fd]]);
+			else if (guard_rx && fd == guard_rx.fileno())
+				on_guard();
+			else if (watch.sock && fd == watch.sock.fileno())
+				on_watch(now());
+			else if (by_wifi[fd] != null && dw.ifaces[by_wifi[fd]]) {
+				let w = dw.ifaces[by_wifi[fd]];
+				on_dhcp(w, now());
+				// The interface went away: the next scan opens it again.
+				if (r[1] & (socket.POLLERR | socket.POLLHUP)) {
+					close(w.sock);
+					delete dw.ifaces[by_wifi[fd]];
+				}
+			}
+			else if (by_rad[fd] != null && rad[by_rad[fd]]) {
+				let server = rad[by_rad[fd]];
+				on_radius(server, now());
+				// Its route or address went: the socket is opened again at
+				// the next ask.
+				if (r[1] & (socket.POLLERR | socket.POLLHUP)) {
+					close(server.sock);
+					server.sock = null;
+				}
+			}
+			else if (by_out[fd] != null && wayout.dns[by_out[fd]]) {
+				let server = wayout.dns[by_out[fd]];
+				on_out(server, now());
+				// Its route or address went: the socket is opened again at
+				// the next ask.
+				if (r[1] & (socket.POLLERR | socket.POLLHUP)) {
+					close(server.sock);
+					server.sock = null;
+				}
+			}
+			else if (by_lldp[fd] != null) {
+				let port = by_lldp[fd];
+				on_lldp(port, now());
+				// The port went away or down: its socket is opened again at
+				// the next look at the plan.
+				if (r[1] & (socket.POLLERR | socket.POLLHUP)) {
+					close(watch.lldp[port]);
+					watch.lldp[port] = null;
+				}
+			}
+		}
+	}
+}
+
+main();

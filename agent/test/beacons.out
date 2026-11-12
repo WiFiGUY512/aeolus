@@ -1,0 +1,18 @@
+good: flags 0, advert { "bssid": "20:05:b6:df:64:e2", "advert": { "ap": "ap-2005b6df64e0", "address": "192.168.1.69", "port": 16730 } }
+failed: flags 64, advert null
+spoilt: flags 64, advert null
+good, flags 0x40: flags 64, advert null
+good, flags 0x50: flags 80, advert null
+good, flags 0x10: flags 16, advert { "bssid": "20:05:b6:df:64:e2", "advert": { "ap": "ap-2005b6df64e0", "address": "192.168.1.69", "port": 16730 } }
+good, flags 0x02: flags 2, advert { "bssid": "20:05:b6:df:64:e2", "advert": { "ap": "ap-2005b6df64e0", "address": "192.168.1.69", "port": 16730 } }
+failed, flags 0x00: flags 0, advert { "bssid": "a0:04:60:82:27:61", "advert": { "ap": "ap-a0046082275e", "address": "192.168.1.38", "port": 16730 } }
+flags alone: flags 64, advert null
+two present words: flags 64, advert null
+two present words, good: flags 0, advert { "bssid": "20:05:b6:df:64:e2", "advert": { "ap": "ap-2005b6df64e0", "address": "192.168.1.69", "port": 16730 } }
+three present words: flags 64, advert null
+no flags: flags null, advert { "bssid": "20:05:b6:df:64:e2", "advert": { "ap": "ap-2005b6df64e0", "address": "192.168.1.69", "port": 16730 } }
+zeros: flags null, advert { "bssid": "20:05:b6:df:64:e2", "advert": { "ap": "ap-2005b6df64e0", "address": "192.168.1.69", "port": 16730 } }
+header longer than the frame: flags null, advert null
+present words without end: flags null, advert null
+flags past the header: flags null, advert { "bssid": "20:05:b6:df:64:e2", "advert": { "ap": "ap-2005b6df64e0", "address": "192.168.1.69", "port": 16730 } }
+nothing: flags null, advert null

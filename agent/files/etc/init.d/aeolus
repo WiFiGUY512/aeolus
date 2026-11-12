@@ -1,0 +1,163 @@
+#!/bin/sh /etc/rc.common
+# The Aeolus agent (0040), its key agent (0070), its prober (0059), its
+# radio resource management (0073), its record of clients coming online
+# (0118), its steering of them (0138), the line it holds open to the
+# manager (0145) and the lending of its Bluetooth radio to Home Assistant
+# (0156). Their log: logread -e aeolus
+
+START=99
+USE_PROCD=1
+
+# The ucode modules the agent cannot start without; the package depends on
+# them (0080).
+REQUIRED="fs uci ubus uloop uclient math log digest"
+
+# loads says whether ucode module $1 loads: one installed for another ucode
+# than the image's is there and does not (2026-10-24).
+loads() { ucode -e "require('$1')" >/dev/null 2>&1; }
+
+# starts says whether the ucode program $1 can start. While a module the
+# agent needs is missing (0234), a program that imports it fails as it
+# starts, and again each five seconds as procd starts it anew, filling the
+# log until the module is back: the C-260's log of its boot was gone ten
+# minutes after a flash (2026-10-28). A program that compiles starts, as
+# steering and radio resource management do without uclient and math; the
+# others start once the boot run has the modules back (0237). With nothing
+# missing, nothing is checked.
+starts() { [ -z "$waiting" ] || ucode -c -o /dev/null "$1" >/dev/null 2>&1; }
+
+# cores lets a daemon that crashes leave a core, for the porting session to
+# read its stack (B162: the agent's ucode crashed on C360-AP, 2026-11-06,
+# and procd starts services with no core). Only where the kernel writes
+# cores to /tmp, in memory, as the port's images have it: elsewhere a core
+# would go to flash. Of ucode's, the newest three are kept.
+cores() {
+	case "$(cat /proc/sys/kernel/core_pattern 2>/dev/null)" in
+	/tmp/*) procd_set_param limits core="unlimited" ;;
+	esac
+}
+
+start_service() {
+	# Installed, the agent is inert until aeolus-setup has said where the
+	# manager is (0080).
+	[ -n "$(uci -q get aeolus.agent.url)" ] || return 0
+
+	# The newest three of ucode's cores are kept (cores, below).
+	ls -t /tmp/ucode.*.core 2>/dev/null | tail -n +4 | xargs -r rm -f
+
+	# What puts the packages back before the network after a sysupgrade
+	# (0248) runs at the start of boot: enabled here, as a fleet update
+	# brings it.
+	[ -x /etc/init.d/aeolus-early ] && [ ! -e /etc/rc.d/S11aeolus-early ] && /etc/init.d/aeolus-early enable
+
+	# After a sysupgrade the agent's files are kept (keep.d) but packages
+	# are not, and where the image lacks one of the modules the agent needs
+	# (uclient and math, on the Arista ports), it cannot start to put them
+	# back itself. This script is plain shell, so it starts that here, and
+	# that tries again until they load, since at boot the AP may have no
+	# address yet (0234). Meanwhile what cannot start is not started (0237).
+	# It lets go of this script's lock at once (0342).
+	waiting=
+	for m in $REQUIRED; do
+		[ -e /usr/lib/ucode/$m.so ] && loads $m && continue
+		waiting=$m
+		setsid /usr/libexec/aeolus-packages boot </dev/null >/dev/null 2>&1 &
+		break
+	done
+
+	if starts /usr/sbin/aeolus-agent; then
+		procd_open_instance
+		procd_set_param command /usr/sbin/aeolus-agent
+		procd_set_param respawn 3600 5 0
+		# The agent logs to syslog itself; this catches a crash.
+		procd_set_param stderr 1
+		cores
+		procd_close_instance
+
+		# The key agent keeps the AP's per-user keys (0070), apart from
+		# config.
+		procd_open_instance keys
+		procd_set_param command /usr/sbin/aeolus-agent keys
+		procd_set_param respawn 3600 5 0
+		procd_set_param stderr 1
+		cores
+		procd_close_instance
+	fi
+
+	# The prober probes the tunnels and guards tunnel ports against loops.
+	# It needs ucode's socket module; without it, the agent reports that.
+	if [ -e /usr/lib/ucode/socket.so ] && starts /usr/sbin/aeolus-prober; then
+		procd_open_instance prober
+		procd_set_param command /usr/sbin/aeolus-prober
+		procd_set_param respawn 3600 5 0
+		procd_set_param stderr 1
+		cores
+		procd_close_instance
+	fi
+
+	# Radio resource management finds the AP's radio neighbours (0073). It
+	# stays idle until Aeolus turns it on, and needs ucode's nl80211,
+	# digest and socket modules.
+	if [ -e /usr/lib/ucode/nl80211.so ] && [ -e /usr/lib/ucode/digest.so ] && [ -e /usr/lib/ucode/socket.so ] &&
+		starts /usr/sbin/aeolus-rrm; then
+		procd_open_instance rrm
+		procd_set_param command /usr/sbin/aeolus-rrm
+		procd_set_param respawn 3600 5 0
+		procd_set_param stderr 1
+		cores
+		procd_close_instance
+	fi
+
+	# The record of each Wi-Fi client coming online, step by step (0118). It
+	# needs ucode's socket module, and logread, which OpenWrt has.
+	if [ -e /usr/lib/ucode/socket.so ] && [ -x /sbin/logread ] && starts /usr/sbin/aeolus-journey; then
+		procd_open_instance journey
+		procd_set_param command /usr/sbin/aeolus-journey
+		procd_set_param respawn 3600 5 0
+		procd_set_param stderr 1
+		cores
+		procd_close_instance
+	fi
+
+	# The steering of clients (0138), a network at a time. It stays idle
+	# until Aeolus has a network steered, and hostapd never waits for it:
+	# stopped, clients join as on a network that is not steered.
+	if [ -x /usr/sbin/aeolus-steer ] && starts /usr/sbin/aeolus-steer; then
+		procd_open_instance steer
+		procd_set_param command /usr/sbin/aeolus-steer
+		procd_set_param respawn 3600 5 0
+		procd_set_param stderr 1
+		cores
+		procd_close_instance
+	fi
+
+	# The line the AP holds open to the manager (0145): on it the AP hears
+	# at once what would wait for its poll, and says what it sees of a
+	# client that is traced (0144) as it sees it. It needs ucode's socket
+	# and uclient modules: uclient is missing after a sysupgrade onto an
+	# image without it until the agent has put it back, and restarted this.
+	# Nothing rests on it: stopped, the AP is told at its poll.
+	if [ -x /usr/sbin/aeolus-live ] && loads socket && loads uclient && starts /usr/sbin/aeolus-live; then
+		procd_open_instance live
+		procd_set_param command /usr/sbin/aeolus-live
+		procd_set_param respawn 3600 5 0
+		procd_set_param stderr 1
+		cores
+		procd_close_instance
+	fi
+
+	# The AP's Bluetooth radio, lent to Home Assistant (0156). It stays
+	# idle until Aeolus turns it on. It needs ucode's socket module, and
+	# BlueZ's hcitool and hcidump, or btmon where BlueZ has no hcidump
+	# (5.87, 0281), which an AP with such a radio has.
+	if [ -x /usr/sbin/aeolus-ble ] && [ -e /usr/lib/ucode/socket.so ] && [ -x /usr/bin/hcitool ] &&
+		{ [ -x /usr/bin/hcidump ] || [ -x /usr/bin/btmon ]; } &&
+		starts /usr/sbin/aeolus-ble; then
+		procd_open_instance ble
+		procd_set_param command /usr/sbin/aeolus-ble
+		procd_set_param respawn 3600 5 0
+		procd_set_param stderr 1
+		cores
+		procd_close_instance
+	fi
+}

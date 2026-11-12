@@ -1,0 +1,2316 @@
+package api
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"net"
+	"net/http"
+	"regexp"
+	"slices"
+	"strconv"
+	"strings"
+	"time"
+	"unicode/utf8"
+
+	"github.com/WiFiGUY512/aeolus/internal/access"
+	"github.com/WiFiGUY512/aeolus/internal/change"
+	"github.com/WiFiGUY512/aeolus/internal/compose"
+	"github.com/WiFiGUY512/aeolus/internal/conditions"
+	"github.com/WiFiGUY512/aeolus/internal/hierarchy"
+	"github.com/WiFiGUY512/aeolus/internal/identify"
+	"github.com/WiFiGUY512/aeolus/internal/oui"
+	"github.com/WiFiGUY512/aeolus/internal/rendercheck"
+	"github.com/WiFiGUY512/aeolus/internal/uci"
+)
+
+// The render check and the reports (0039).
+
+const (
+	maxUCI    = 256 << 10
+	maxReport = 512 << 10 // room for 256 clients (0066, 0067)
+	maxError  = 2048
+)
+
+var (
+	hashRE      = regexp.MustCompile(`^[0-9a-f]{64}$`)
+	networkIDRE = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,31}$`)
+	portNameRE  = regexp.MustCompile(`^[a-z][a-z0-9._-]{0,15}$`) // as the schema names ports
+	speedRE     = regexp.MustCompile(`^([0-9]{1,6}[FH])?$`)
+	// deviceRE is a Linux device's name, as the loop guard reports one (0059).
+	deviceRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._@-]{0,14}$`)
+	// netifdNameRE is an interface's name as netifd has it (lan, vlan20,
+	// aeolus_home_wi_fi_iot), which a device's 15 characters do not bound.
+	netifdNameRE = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$`)
+	// ifaceNameRE is a netifd interface's name, a UCI section's.
+	ifaceNameRE = regexp.MustCompile(`^[A-Za-z0-9_]{1,64}$`)
+	// macRE is a MAC as Linux writes one; hexRE, bytes as the prober writes
+	// what it doesn't know of the switch's LLDP, at most 64 of them (0064).
+	macRE = regexp.MustCompile(`^[0-9a-f]{2}(:[0-9a-f]{2}){5}$`)
+	hexRE = regexp.MustCompile(`^([0-9a-f]{2}){0,64}$`)
+)
+
+// secretOptions are the UCI options that hold keys and passwords (0041).
+var secretOptions = map[string]bool{
+	"key": true, "sae_password": true, "password": true,
+	"auth_secret": true, "acct_secret": true, "radius_das_secret": true, "private_key": true, "preshared_key": true,
+	"community": true, "auth_pass": true, "privacy_pass": true,
+}
+
+// secretsIn lists the secret values in a composed config (0027), so a kept
+// copy of rendered UCI can blank them wherever they appear (0041).
+func (s *Server) secretsIn(doc map[string]any) []string {
+	var out []string
+	var walk func(v any, path string)
+	walk = func(v any, path string) {
+		switch x := v.(type) {
+		case map[string]any:
+			for k, e := range x {
+				if path == "" {
+					walk(e, k)
+				} else {
+					walk(e, path+"."+k)
+				}
+			}
+		case string:
+			if f, err := s.schema.Field(hierarchy.Path(path)); err == nil && f.Secret {
+				out = append(out, x)
+			}
+		}
+	}
+	walk(doc, "")
+	return out
+}
+
+// unadopted refuses a check or report from an AP in Landing Zone: it has no
+// config, and nobody has vouched for it yet (0039). Nothing is recorded.
+func unadopted(state *change.State, ap hierarchy.NodeID) error {
+	if state.Org.Locations.InIsolated(ap) {
+		return &apiError{http.StatusConflict, "this AP is in Landing Zone: it has nothing to check or report until a person adopts it"}
+	}
+	return nil
+}
+
+// render checks the UCI an AP rendered before it applies it (0008, 0039).
+// The UCI itself is not kept, since it carries passphrases in plain text;
+// its hash is.
+func (s *Server) render(w http.ResponseWriter, r *http.Request, c apCall) error {
+	r.Body = http.MaxBytesReader(w, r.Body, maxUCI+4096)
+	var req struct {
+		Version int64  `json:"version"`
+		UCI     string `json:"uci"`
+	}
+	if err := readJSON(r, &req); err != nil {
+		return err
+	}
+	sum := sha256.Sum256([]byte(req.UCI))
+	hash := hex.EncodeToString(sum[:])
+
+	// The version is read on both sides of the snapshot: if a change landed
+	// in between, the state may not be the one the AP rendered.
+	current, _ := s.log.Version(c.ap)
+	state := s.log.Snapshot()
+	after, _ := s.log.Version(c.ap)
+	if err := unadopted(state, c.ap); err != nil {
+		return err
+	}
+	check := conditions.Check{Version: req.Version, Hash: hash}
+	switch {
+	case req.Version != after || after != current:
+		check.Result = conditions.Stale
+		check.Problems = []string{fmt.Sprintf("version %d is not current (%d): poll again", req.Version, after)}
+	default:
+		res, err := s.compose(state, c.ap, s.reveal)
+		if err != nil {
+			return err
+		}
+		// Kept for the record, secrets blanked (0041). A stale render is
+		// not kept: it will never run.
+		check.UCI = uci.Redact(req.UCI, secretOptions, s.secretsIn(res.Doc))
+		switch parsed, err := uci.Parse(req.UCI); {
+		case len(res.Problems) > 0:
+			check.Result, check.Problems = conditions.Refused, append([]string{"the config itself is held (0029)"}, res.Problems...)
+		case err != nil:
+			check.Result, check.Problems = conditions.Refused, []string{"the UCI does not parse: " + err.Error()}
+		default:
+			// A test network is checked for only while it is on (0179), as
+			// the AP renders it.
+			check.Problems = rendercheck.CheckAP(compose.Live(res.Doc, time.Now()), parsed, string(c.ap))
+			check.Result = conditions.OK
+			if len(check.Problems) > 0 {
+				check.Result = conditions.Refused
+			}
+		}
+	}
+	if check.Problems == nil {
+		check.Problems = []string{}
+	}
+	if err := s.conds.RecordCheck(c.ap, check); err != nil {
+		return err
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"result": check.Result, "problems": check.Problems, "version": after, "hash": hash})
+	return nil
+}
+
+// applied records an apply attempt, and whether an ok check covered it.
+func (s *Server) applied(w http.ResponseWriter, r *http.Request, c apCall) error {
+	r.Body = http.MaxBytesReader(w, r.Body, maxReport)
+	var req struct {
+		Version int64  `json:"version"`
+		Hash    string `json:"hash"`
+		OK      bool   `json:"ok"`
+		Error   string `json:"error"`
+	}
+	if err := readJSON(r, &req); err != nil {
+		return err
+	}
+	if !hashRE.MatchString(req.Hash) {
+		return badRequest("hash must be the SHA-256 of the UCI, as 64 lowercase hex digits")
+	}
+	if len(req.Error) > maxError {
+		return badRequest("error is longer than %d characters", maxError)
+	}
+	if err := unadopted(s.log.Snapshot(), c.ap); err != nil {
+		return err
+	}
+	a, err := s.conds.RecordApply(c.ap, conditions.Apply{Version: req.Version, Hash: req.Hash, OK: req.OK, Error: req.Error})
+	if err != nil {
+		return err
+	}
+	if !a.Checked {
+		slog.Warn("AP applied UCI that no ok check covers", "ap", c.ap, "version", req.Version, "hash", req.Hash)
+	}
+	if req.OK {
+		if err := s.conds.Running(c.ap, req.Version); err != nil {
+			return err
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"recorded": true, "checked": a.Checked})
+	return nil
+}
+
+// stateReport is what an AP reports about itself periodically (0039).
+type stateReport struct {
+	Version int64        `json:"version"`
+	Uptime  int64        `json:"uptime"`
+	OpenWrt string       `json:"openwrt,omitempty"`
+	Radios  []radioState `json:"radios,omitempty"`
+	// Its own BSSIDs, which another AP hearing them should not take for a
+	// stranger's (0105).
+	BSSIDs     []string                  `json:"bssids,omitempty"`
+	Transports map[string]transportState `json:"transports,omitempty"`
+	Steering   *steeringState            `json:"steering,omitempty"`
+	Ports      []portState               `json:"ports,omitempty"`
+	VXLAN      *vxlanState               `json:"vxlan,omitempty"`
+	VLANProbes []vlanProbe               `json:"vlan_probes,omitempty"`
+	// The networks that go off the air while they cannot reach their way
+	// on (0201), by ID.
+	OffAir map[string]offAirState `json:"off_air,omitempty"`
+	// The VLANs the AP watches on its uplink, and the switch it is on (0064).
+	UplinkVLANs    []uplinkVLAN    `json:"uplink_vlans,omitempty"`
+	UplinkNeighbor *uplinkNeighbor `json:"uplink_neighbor,omitempty"`
+	UplinkPort     *uplinkPort     `json:"uplink_port,omitempty"`
+	// Its addresses on networks its own Wi-Fi serves (0209).
+	OnAir []onAirState `json:"on_air,omitempty"`
+	// What the AP saw of its Wi-Fi clients' DHCP, by network (0065).
+	DHCP map[string]dhcpState `json:"dhcp,omitempty"`
+	// Every Wi-Fi client on the AP (0066).
+	Clients []wifiClient `json:"clients,omitempty"`
+	// Its own Wi-Fi networks, set on the AP and not by Aeolus (0137).
+	Others []otherNetwork `json:"others,omitempty"`
+	// What its steering asked of clients, and what came of it (0138).
+	Steer *steerState `json:"steer,omitempty"`
+	// The RADIUS servers its networks sign clients in against (0114).
+	Radius []radiusState `json:"radius,omitempty"`
+	// Its own way out: its gateway, its name servers, the internet and the
+	// manager, each with how long it took to answer (0142).
+	Path *pathState `json:"path,omitempty"`
+	// How the AP itself is doing: processor, memory, storage, heat (0119).
+	Health *apHealth `json:"health,omitempty"`
+	// Its scan radio, where it has one (0126).
+	ScanRadio *scanRadioState `json:"scan_radio,omitempty"`
+	// Its radios whose firmware crashed, while its log holds it (0310).
+	FWCrashes []fwCrash `json:"fw_crashes,omitempty"`
+	// The libraries a process holds two builds of at once (0317).
+	MixedLibs []mixedLib `json:"mixed_libs,omitempty"`
+	// Its Bluetooth radio, where it is lent to Home Assistant (0156).
+	BLE *bleState `json:"ble,omitempty"`
+	// What its Bluetooth radio hears, device by device (0157).
+	BLEDevices *bleDevices `json:"ble_devices,omitempty"`
+	// Whether its agent can make a client test over the wire (0128).
+	WireTests bool `json:"wire_tests,omitempty"`
+	// Its clock (0069).
+	Time *timeState `json:"time,omitempty"`
+	// The per-user keys it has (0070): their version, and how many.
+	Keys *keysState `json:"keys,omitempty"`
+	// Each BSS of a network with 802.11r it runs, a key holder (0224).
+	FT []ftBSS `json:"ft,omitempty"`
+	// What its radio resource management found (0073).
+	RRM *rrmState `json:"rrm,omitempty"`
+	// What its scan radio found of other APs, and their clients (0160).
+	Airscan *airscanState `json:"airscan,omitempty"`
+	// The agent it runs, and its last update (0079).
+	Agent *agentState `json:"agent,omitempty"`
+	// netifd's network.wireless object is gone: the radios run, but the
+	// agent, its prober and RRM see none of them, nor their clients, until
+	// the network restarts on the AP (2026-10-06).
+	WirelessMissing bool `json:"wireless_missing,omitempty"`
+}
+
+// rrmState is what the AP's radio resource management found (0073): its
+// management address, where its neighbours reach it; the bands its beacons
+// say it is an Aeolus AP on; the other Aeolus APs it hears in the air or
+// keeps neighbours with over the wire; how it rates each channel; its last
+// moves; the radios its power control holds (0077); and the radios that
+// can't scan, whose ratings age.
+type rrmState struct {
+	Address    string         `json:"address"`
+	Advertised []string       `json:"advertised"`
+	Neighbours []rrmNeighbour `json:"neighbours"`
+	Ratings    []rrmRating    `json:"ratings"`
+	Moves      []rrmMove      `json:"moves"`
+	APC        []rrmPower     `json:"apc,omitempty"`
+	APCEvents  []apcEvent     `json:"apc_events,omitempty"`
+	CannotScan []rrmDeaf      `json:"cannot_scan,omitempty"`
+	Others     []rrmOther     `json:"others,omitempty"`
+	// How it listens (0173): scan-radio, through the scan radio in
+	// service, or serving, by the serving radios; and whether the AP has a
+	// scan radio out of service. An older agent leaves them out.
+	Listens string `json:"listens,omitempty"`
+	ScanOut bool   `json:"scan_out,omitempty"`
+	// Plans are the moves it would make, each waiting for its reason to
+	// hold, and for the window (0338). An older agent leaves them out.
+	Plans []rrmPlan `json:"plans,omitempty"`
+	// Up is how many seconds RRM has run (0338): started afresh, it has
+	// forgotten its neighbours, its deaf radios and its plans, and
+	// finds them again. An older agent leaves it out.
+	Up *int64 `json:"up,omitempty"`
+}
+
+// rrmPlan is a move a radio would make (0338): its band, the channel it is
+// on and the one it would go to, why, whether it costs a radar check (or
+// widens), and how many seconds its reason has held.
+type rrmPlan struct {
+	Band  string `json:"band"`
+	From  int    `json:"from"`
+	To    int    `json:"to"`
+	Why   string `json:"why"`
+	Radar bool   `json:"radar,omitempty"`
+	Ago   int64  `json:"ago"`
+}
+
+// rrmOther is a network heard in a scan that carries no Aeolus advert
+// (0105): its BSSID and SSID, band, channel and signal, and seconds since.
+type rrmOther struct {
+	BSSID   string  `json:"bssid"`
+	SSID    string  `json:"ssid"`
+	Band    string  `json:"band"`
+	Channel int     `json:"channel"`
+	Signal  float64 `json:"signal"`
+	Ago     int64   `json:"ago"`
+}
+
+// rrmDeaf is a radio that can't scan (2026-10-06): its band and channel;
+// why, dfs (on a channel shared with radar, Linux keeps an AP there
+// listening and refuses every scan) or refused (every scan refused
+// otherwise); and for how many seconds. Where the AP looks before it uses a
+// DFS channel (0120), home is the channel the radio steps off to when its
+// own grows worse.
+type rrmDeaf struct {
+	Band    string `json:"band"`
+	Channel int    `json:"channel"`
+	Why     string `json:"why"`
+	Ago     int64  `json:"ago"`
+	Home    int    `json:"home,omitempty"`
+}
+
+// rrmPower is a radio whose power the AP's power control holds (0077): the
+// power it holds it at and the most it may, in dBm, none where it couldn't;
+// how many neighbours it looks for, and its target; how many of them hear
+// it, and the weakest of them, as of its last look; its last step, in dB;
+// why: new (just taken over), looking (fewer neighbours hear it than it
+// looks for), below (the weakest hears it below the target), ceiling (it
+// would go up, but is at its most), target (they hear it at the target),
+// above (all hear it well above), floor (it would go down, but is at its
+// least) or failed (its power couldn't be read or set); and seconds since
+// its power last moved.
+type rrmPower struct {
+	Radio   string `json:"radio"`
+	Band    string `json:"band"`
+	Power   *int   `json:"power"`
+	Ceiling *int   `json:"ceiling"`
+	Wanted  int    `json:"wanted"`
+	Target  int    `json:"target"`
+	Count   *int   `json:"count"`
+	Weakest *int   `json:"weakest"`
+	Step    int    `json:"step"`
+	Why     string `json:"why"`
+	Ago     *int64 `json:"ago"`
+	// Its clients (0206): what power control does for them (guard, ignore
+	// or ask), the threshold a lonely client should hear the AP at, the
+	// floor its lonely clients set, a step back still held, its lonely
+	// clients the loneliest first, and its clients' last distress.
+	Clients     string       `json:"clients,omitempty"`
+	ClientFloor *int         `json:"client_floor,omitempty"`
+	Floor       *int         `json:"floor,omitempty"`
+	Hold        *apcHold     `json:"hold,omitempty"`
+	Lonely      []apcLonely  `json:"lonely,omitempty"`
+	Distress    *apcDistress `json:"distress,omitempty"`
+}
+
+// apcHold is a radio held up after its clients took a step down badly
+// (0206): at what power, and for how many seconds more.
+type apcHold struct {
+	Power int   `json:"power"`
+	Left  int64 `json:"left"`
+}
+
+// apcLonely is a client no other AP hears better (0206): its signal as the
+// AP hears it, what it hears of the AP at the AP's power (est), the power it
+// needs to hear it at the threshold, and the best another AP hears it, if
+// any does.
+type apcLonely struct {
+	MAC    string `json:"mac"`
+	Signal int    `json:"signal"`
+	Est    int    `json:"est"`
+	Need   int    `json:"need"`
+	Other  *int   `json:"other"`
+	// Measured says est is what the client said it hears (802.11k), and
+	// not reckoned from how the AP hears it.
+	Measured bool `json:"measured,omitempty"`
+}
+
+// apcDistress is a radio's clients taking a step down badly (0206): when,
+// why (scanning, leaving or retries), how many scanned, how many left or
+// came back, the share of what was sent to them that was tried again or
+// lost before and after, and whether the radio stepped back.
+type apcDistress struct {
+	At       int64      `json:"at"`
+	Why      string     `json:"why"`
+	Scanning int        `json:"scanning"`
+	Left     int        `json:"left"`
+	Ratio    []*float64 `json:"ratio"`
+	Acted    bool       `json:"acted"`
+	// After is how many seconds after the step it was seen (0207): from
+	// two minutes on, every minute, to ten.
+	After *int `json:"after,omitempty"`
+}
+
+// apcEvent is one of power control's steps (0206): when, the band, from
+// and to in dBm, why, and what the clients did where they had a say.
+type apcEvent struct {
+	At       int64      `json:"at"`
+	Band     string     `json:"band"`
+	From     *int       `json:"from"`
+	To       *int       `json:"to"`
+	Why      string     `json:"why"`
+	Scanning *int       `json:"scanning"`
+	Left     *int       `json:"left"`
+	Ratio    []*float64 `json:"ratio"`
+}
+
+// rrmMove is one of the AP's moves (0073): a radio's band, the channel it
+// was on and the one it went for; why: start, shared, better,
+// interference, or radar (found on its channel, so hostapd moved it, 0120);
+// what came of it: announced (claimed in its hellos, not yet made),
+// checking (listening for radar on a DFS channel before it sends there,
+// 0120), moved, yielded (to AP's claim), withdrawn or failed; and when it
+// came to that, in Unix seconds. Clients is what came of a move made for
+// the clients its radio had (0265).
+type rrmMove struct {
+	Band    string       `json:"band"`
+	From    int          `json:"from"`
+	To      int          `json:"to"`
+	Why     string       `json:"why"`
+	State   string       `json:"state"`
+	At      int64        `json:"at"`
+	AP      string       `json:"ap,omitempty"`
+	Clients *moveClients `json:"clients,omitempty"`
+}
+
+// moveClients is what came of a move for the clients a radio had when it
+// moved (0265), two minutes after it was made: how many it had, how many
+// were on it still on their own association (followed), on it again on a
+// new one, and gone.
+type moveClients struct {
+	Clients int `json:"clients"`
+	Kept    int `json:"kept"`
+	Back    int `json:"back"`
+	Gone    int `json:"gone"`
+}
+
+func (c *moveClients) ok() bool {
+	return c == nil || (c.Kept >= 0 && c.Back >= 0 && c.Gone >= 0 && c.Clients <= 4096 && c.Kept+c.Back+c.Gone == c.Clients)
+}
+
+// rrmRating is one channel as the AP rates it (0073), lower being better:
+// its lasting rating, earned over many visits, and its rating now; how busy
+// others kept it on the last visit, in percent; its noise floor, where the
+// driver says; how many other networks were heard there; how many visits it
+// has had, and seconds since the last; whether one of the AP's radios is
+// on it; the neighbours using it, which blot it out; and whether it is the
+// AP's best on its band: the best rated no neighbour uses, or where
+// neighbours use them all, the one whose nearest user is furthest away.
+// Energy is the share of the scan radio's last spectral sweep that held
+// energy there at or above the preamble level, in percent, where it swept
+// (0245): busy is the busier of it and the survey. Floor is the channel's
+// noise floor in dBm, the sweep's level set against the radio's own on its
+// channel (0247), where both were read.
+type rrmRating struct {
+	Band      string   `json:"band"`
+	Channel   int      `json:"channel"`
+	Cost      int      `json:"cost"`
+	Now       int      `json:"now"`
+	Busy      int      `json:"busy"`
+	Energy    *int     `json:"energy,omitempty"`
+	Floor     *int     `json:"floor,omitempty"`
+	Noise     *int     `json:"noise"`
+	Networks  int      `json:"networks"`
+	Visits    int      `json:"visits"`
+	Ago       int64    `json:"ago"`
+	Own       bool     `json:"own"`
+	BlottedBy []string `json:"blotted_by"`
+	Best      bool     `json:"best"`
+	// Stale: not visited for half an hour, and remembered (0332): what the
+	// AP last knew of the channel, which RRM does not move by.
+	Stale bool `json:"stale,omitempty"`
+}
+
+// rrmNeighbour is one other Aeolus AP: its ID and management address; up
+// when hellos go both ways, one-way when its hellos come but don't list this
+// AP, heard when it is only heard in the air, down when its hellos stopped;
+// whether it is among the three this AP hears most strongly on a band;
+// seconds since its last hello; and on each band, how strongly each hears
+// the other, and its channel and width there, as its hellos say; and its
+// radio's BSSID there and how busy it is (0207).
+type rrmNeighbour struct {
+	AP       string    `json:"ap"`
+	Address  string    `json:"address"`
+	State    string    `json:"state"`
+	Chosen   bool      `json:"chosen"`
+	HelloAgo *int64    `json:"hello_ago"`
+	Bands    []rrmBand `json:"bands"`
+}
+
+type rrmBand struct {
+	Band        string   `json:"band"`
+	Signal      *int     `json:"signal"`
+	TheirSignal *int     `json:"their_signal"`
+	Channel     *int     `json:"channel"`
+	Width       *int     `json:"width"`
+	BSSID       *string  `json:"bssid"`
+	Load        *rrmLoad `json:"load"`
+}
+
+// rrmLoad is how busy a neighbour's radio is (0207), as its hellos say, of
+// its last minute: its channel, in percent; its clients; and the share of
+// what was sent to them that was tried again or lost.
+type rrmLoad struct {
+	Busy    *float64 `json:"busy"`
+	Clients *float64 `json:"clients"`
+	Retried *float64 `json:"retried"`
+}
+
+// ok says whether a load is well said.
+func (l *rrmLoad) ok() bool {
+	return l == nil || (within(l.Busy, 0, 100) && within(l.Clients, 0, 1024) && within(l.Retried, 0, 1))
+}
+
+var (
+	apIDRE    = regexp.MustCompile(`^ap-[0-9a-f]{12}$`)
+	rrmStates = map[string]bool{"up": true, "one-way": true, "heard": true, "down": true}
+	rrmWhys   = map[string]bool{"start": true, "shared": true, "better": true, "interference": true, "radar": true, "own": true, "wide": true}
+	rrmEnds   = map[string]bool{"announced": true, "checking": true, "moved": true, "yielded": true, "withdrawn": true, "failed": true}
+	rrmWidths = map[int]bool{0: true, 20: true, 40: true, 80: true, 160: true, 320: true}
+	apcWhys   = map[string]bool{"new": true, "looking": true, "below": true, "ceiling": true, "target": true, "above": true, "floor": true, "failed": true,
+		// For its clients (0206): up to a lonely client's floor, held after
+		// they took a step badly, stepped back for that, or seen to.
+		"guard": true, "hold": true, "distress": true, "distress-seen": true}
+	apcModes    = map[string]bool{"": true, "ask": true, "guard": true, "ignore": true}
+	distressWhy = map[string]bool{"scanning": true, "leaving": true, "retries": true}
+	radioRE     = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,32}$`)
+)
+
+func (r *rrmState) check() error {
+	if r == nil {
+		return nil
+	}
+	bad := badRequest("rrm: an address, at most 3 bands, and at most 64 neighbours, each an AP ID with its address, state, and on each band a signal from -127 to 0 dBm, a channel and a width")
+	if (r.Address != "" && net.ParseIP(r.Address) == nil) || len(r.Advertised) > 3 || len(r.Neighbours) > 64 || len(r.Ratings) > 64 {
+		return bad
+	}
+	for _, rt := range r.Ratings {
+		if !bands[rt.Band] || rt.Channel < 1 || rt.Channel > 233 || rt.Cost < 0 || rt.Cost > 100000 || rt.Now < 0 || rt.Now > 100000 ||
+			rt.Busy < 0 || rt.Busy > 100 || (rt.Energy != nil && (*rt.Energy < 0 || *rt.Energy > 100)) || !dbm(rt.Noise) || !dbm(rt.Floor) || rt.Networks < 0 || rt.Networks > 1000 || rt.Visits < 0 || rt.Ago < 0 ||
+			len(rt.BlottedBy) > 8 {
+			return badRequest("rrm: a rating is a band, a channel from 1 to 233, costs from 0, busy and energy from 0 to 100, a noise floor and a floor in dBm, counts from 0, and at most 8 APs blotting it out")
+		}
+		for _, ap := range rt.BlottedBy {
+			if !apIDRE.MatchString(ap) {
+				return bad
+			}
+		}
+	}
+	if len(r.Moves) > 16 {
+		return bad
+	}
+	for _, m := range r.Moves {
+		if !bands[m.Band] || m.From < 0 || m.From > 233 || m.To < 1 || m.To > 233 || !rrmWhys[m.Why] || !rrmEnds[m.State] || m.At < 0 ||
+			(m.AP != "" && !apIDRE.MatchString(m.AP)) || !m.Clients.ok() {
+			return badRequest("rrm: at most 16 moves, each a band, the channels from and to, why (start, shared, better, interference or radar), what came of it (announced, checking, moved, yielded, withdrawn or failed), when, the AP it yielded to, and its clients: up to 4096, as many as followed, joined again and are gone")
+		}
+	}
+	for _, b := range r.Advertised {
+		if !bands[b] {
+			return bad
+		}
+	}
+	if r.Listens != "" && r.Listens != "scan-radio" && r.Listens != "serving" {
+		return badRequest("rrm listens through the scan radio or the serving ones")
+	}
+	if len(r.APC) > 4 || len(r.CannotScan) > 4 {
+		return bad
+	}
+	if r.Up != nil && *r.Up < 0 {
+		return badRequest("rrm: up is seconds, not negative")
+	}
+	if len(r.Plans) > 12 {
+		return badRequest("rrm: at most 12 plans")
+	}
+	for _, p := range r.Plans {
+		if !bands[p.Band] || p.From < 1 || p.From > 233 || p.To < 1 || p.To > 233 || !rrmWhys[p.Why] || p.Ago < 0 {
+			return badRequest("rrm: a plan is a band, the channels from and to, why, and seconds since, not negative")
+		}
+	}
+	if len(r.Others) > 64 {
+		return badRequest("rrm: at most 64 other networks")
+	}
+	for _, o := range r.Others {
+		if !macRE.MatchString(o.BSSID) || o.SSID == "" || len(o.SSID) > 32 || !printable(o.SSID) || !bands[o.Band] ||
+			o.Channel < 1 || o.Channel > 233 || o.Signal < -127 || o.Signal > 0 || o.Ago < 0 {
+			return badRequest("rrm: another network is a BSSID, a printable SSID of at most 32 characters, a band, a channel from 1 to 233, a signal in dBm and seconds since")
+		}
+	}
+	for _, d := range r.CannotScan {
+		if !bands[d.Band] || d.Channel < 1 || d.Channel > 233 || (d.Why != "dfs" && d.Why != "refused") || d.Ago < 0 || d.Home < 0 || d.Home > 233 {
+			return badRequest("rrm: a radio that can't scan is a band, a channel from 1 to 233, why (dfs or refused), seconds since, and the channel it steps off to, if any")
+		}
+	}
+	for _, p := range r.APC {
+		if !radioRE.MatchString(p.Radio) || !bands[p.Band] || !power(p.Power) || !power(p.Ceiling) || p.Wanted < 1 || p.Wanted > 6 ||
+			p.Target < -85 || p.Target > -50 || (p.Count != nil && (*p.Count < 0 || *p.Count > 6)) || !dbm(p.Weakest) ||
+			p.Step < -40 || p.Step > 40 || !apcWhys[p.Why] || (p.Ago != nil && *p.Ago < 0) {
+			return badRequest("rrm: at most 4 radios under power control, each a radio and band, its power and ceiling from 0 to 40 dBm, 1 to 6 neighbours looked for, a target from -85 to -50 dBm, how many hear it, the weakest in dBm, its last step in dB, and why")
+		}
+		if err := p.checkClients(); err != nil {
+			return err
+		}
+	}
+	if len(r.APCEvents) > 40 {
+		return badRequest("rrm: at most 40 of power control's steps")
+	}
+	for _, e := range r.APCEvents {
+		if !e.ok() {
+			return badRequest("rrm: a step of power control is when, a band, from and to in dBm, why, and what its clients did")
+		}
+	}
+	for _, n := range r.Neighbours {
+		if !apIDRE.MatchString(n.AP) || (n.Address != "" && net.ParseIP(n.Address) == nil) || !rrmStates[n.State] ||
+			(n.HelloAgo != nil && *n.HelloAgo < 0) || len(n.Bands) > 3 {
+			return bad
+		}
+		for _, b := range n.Bands {
+			if !bands[b.Band] || !dbm(b.Signal) || !dbm(b.TheirSignal) ||
+				(b.Channel != nil && (*b.Channel < 0 || *b.Channel > 233)) || (b.Width != nil && !rrmWidths[*b.Width]) ||
+				(b.BSSID != nil && !macRE.MatchString(*b.BSSID)) || !b.Load.ok() {
+				return bad
+			}
+		}
+	}
+	return nil
+}
+
+// checkClients checks what a radio under power control says of its
+// clients (0206).
+func (p rrmPower) checkClients() error {
+	bad := badRequest("rrm: what power control says of a radio's clients is guard, ignore or ask, a threshold from -95 to -60 dBm, a floor and a power held from 0 to 40 dBm, at most 8 lonely clients, and its clients' last distress")
+	if !apcModes[p.Clients] || (p.ClientFloor != nil && (*p.ClientFloor < -95 || *p.ClientFloor > -60)) || !power(p.Floor) ||
+		(p.Hold != nil && (p.Hold.Power < 0 || p.Hold.Power > 40 || p.Hold.Left < 0)) || len(p.Lonely) > 8 {
+		return bad
+	}
+	for _, c := range p.Lonely {
+		if !macRE.MatchString(c.MAC) || c.Signal < -127 || c.Signal > 0 || c.Est < -200 || c.Est > 40 || c.Need < -100 || c.Need > 200 || !dbm(c.Other) {
+			return bad
+		}
+	}
+	if d := p.Distress; d != nil && (d.At <= 0 || !distressWhy[d.Why] || d.Scanning < 0 || d.Scanning > 256 || d.Left < 0 || d.Left > 4096 || !ratios(d.Ratio) ||
+		(d.After != nil && (*d.After < 0 || *d.After > 3600))) {
+		return bad
+	}
+	return nil
+}
+
+// ratios is a share before and after, each from 0 to 1, or none.
+func ratios(r []*float64) bool {
+	if len(r) > 2 {
+		return false
+	}
+	for _, v := range r {
+		if v != nil && (*v < 0 || *v > 1) {
+			return false
+		}
+	}
+	return true
+}
+
+func dbm(v *int) bool {
+	return v == nil || (*v >= -127 && *v <= 0)
+}
+
+func power(v *int) bool {
+	return v == nil || (*v >= 0 && *v <= 40)
+}
+
+type keysState struct {
+	Version string `json:"version"`
+	Count   int    `json:"count"`
+}
+
+var keysVersionRE = regexp.MustCompile(`^[0-9a-f]{0,64}$`)
+
+func (k *keysState) check() error {
+	if k != nil && (!keysVersionRE.MatchString(k.Version) || k.Count < 0 || k.Count > 1<<20) {
+		return badRequest("keys: version is hex, count 0 or more")
+	}
+	return nil
+}
+
+// timeState is whether the AP's clock is synchronized, as ntpd last said
+// (0069): null until it has said; its stratum and offset in seconds; seconds
+// since it said so; and the time servers ntpd was started with. Zone and
+// Rule are its clock's zone (0262): UCI's name, and the POSIX rule in
+// effect, null where the agent is older.
+type timeState struct {
+	Synced  *bool    `json:"synced"`
+	Stratum *int     `json:"stratum"`
+	Offset  *float64 `json:"offset"`
+	Ago     *int64   `json:"ago"`
+	Servers []string `json:"servers"`
+	Zone    *string  `json:"zone"`
+	Rule    *string  `json:"rule"`
+}
+
+func (t *timeState) check() error {
+	if t == nil {
+		return nil
+	}
+	if (t.Stratum != nil && (*t.Stratum < 0 || *t.Stratum > 16)) || (t.Ago != nil && *t.Ago < 0) || len(t.Servers) > 8 {
+		return badRequest("time: stratum is 0 to 16, ago cannot be negative, at most 8 servers")
+	}
+	for _, sv := range t.Servers {
+		if err := plainText("time server", sv, 253); err != nil {
+			return err
+		}
+	}
+	if t.Zone != nil {
+		if err := plainText("time zone", *t.Zone, 64); err != nil {
+			return err
+		}
+	}
+	if t.Rule != nil {
+		if err := plainText("time rule", *t.Rule, 128); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// wifiClient is one Wi-Fi client on an AP (0066), as nl80211 and the DHCP
+// watch saw it: its MAC; its network (Aeolus's, or none for the AP's own),
+// SSID and band; its signal and average; its rates each way, in Mbit/s, with
+// MCS and streams; its data, packets, retries and failures; how long it has
+// been connected, and since it was last heard; and on Aeolus's networks the
+// address it uses, the host name it gave, and how it does with DHCP. Its
+// retries are null where the AP's radio counted none for it: an ath11k
+// radio counts them only for a client that joined while its extended tx
+// stats were on (0164).
+type wifiClient struct {
+	MAC        string   `json:"mac"`
+	Network    string   `json:"network"`
+	SSID       string   `json:"ssid"`
+	Band       string   `json:"band"`
+	Signal     *int     `json:"signal"`
+	SignalAvg  *int     `json:"signal_avg"`
+	RxRate     *float64 `json:"rx_rate"`
+	RxMCS      *int     `json:"rx_mcs"`
+	RxNSS      *int     `json:"rx_nss"`
+	TxRate     *float64 `json:"tx_rate"`
+	TxMCS      *int     `json:"tx_mcs"`
+	TxNSS      *int     `json:"tx_nss"`
+	RxBytes    int64    `json:"rx_bytes"`
+	TxBytes    int64    `json:"tx_bytes"`
+	RxPackets  int64    `json:"rx_packets"`
+	TxPackets  int64    `json:"tx_packets"`
+	TxRetries  *int64   `json:"tx_retries"`
+	TxFailed   int64    `json:"tx_failed"`
+	Connected  int64    `json:"connected"`
+	InactiveMS int64    `json:"inactive_ms"`
+	Address    string   `json:"address"`
+	Host       string   `json:"host"`
+	DHCP       string   `json:"dhcp"`
+	// What it said of itself in DHCP, and the 802.11 features its
+	// association showed (0067).
+	// The VLAN a per-user key put it in, if any (0070).
+	VLAN *int `json:"vlan"`
+	// Who it signed in as on WPA Enterprise (0113), as hostapd has it.
+	User        string `json:"user,omitempty"`
+	VendorClass string `json:"vendor_class"`
+	Params      string `json:"params"`
+	Gen         string `json:"gen"`
+	K           *bool  `json:"k"`
+	V           *bool  `json:"v"`
+	W           *bool  `json:"w"`
+	// Whether the key management it chose is a fast transition's, 802.11r
+	// (0150); not there from an agent that does not ask.
+	R   *bool `json:"r,omitempty"`
+	MBO *bool `json:"mbo"`
+	WMM *bool `json:"wmm"`
+	// Added by the manager when the report arrives (0067): the maker by
+	// OUI, whether the MAC is private, and a guess at what the device is.
+	Maker   string `json:"maker,omitempty"`
+	Private bool   `json:"private,omitempty"`
+	Kind    string `json:"kind,omitempty"`
+	OS      string `json:"os,omitempty"`
+	Basis   string `json:"basis,omitempty"`
+	// Added by the manager too: that it is an AP's scan radio, joined as a
+	// client for a test (0121), and no device of anyone's.
+	TestClient bool `json:"test_client,omitempty"`
+}
+
+// gens are the 802.11 generations a client can show: n, ac, ax and be, or
+// none, for a/b/g (0067).
+var gens = map[string]bool{"": true, "n": true, "ac": true, "ax": true, "be": true}
+
+// paramsRE is a DHCP parameter request list, as the prober writes it.
+var paramsRE = regexp.MustCompile(`^([0-9]{1,3}(,[0-9]{1,3}){0,63})?$`)
+
+// identify adds to each client what the manager knows of it (0067): its
+// maker, by OUI; whether its MAC is private; and a guess at its kind and
+// operating system, with what the guess went on. One that is an AP's scan
+// radio making a client test (0121) is said to be that, and not guessed at.
+func (st *stateReport) identify(own map[string]hierarchy.NodeID) {
+	// And what its Bluetooth radio hears (0157).
+	st.BLEDevices.name()
+	for i := range st.Clients {
+		c := &st.Clients[i]
+		c.Maker, c.Private = oui.Lookup(c.MAC)
+		if _, c.TestClient = own[strings.ToLower(c.MAC)]; c.TestClient {
+			c.Kind, c.OS, c.Basis = "", "", ""
+			continue
+		}
+		g := identify.Of(identify.Evidence{Host: c.Host, VendorClass: c.VendorClass, Params: c.Params, Maker: c.Maker, Private: c.Private})
+		c.Kind, c.OS, c.Basis = g.Kind, g.OS, g.Basis
+	}
+}
+
+// The verdicts of the DHCP watch on a client (0065); "" off Aeolus's networks.
+var clientDHCP = map[string]bool{"": true, "ok": true, "static": true, "none": true, "unknown": true}
+
+// check holds a client to what the prober writes.
+func (c wifiClient) check() error {
+	bad := badRequest("clients: each has a MAC, a network ID or none, an SSID of at most 32 bytes, a band (2g, 5g or 6g), a signal from -150 to 50 dBm, rates up to 100000 Mbit/s, MCS up to 31 and up to 16 streams, counts not negative, an IPv4 address or none, a printable host name of at most 64 characters, a DHCP verdict (ok, static, none or unknown), and a printable user name of at most 64 characters")
+	inRange := func(p *int, lo, hi int) bool { return p == nil || (*p >= lo && *p <= hi) }
+	rate := func(p *float64) bool { return p == nil || (*p >= 0 && *p <= 100000) }
+	ip := net.ParseIP(c.Address)
+	if !macRE.MatchString(c.MAC) || (c.Network != "" && !networkIDRE.MatchString(c.Network)) || len(c.SSID) > 32 ||
+		(c.Band != "" && !bands[c.Band]) || !inRange(c.Signal, -150, 50) || !inRange(c.SignalAvg, -150, 50) ||
+		!rate(c.RxRate) || !rate(c.TxRate) || !inRange(c.RxMCS, 0, 31) || !inRange(c.TxMCS, 0, 31) || !inRange(c.RxNSS, 0, 16) || !inRange(c.TxNSS, 0, 16) ||
+		c.RxBytes < 0 || c.TxBytes < 0 || c.RxPackets < 0 || c.TxPackets < 0 || (c.TxRetries != nil && *c.TxRetries < 0) || c.TxFailed < 0 || c.Connected < 0 || c.InactiveMS < 0 ||
+		(c.Address != "" && (ip == nil || ip.To4() == nil)) || len(c.Host) > 64 || !printable(c.Host) || !clientDHCP[c.DHCP] ||
+		len(c.VendorClass) > 64 || !printable(c.VendorClass) || !paramsRE.MatchString(c.Params) || !gens[c.Gen] ||
+		(c.VLAN != nil && (*c.VLAN < 1 || *c.VLAN > 4094)) || len(c.User) > 64 || !printable(c.User) {
+		return bad
+	}
+	return nil
+}
+
+// dhcpState is what the AP saw of one network's DHCP on its Wi-Fi
+// interfaces (0065): the servers that answered, and when last; how many of
+// the clients' requests in the last 10 minutes were answered, and how many
+// not, and which clients made those; requests more than one server answered;
+// and the clients that don't use DHCP, with the address each shows.
+type dhcpState struct {
+	Servers           []dhcpServer    `json:"servers"`
+	Answered          int             `json:"answered"`
+	Unanswered        int             `json:"unanswered"`
+	UnansweredClients []string        `json:"unanswered_clients"`
+	Duplicates        []dhcpDuplicate `json:"duplicates"`
+	Without           []dhcpClient    `json:"without"`
+}
+
+type dhcpServer struct {
+	ID      string `json:"id"`
+	MAC     string `json:"mac"`
+	Answers int    `json:"answers"`
+	Ago     int64  `json:"ago"`
+}
+
+type dhcpDuplicate struct {
+	Servers []string `json:"servers"`
+	Client  string   `json:"client"`
+	Ago     int64    `json:"ago"`
+}
+
+type dhcpClient struct {
+	MAC       string  `json:"mac"`
+	JoinedAgo int64   `json:"joined_ago"`
+	Address   *string `json:"address"`
+}
+
+// check holds a network's DHCP findings to what the prober writes: IPv4
+// addresses, MACs, counts that are not negative, and short lists.
+func (d dhcpState) check(id string) error {
+	bad := badRequest("dhcp.%s: servers by IPv4 address and MAC, counts not negative, clients by MAC, at most 8 servers, 16 unanswered clients, 8 duplicates and 32 clients without DHCP", id)
+	ipv4 := func(s string) bool {
+		ip := net.ParseIP(s)
+		return ip != nil && ip.To4() != nil
+	}
+	if !networkIDRE.MatchString(id) || len(d.Servers) > 8 || len(d.UnansweredClients) > 16 || len(d.Duplicates) > 8 || len(d.Without) > 32 ||
+		d.Answered < 0 || d.Unanswered < 0 {
+		return bad
+	}
+	for _, s := range d.Servers {
+		if !ipv4(s.ID) || !macRE.MatchString(s.MAC) || s.Answers < 0 || s.Ago < 0 {
+			return bad
+		}
+	}
+	for _, m := range d.UnansweredClients {
+		if !macRE.MatchString(m) {
+			return bad
+		}
+	}
+	for _, x := range d.Duplicates {
+		if !macRE.MatchString(x.Client) || x.Ago < 0 || len(x.Servers) < 2 || len(x.Servers) > 8 {
+			return bad
+		}
+		for _, s := range x.Servers {
+			if !ipv4(s) {
+				return bad
+			}
+		}
+	}
+	for _, c := range d.Without {
+		if !macRE.MatchString(c.MAC) || c.JoinedAgo < 0 || (c.Address != nil && !ipv4(*c.Address)) {
+			return bad
+		}
+	}
+	return nil
+}
+
+// uplinkPort is what the AP knows of its uplink itself (0064): its name, MAC
+// and MTU; how often its link has come and gone; the VLANs it carries, as
+// its network config has them, and which is the management VLAN; and its
+// counters.
+type uplinkPort struct {
+	Name           string        `json:"name"`
+	MAC            string        `json:"mac"`
+	MTU            int           `json:"mtu"`
+	CarrierChanges int64         `json:"carrier_changes"`
+	VLANs          []carriedVLAN `json:"vlans,omitempty"`
+	ManagementVLAN int           `json:"management_vlan,omitempty"`
+	RxBytes        int64         `json:"rx_bytes"`
+	TxBytes        int64         `json:"tx_bytes"`
+	RxPackets      int64         `json:"rx_packets"`
+	TxPackets      int64         `json:"tx_packets"`
+	RxErrors       int64         `json:"rx_errors"`
+	TxErrors       int64         `json:"tx_errors"`
+	RxDropped      int64         `json:"rx_dropped"`
+	TxDropped      int64         `json:"tx_dropped"`
+}
+
+// carriedVLAN is a VLAN on the uplink, tagged or not.
+type carriedVLAN struct {
+	VLAN   int  `json:"vlan"`
+	Tagged bool `json:"tagged"`
+	// The MAC the AP talks with on it, and the addresses it holds there
+	// (0186), where it has a device on it.
+	MAC       string   `json:"mac,omitempty"`
+	Addresses []string `json:"addresses,omitempty"`
+}
+
+// uplinkVLAN is a VLAN the AP carries on its uplink for its intent, and
+// whether it reaches the AP from the switch (0064): present, when a frame
+// came in on it within three minutes; silent, when none has for that long,
+// though nudged; unknown, before it has been watched that long.
+type uplinkVLAN struct {
+	VLAN     int    `json:"vlan"`
+	Tagged   bool   `json:"tagged"`
+	Verdict  string `json:"verdict"`
+	HeardAgo *int64 `json:"heard_ago"`
+}
+
+// uplinkNeighbor is all the switch's LLDP says of itself and of the port the
+// AP's uplink is on (0064), as the prober reads it, and seconds since it last
+// said so. What the prober doesn't know is in Other, as hex.
+type uplinkNeighbor struct {
+	Chassis             string            `json:"chassis,omitempty"`
+	ChassisKind         string            `json:"chassis_kind,omitempty"`
+	System              string            `json:"system,omitempty"`
+	SystemDescription   string            `json:"system_description,omitempty"`
+	Port                string            `json:"port,omitempty"`
+	PortKind            string            `json:"port_kind,omitempty"`
+	PortDescription     string            `json:"port_description,omitempty"`
+	TTL                 *int              `json:"ttl,omitempty"`
+	Capabilities        []string          `json:"capabilities,omitempty"`
+	EnabledCapabilities []string          `json:"enabled_capabilities,omitempty"`
+	Management          []lldpManagement  `json:"management,omitempty"`
+	NativeVLAN          int               `json:"native_vlan,omitempty"`
+	VLANs               []int             `json:"vlans,omitempty"`
+	VLANNames           map[string]string `json:"vlan_names,omitempty"`
+	ProtocolVLANs       []int             `json:"protocol_vlans,omitempty"`
+	Protocols           []string          `json:"protocols,omitempty"`
+	Aggregation         *lldpAggregation  `json:"aggregation,omitempty"`
+	MaxFrame            int               `json:"max_frame,omitempty"`
+	MACPHY              *lldpMACPHY       `json:"mac_phy,omitempty"`
+	Power               *lldpPower        `json:"power,omitempty"`
+	MED                 *lldpMED          `json:"med,omitempty"`
+	Other               []lldpOther       `json:"other,omitempty"`
+	Ago                 int64             `json:"ago"`
+}
+
+type lldpManagement struct {
+	Address       string `json:"address"`
+	Interface     int64  `json:"interface"`
+	InterfaceKind string `json:"interface_kind"`
+}
+
+type lldpAggregation struct {
+	Capable bool  `json:"capable"`
+	Enabled bool  `json:"enabled"`
+	Port    int64 `json:"port"`
+}
+
+type lldpMACPHY struct {
+	AutonegSupported bool   `json:"autoneg_supported"`
+	AutonegEnabled   bool   `json:"autoneg_enabled"`
+	Advertised       string `json:"advertised"`
+	MAU              int    `json:"mau"`
+	MAUName          string `json:"mau_name,omitempty"`
+}
+
+type lldpPower struct {
+	PSE        bool     `json:"pse"`
+	Supported  bool     `json:"supported"`
+	Enabled    bool     `json:"enabled"`
+	Pair       string   `json:"pair,omitempty"`
+	Class      *int     `json:"class,omitempty"`
+	RequestedW *float64 `json:"requested_w,omitempty"`
+	AllocatedW *float64 `json:"allocated_w,omitempty"`
+}
+
+type lldpMED struct {
+	Capabilities string            `json:"capabilities,omitempty"`
+	Class        int               `json:"class,omitempty"`
+	Policies     []lldpPolicy      `json:"policies,omitempty"`
+	Inventory    map[string]string `json:"inventory,omitempty"`
+	Location     string            `json:"location,omitempty"`
+	PowerW       *float64          `json:"power_w,omitempty"`
+}
+
+type lldpPolicy struct {
+	Application string `json:"application"`
+	Unknown     bool   `json:"unknown"`
+	Tagged      bool   `json:"tagged"`
+	VLAN        int    `json:"vlan"`
+	Priority    int    `json:"priority"`
+	DSCP        int    `json:"dscp"`
+}
+
+type lldpOther struct {
+	Type    int    `json:"type"`
+	OUI     string `json:"oui,omitempty"`
+	Subtype int    `json:"subtype,omitempty"`
+	Data    string `json:"data"`
+}
+
+// check holds the switch's account to what the prober can write: printable
+// names of at most 255 characters, short lists, VLANs from 1 to 4094, and hex
+// for what it doesn't know.
+func (n *uplinkNeighbor) check() error {
+	bad := func(what string) error {
+		return badRequest("uplink_neighbor: %s", what)
+	}
+	texts := []string{n.Chassis, n.ChassisKind, n.System, n.SystemDescription, n.Port, n.PortKind, n.PortDescription}
+	texts = append(texts, n.Capabilities...)
+	texts = append(texts, n.EnabledCapabilities...)
+	for _, m := range n.Management {
+		texts = append(texts, m.Address, m.InterfaceKind)
+	}
+	if p := n.Power; p != nil {
+		texts = append(texts, p.Pair)
+	}
+	if m := n.MED; m != nil {
+		texts = append(texts, m.Capabilities)
+		for k, v := range m.Inventory {
+			texts = append(texts, k, v)
+		}
+		for _, p := range m.Policies {
+			texts = append(texts, p.Application)
+			if p.VLAN < 0 || p.VLAN > 4095 || p.Priority < 0 || p.Priority > 7 || p.DSCP < 0 || p.DSCP > 63 {
+				return bad("a network policy's VLAN, priority or DSCP is out of range")
+			}
+		}
+		if len(m.Policies) > 8 || len(m.Inventory) > 8 || !hexRE.MatchString(m.Location) {
+			return bad("at most 8 network policies and 8 inventory items, and the location in hex")
+		}
+	}
+	for _, t := range texts {
+		if len(t) > 255 || !printable(t) {
+			return bad("its names are printable, and at most 255 characters")
+		}
+	}
+	if len(n.Capabilities) > 16 || len(n.EnabledCapabilities) > 16 || len(n.Management) > 4 || len(n.Protocols) > 16 ||
+		len(n.ProtocolVLANs) > 64 || len(n.Other) > 16 || len(n.VLANs) > 4094 || len(n.VLANNames) > 4094 {
+		return bad("too many capabilities, addresses, protocols, VLANs or unknown TLVs")
+	}
+	named := map[int]bool{}
+	for _, v := range n.VLANs {
+		if v < 1 || v > 4094 || named[v] {
+			return bad("the VLANs it names are distinct, from 1 to 4094")
+		}
+		named[v] = true
+	}
+	for k, name := range n.VLANNames {
+		if v, err := strconv.Atoi(k); err != nil || !named[v] || len(name) > 32 || !printable(name) {
+			return bad("each VLAN name is for a VLAN it names, printable, and at most 32 characters")
+		}
+	}
+	for _, v := range n.ProtocolVLANs {
+		if v < 0 || v > 4094 {
+			return bad("protocol VLANs are from 0 to 4094")
+		}
+	}
+	for _, p := range n.Protocols {
+		if !hexRE.MatchString(p) {
+			return bad("protocols are in hex")
+		}
+	}
+	for _, o := range n.Other {
+		if o.Type < 0 || o.Type > 127 || o.Subtype < 0 || o.Subtype > 255 || !hexRE.MatchString(o.OUI) || !hexRE.MatchString(o.Data) {
+			return bad("an unknown TLV has a type, and its data in hex")
+		}
+	}
+	if (n.TTL != nil && (*n.TTL < 0 || *n.TTL > 65535)) || n.NativeVLAN < 0 || n.NativeVLAN > 4094 || n.MaxFrame < 0 || n.MaxFrame > 65535 || n.Ago < 0 {
+		return bad("a TTL and maximum frame size from 0 to 65535, a native VLAN from 1 to 4094, and seconds since it was heard, not negative")
+	}
+	return nil
+}
+
+// check holds the uplink's own account (0064).
+func (u *uplinkPort) check() error {
+	if !portNameRE.MatchString(u.Name) || !macRE.MatchString(u.MAC) || u.MTU < 0 || u.MTU > 65535 || u.CarrierChanges < 0 ||
+		u.ManagementVLAN < 0 || u.ManagementVLAN > 4094 || len(u.VLANs) > 4094 {
+		return badRequest("uplink_port: a port's name, its MAC, an MTU up to 65535, a management VLAN up to 4094, and counts that are not negative")
+	}
+	for _, c := range []int64{u.RxBytes, u.TxBytes, u.RxPackets, u.TxPackets, u.RxErrors, u.TxErrors, u.RxDropped, u.TxDropped} {
+		if c < 0 {
+			return badRequest("uplink_port: counters are not negative")
+		}
+	}
+	seen := map[int]bool{}
+	for _, v := range u.VLANs {
+		if v.VLAN < 1 || v.VLAN > 4094 || seen[v.VLAN] {
+			return badRequest("uplink_port: its VLANs are distinct, from 1 to 4094")
+		}
+		seen[v.VLAN] = true
+		if (v.MAC != "" && !macRE.MatchString(v.MAC)) || len(v.Addresses) > 16 {
+			return badRequest("uplink_port: a VLAN's MAC, and at most 16 addresses")
+		}
+		for _, a := range v.Addresses {
+			if _, _, err := net.ParseCIDR(a); err != nil {
+				return badRequest("uplink_port: a VLAN's addresses are each an address and its prefix length")
+			}
+		}
+	}
+	return nil
+}
+
+// vlanProbe is what the prober found on a VLAN transport of a network with a
+// fallback (0061), probed on the uplink, tagged or not as the uplink carries
+// the VLAN.
+type vlanProbe struct {
+	VLAN   int         `json:"vlan"`
+	Tagged bool        `json:"tagged"`
+	Probe  *probeState `json:"probe"`
+}
+
+// vxlanState is what the AP's VXLAN tunnels are doing (0054): whether the
+// packages they need are installed (vxlan, and kmod-nft-bridge for the
+// clamp), each tunnel Aeolus made, and whether the prober can run and which
+// tunnel ports its loop guard took off their tunnels (0059).
+type vxlanState struct {
+	Installed bool          `json:"installed"`
+	Loaded    *bool         `json:"loaded,omitempty"` // whether netifd has loaded vxlan (0057)
+	Clamp     bool          `json:"clamp"`
+	Prober    *bool         `json:"prober,omitempty"`     // whether ucode-mod-socket, which the prober needs, is installed (0059)
+	UplinkMTU int           `json:"uplink_mtu,omitempty"` // what the AP's uplink carries now (0056)
+	Tunnels   []tunnelState `json:"tunnels,omitempty"`
+	Loops     []loopState   `json:"loops,omitempty"`
+}
+
+// tunnelState is one tunnel: its VNI, the concentrator's address and port,
+// its MTU, the VLAN it starts from and the AP's address there (0063), the
+// gateway there and whether it answers, by the AP's neighbour table; the
+// AP's other interfaces holding that address on that VLAN, and seconds
+// since the prober last put back routes the start lost
+// (2026-10-06); whether it is up, or standing by as a fallback, or gone
+// though netifd has it up (0187); and what the prober found.
+type tunnelState struct {
+	VNI                int      `json:"vni"`
+	Peer               string   `json:"peer"`
+	Port               int      `json:"port"`
+	MTU                int      `json:"mtu"`
+	FromVLAN           int      `json:"from_vlan,omitempty"`
+	FromAddress        string   `json:"from_address,omitempty"`
+	FromGateway        string   `json:"from_gateway,omitempty"`
+	FromGatewayAnswers *bool    `json:"from_gateway_answers,omitempty"`
+	FromShared         []string `json:"from_shared,omitempty"`
+	FromPutBackAgo     *int64   `json:"from_put_back_ago,omitempty"`
+	Up                 bool     `json:"up"`
+	Standby            bool     `json:"standby,omitempty"`
+	// Up to netifd, with no device in the kernel, and seconds since the
+	// prober last made its device again (0187).
+	Gone      bool        `json:"gone,omitempty"`
+	RemadeAgo *int64      `json:"remade_ago,omitempty"`
+	Probe     *probeState `json:"probe,omitempty"`
+}
+
+// probeState is what the prober found for a tunnel (0059): its verdict, how
+// often it probes and what it asks, whether the concentrator answers a ping
+// over the underlay and how fast, and what on the segment last answered,
+// how fast, and how many seconds ago. What is not known yet is null.
+type probeState struct {
+	Verdict     string   `json:"verdict"`
+	Interval    int      `json:"interval"`
+	Asks        []string `json:"asks,omitempty"`
+	Underlay    *bool    `json:"underlay"`
+	UnderlayMS  *float64 `json:"underlay_ms"`
+	From        string   `json:"from,omitempty"`
+	RTTMS       *float64 `json:"rtt_ms"`
+	AnsweredAgo *int64   `json:"answered_ago"`
+	Lease       *lease   `json:"lease,omitempty"`
+}
+
+// lease is the address the AP holds on a tunnel's segment, for its probes
+// (0060): who gave it, the gateway it names, and seconds until it ends; and
+// the MAC it holds it with (0186).
+type lease struct {
+	Address   string `json:"address"`
+	Server    string `json:"server,omitempty"`
+	Router    string `json:"router,omitempty"`
+	ExpiresIn int64  `json:"expires_in"`
+	MAC       string `json:"mac,omitempty"`
+}
+
+// loopState is a tunnel port the loop guard took off its tunnels (0059):
+// the device whose frame came back, the VNI it carries, the device the frame
+// came back in on, and how many seconds ago.
+type loopState struct {
+	Port   string `json:"port"`
+	Device string `json:"device"`
+	VNI    int    `json:"vni,omitempty"`
+	CameIn string `json:"came_in,omitempty"`
+	Ago    int64  `json:"ago"`
+}
+
+// portState is one Ethernet port in the bridge the AP's uplink is in
+// (0053): whether it is up, whether it has a link and at what speed, in
+// Mbit/s and duplex ("1000F"), and whether it is the uplink. Since 0093,
+// the fastest it can go and the fastest the far end offers it, in Mbit/s,
+// and for a bond its members.
+type portState struct {
+	Name       string     `json:"name"`
+	Up         bool       `json:"up"`
+	Carrier    bool       `json:"carrier"`
+	Speed      string     `json:"speed,omitempty"`
+	Uplink     bool       `json:"uplink,omitempty"`
+	Max        *int       `json:"max,omitempty"`
+	PartnerMax *int       `json:"partner_max,omitempty"`
+	Bond       *bondState `json:"bond,omitempty"`
+	// Where the bridge runs spanning tree, the port's state in it (0095):
+	// forwarding, blocking, learning, listening or disabled.
+	STP string `json:"stp,omitempty"`
+	// Where the uplink is two ports, its bond taken apart (0096): both are
+	// the uplink, and this one the path out, which the AP's traffic takes.
+	Path bool `json:"path,omitempty"`
+	// The switch port its LLDP names, where more than one Ethernet port is
+	// under the uplink (0096).
+	Neighbor *portNeighbor `json:"neighbor,omitempty"`
+}
+
+// portNeighbor is the switch and switch port one Ethernet port under the
+// uplink is on, as LLDP names them (0096).
+type portNeighbor struct {
+	System string `json:"system,omitempty"`
+	Port   string `json:"port,omitempty"`
+}
+
+// ok says the names are printable, as the prober keeps them, and at most 255
+// characters.
+func (n *portNeighbor) ok() bool {
+	return n == nil || len(n.System) <= 255 && len(n.Port) <= 255 && printable(n.System) && printable(n.Port)
+}
+
+// stpStates are the bridge port states a port reports (0095).
+var stpStates = map[string]bool{"": true, "disabled": true, "listening": true, "learning": true, "forwarding": true, "blocking": true}
+
+// mbitOK says whether a speed a port can go is one a port could: absent,
+// or 1 Mbit/s to a terabit.
+func mbitOK(m *int) bool { return m == nil || *m >= 1 && *m <= 1000000 }
+
+// bondState is a bond's mode ("802.3ad" for LACP), the LACP aggregator in
+// use, and its member ports, each with its link, MII status and aggregator
+// (0093): the C-360's uplink is bond0, of eth0 and eth1.
+type bondState struct {
+	Mode       string       `json:"mode"`
+	Aggregator *int         `json:"aggregator,omitempty"`
+	Members    []bondMember `json:"members"`
+}
+
+type bondMember struct {
+	Name       string        `json:"name"`
+	Up         bool          `json:"up"`
+	Carrier    bool          `json:"carrier"`
+	Speed      string        `json:"speed,omitempty"`
+	Max        *int          `json:"max,omitempty"`
+	PartnerMax *int          `json:"partner_max,omitempty"`
+	MII        string        `json:"mii,omitempty"`
+	Aggregator *int          `json:"aggregator,omitempty"`
+	Neighbor   *portNeighbor `json:"neighbor,omitempty"`
+}
+
+// steerState is what the AP's steering daemon says (0138): whether it
+// runs, the networks it steers and how, the count of what it asked of
+// clients and what came of it since it started, and the last of those
+// askings, each followed to its end. It is what a person sees of whether
+// steering works. An AP whose config has it steer, and whose daemon has
+// said nothing of late, says only that it is not running: clients there
+// join as on a network that is not steered.
+type steerState struct {
+	Running  bool           `json:"running"`
+	Since    int64          `json:"since,omitempty"`
+	Networks []steerNetwork `json:"networks,omitempty"`
+	Events   []steerEvent   `json:"events,omitempty"`
+	// Known is how many clients it remembers the bands of.
+	Known int `json:"known,omitempty"`
+}
+
+// steerNetwork is one steered network on the AP: which ways are on, the
+// bands it is on there, and for each way the count of what was asked and of
+// each thing that came of it. Where sticky is on, its settings: weak
+// (0138), and margin, floor and hold_down (0289), which an older agent
+// leaves out.
+type steerNetwork struct {
+	Network  string                    `json:"network"`
+	Suggest  bool                      `json:"suggest"`
+	Hold     bool                      `json:"hold"`
+	Sticky   bool                      `json:"sticky"`
+	Weak     *int                      `json:"weak,omitempty"`
+	Margin   *int                      `json:"margin,omitempty"`
+	Floor    *int                      `json:"floor,omitempty"`
+	HoldDown *int                      `json:"hold_down,omitempty"`
+	Bands    []string                  `json:"bands,omitempty"`
+	Counts   map[string]map[string]int `json:"counts,omitempty"`
+}
+
+// steerEvent is one asking, at its end: of which client, on which network,
+// by which way and from which band; what was asked (a transition request,
+// a hold, a putting off, or nothing, where it says a client came back
+// down), what the client answered, and what came of it. A sticky asking
+// says why (0289): weak, or better, heard more strongly by another AP,
+// which Elsewhere names with how it heard the client; or home, sent where
+// a person said it belongs (0319), Elsewhere naming the AP, and how it
+// heard the client only where it did. An older agent says neither.
+type steerEvent struct {
+	At        int64           `json:"at"`
+	MAC       string          `json:"mac"`
+	Network   string          `json:"network"`
+	Method    string          `json:"method"`
+	Why       string          `json:"why,omitempty"`
+	From      string          `json:"from"`
+	To        []string        `json:"to,omitempty"`
+	Asked     string          `json:"asked"`
+	Answer    string          `json:"answer,omitempty"`
+	Code      *int            `json:"code,omitempty"`
+	Signal    *int            `json:"signal,omitempty"`
+	Elsewhere *steerElsewhere `json:"elsewhere,omitempty"`
+	Outcome   string          `json:"outcome"`
+	Took      float64         `json:"took"`
+	// Stopped is a client back the second time after its rule of the
+	// nearest put it off: the rule stops on that AP for a week, or until it
+	// changes (0321). Taken, so the report is; not yet kept.
+	Stopped bool `json:"stopped,omitempty"`
+}
+
+// steerElsewhere is the AP that heard a client more strongly than its own
+// did (0289), and how strongly, in dBm; or the AP a client was sent to
+// where it belongs (0319), with how it heard the client where it said.
+type steerElsewhere struct {
+	AP     string `json:"ap"`
+	Signal *int   `json:"signal,omitempty"`
+}
+
+var (
+	steerMethods  = map[string]bool{"suggest": true, "hold": true, "sticky": true, "keep": true}
+	steerAsked    = map[string]bool{"btm": true, "held": true, "kick": true, "none": true}
+	steerAnswers  = map[string]bool{"": true, "accepted": true, "refused": true}
+	steerWhys     = map[string]bool{"": true, "weak": true, "better": true, "home": true, "nearest": true}
+	steerOutcomes = map[string]bool{"moved": true, "refused": true, "stayed": true, "left": true, "joined": true, "back": true, "recovered": true}
+)
+
+func (e steerEvent) ok() bool {
+	for _, b := range e.To {
+		if !bands[b] {
+			return false
+		}
+	}
+	return e.At > 0 && macRE.MatchString(e.MAC) && networkIDRE.MatchString(e.Network) && steerMethods[e.Method] && bands[e.From] && len(e.To) <= 3 &&
+		steerAsked[e.Asked] && steerAnswers[e.Answer] && steerOutcomes[e.Outcome] && e.Took >= 0 && e.Took <= 86400 &&
+		(e.Code == nil || (*e.Code >= 0 && *e.Code <= 255)) && (e.Signal == nil || (*e.Signal >= -127 && *e.Signal <= 0)) &&
+		steerWhys[e.Why] && (e.Why == "" || e.Method == "sticky") &&
+		(e.Elsewhere == nil || ((e.Why == "better" || e.Why == "home" || e.Why == "nearest" || e.Method == "suggest") && apIDRE.MatchString(e.Elsewhere.AP) &&
+			(e.Elsewhere.Signal != nil || e.Why == "home") && (e.Elsewhere.Signal == nil || (*e.Elsewhere.Signal >= -127 && *e.Elsewhere.Signal < 0))))
+}
+
+func (n steerNetwork) ok() bool {
+	for _, b := range n.Bands {
+		if !bands[b] {
+			return false
+		}
+	}
+	for method, counts := range n.Counts {
+		if !steerMethods[method] || len(counts) > 16 {
+			return false
+		}
+		for what, c := range counts {
+			if (what != "asked" && !steerOutcomes[what]) || c < 0 || c > 1_000_000_000 {
+				return false
+			}
+		}
+	}
+	within := func(v *int, least, most int) bool { return v == nil || (*v >= least && *v <= most) }
+	return networkIDRE.MatchString(n.Network) && len(n.Bands) <= 3 && len(n.Counts) <= 3 && within(n.Weak, -127, 0) &&
+		within(n.Margin, 1, 20) && within(n.Floor, -90, -40) && within(n.HoldDown, 1, 60)
+}
+
+// clean keeps of an AP's word on its steering what is well said, and no
+// more than a report may hold: 32 networks and 50 askings. The rest is left
+// out, as with its own networks (0137), and the report taken.
+func (s *steerState) clean() *steerState {
+	if s == nil {
+		return nil
+	}
+	s.Networks = slices.DeleteFunc(s.Networks, func(n steerNetwork) bool { return !n.ok() })
+	if len(s.Networks) > 32 {
+		s.Networks = s.Networks[:32]
+	}
+	s.Events = slices.DeleteFunc(s.Events, func(e steerEvent) bool { return !e.ok() })
+	if len(s.Events) > 50 {
+		s.Events = s.Events[len(s.Events)-50:]
+	}
+	if s.Since < 0 {
+		s.Since = 0
+	}
+	if s.Known < 0 || s.Known > 1_000_000 {
+		s.Known = 0
+	}
+	return s
+}
+
+// steeringState is what usteer is doing on the AP (0050, 0051). It steers
+// nothing now (0138), and is still said: whether hostapd has 802.11v is
+// here, and what usteer hears of clients' probes is where a client's
+// probes are read from.
+type steeringState struct {
+	Installed bool       `json:"installed"`
+	Running   bool       `json:"running"`
+	Interval  int        `json:"interval"`        // band_steering_interval, ms; 0 is off
+	SSIDs     []string   `json:"ssids,omitempty"` // the SSIDs it steers
+	BSS       []bssState `json:"bss,omitempty"`
+	// BSSTransition says whether hostapd has 802.11v, which band steering
+	// and BSS transition need (0057); absent when not known.
+	BSSTransition *bool `json:"bss_transition,omitempty"`
+}
+
+// bssState is one SSID on one band: its clients now, and the clients usteer
+// has moved off it and onto it since usteer started.
+type bssState struct {
+	SSID        string `json:"ssid"`
+	Band        string `json:"band"`
+	Clients     int    `json:"clients"`
+	SteeredAway int    `json:"steered_away"`
+	SteeredIn   int    `json:"steered_in"`
+}
+
+type radioState struct {
+	Radio   string `json:"radio"`
+	Band    string `json:"band"`
+	Channel int    `json:"channel,omitempty"`
+	Width   int    `json:"width,omitempty"`
+	Clients int    `json:"clients"`
+	// Whether it is up, and the power it sends at in dBm, as it runs them,
+	// set by Aeolus or not. An older agent leaves them out.
+	Up      *bool `json:"up,omitempty"`
+	TxPower *int  `json:"txpower,omitempty"`
+	// How many of its networks are on the air, of those it has but those
+	// taken off the air on purpose (0201); for how long, in seconds, it has
+	// had fewer on the air, and the SSIDs not on it (0216). An older agent
+	// leaves them out.
+	BSS      *int     `json:"bss,omitempty"`
+	BSSWant  *int     `json:"bss_want,omitempty"`
+	ShortFor *int     `json:"short_for,omitempty"`
+	Missing  []string `json:"missing,omitempty"`
+	// The beacons its networks sent and failed to send since the agent's
+	// last report, over seconds (0221): where its driver says, ath11k's.
+	Beacons *radioBeacons `json:"beacons,omitempty"`
+}
+
+// radioBeacons is a radio's beacons over a time (0221): those its networks
+// sent, all of them together, and those that did not go out.
+type radioBeacons struct {
+	Sent   int64 `json:"sent"`
+	Failed int64 `json:"failed"`
+	Over   int   `json:"over"`
+}
+
+// beacons is what each of its radios that counts them says of its beacons
+// since the agent's last report (0221, 0339).
+func (st *stateReport) beacons() []conditions.RadioBeacons {
+	var out []conditions.RadioBeacons
+	for _, rd := range st.Radios {
+		if b := rd.Beacons; b != nil {
+			out = append(out, conditions.RadioBeacons{Radio: rd.Radio, Band: rd.Band, Sent: b.Sent, Failed: b.Failed, Over: b.Over})
+		}
+	}
+	return out
+}
+
+// otherNetwork is a Wi-Fi network an AP has of its own, set on the AP and
+// not by Aeolus, on one of its radios (0137): the section of its config it
+// is, by which it is asked for; its SSID; its security, as OpenWrt names
+// the encryption; the VLAN it is on, where its config says; whether it is
+// hidden, off, offers fast transition, or carries another AP's uplink (WDS);
+// and how many clients are on it.
+// Nothing of its key.
+type otherNetwork struct {
+	Section  string `json:"section"`
+	Radio    string `json:"radio"`
+	Band     string `json:"band"`
+	SSID     string `json:"ssid"`
+	Security string `json:"security"`
+	VLAN     int    `json:"vlan,omitempty"`
+	Hidden   bool   `json:"hidden,omitempty"`
+	Off      bool   `json:"off,omitempty"`
+	FT       bool   `json:"ft,omitempty"`
+	// WDS says another AP may hang off it, as its uplink.
+	WDS     bool `json:"wds,omitempty"`
+	Clients int  `json:"clients"`
+}
+
+// otherSectionRE is a section of an AP's config, by its name, or the name
+// uci gives one that has none.
+var otherSectionRE = regexp.MustCompile(`^[A-Za-z0-9_]{1,64}$`)
+
+// ok says whether one is as an agent says it. One that is not is left out
+// of its AP's report, and the report kept: what someone typed on an AP
+// should not cost the AP its report.
+func (o otherNetwork) ok() bool {
+	return otherSectionRE.MatchString(o.Section) && radioRE.MatchString(o.Radio) && (o.Band == "" || bands[o.Band]) &&
+		len(o.SSID) <= 32 && len(o.Security) >= 1 && len(o.Security) <= 32 && printable(o.Security) &&
+		o.VLAN >= 0 && o.VLAN <= 4094 && o.Clients >= 0 && o.Clients <= 100000
+}
+
+// transportState is one network's transports: which is carrying traffic, and
+// how each is doing (0020, 0022), by the prober's verdicts (0061). A
+// transport not started, a VXLAN fallback waiting, is off. With automatic
+// switching, the last switch, and why a switch that is due cannot be made.
+type transportState struct {
+	Active       string      `json:"active"`
+	Primary      string      `json:"primary,omitempty"`
+	Fallback     string      `json:"fallback,omitempty"`
+	LastSwitch   *lastSwitch `json:"last_switch,omitempty"`
+	CannotSwitch string      `json:"cannot_switch,omitempty"`
+}
+
+// onAirState is an interface the AP holds an IPv4 address on whose network
+// its own Wi-Fi serves too (0209): its name, whether it is the management
+// interface, its VLAN where it is a bridge's, and the SSIDs there.
+type onAirState struct {
+	Interface  string   `json:"interface"`
+	Management bool     `json:"management"`
+	VLAN       *int     `json:"vlan"`
+	SSIDs      []string `json:"ssids"`
+}
+
+// offAirState is a network that goes off the air on the AP while it cannot
+// reach its way on (0201): whether it is off now, since how many seconds,
+// why, and the Wi-Fi interfaces taken off.
+type offAirState struct {
+	Off     bool     `json:"off"`
+	Ago     *int     `json:"ago,omitempty"`
+	Why     string   `json:"why,omitempty"`
+	Stopped []string `json:"stopped,omitempty"`
+}
+
+// lastSwitch is a network's last move between its transports (0061): from
+// which to which, why, and how many seconds ago.
+type lastSwitch struct {
+	From string `json:"from"`
+	To   string `json:"to"`
+	Why  string `json:"why"`
+	Ago  int64  `json:"ago"`
+}
+
+var (
+	verdicts = map[string]bool{"up": true, "down": true, "unverified": true, "unknown": true, "off": true}
+	bands    = map[string]bool{"2g": true, "5g": true, "6g": true}
+	actives  = map[string]bool{"primary": true, "fallback": true, "none": true}
+	// What the prober says of a VLAN watched on the uplink (0064).
+	watchVerdicts = map[string]bool{"present": true, "silent": true, "unknown": true}
+	sides         = map[string]bool{"primary": true, "fallback": true}
+	healths       = map[string]bool{"": true, "up": true, "down": true, "unknown": true, "unverified": true, "off": true}
+)
+
+// check is one radio of a state report, as check has it of each.
+func (rd radioState) check() error {
+	if !bands[rd.Band] {
+		return badRequest("radio band %q: want 2g, 5g or 6g", rd.Band)
+	}
+	if err := plainText("radio", rd.Radio, 32); err != nil {
+		return err
+	}
+	if rd.Channel < 0 || rd.Width < 0 || rd.Clients < 0 {
+		return badRequest("radio numbers cannot be negative")
+	}
+	if rd.TxPower != nil && (*rd.TxPower < 0 || *rd.TxPower > 40) {
+		return badRequest("a radio's power is 0 to 40 dBm")
+	}
+	if (rd.BSS == nil) != (rd.BSSWant == nil) || rd.BSS != nil && (*rd.BSS < 0 || *rd.BSSWant > 64 || *rd.BSS > *rd.BSSWant) {
+		return badRequest("a radio's networks on the air are 0 to the 64 it may have, with how many it has")
+	}
+	if rd.ShortFor != nil && (*rd.ShortFor < 0 || rd.BSS == nil || *rd.BSS == *rd.BSSWant) {
+		return badRequest("a radio is short of networks on the air only where it has fewer on the air than it has")
+	}
+	// At most 64 networks each sending ten beacons a second.
+	if b := rd.Beacons; b != nil && (b.Over < 1 || b.Over > 86400 || b.Sent < 0 || b.Failed < 0 || b.Sent+b.Failed > int64(b.Over)*640) {
+		return badRequest("a radio's beacons are counts from 0 over 1 to 86400 seconds, at most 640 a second")
+	}
+	if len(rd.Missing) > 16 {
+		return badRequest("at most 16 networks missing from a radio")
+	}
+	for _, s := range rd.Missing {
+		if len(s) == 0 || len(s) > 32 {
+			return badRequest("an SSID is 1 to 32 bytes")
+		}
+	}
+	return nil
+}
+
+// check is one port of a state report, as check has it of each: that no
+// two have one name is check's.
+func (p portState) check() error {
+	if !portNameRE.MatchString(p.Name) || !speedRE.MatchString(p.Speed) || !mbitOK(p.Max) || !mbitOK(p.PartnerMax) {
+		return badRequest("ports: each has its own name (such as lan1), a speed such as 1000F, or none, and speeds it can go of 1 to 1000000 Mbit/s")
+	}
+	if !stpStates[p.STP] {
+		return badRequest("ports: a port's spanning tree state is forwarding, blocking, learning, listening or disabled")
+	}
+	if !p.Neighbor.ok() {
+		return badRequest("ports: the switch and switch port a port is on are printable, of at most 255 characters")
+	}
+	if b := p.Bond; b != nil {
+		if len(b.Members) > 8 || len(b.Mode) > 32 {
+			return badRequest("ports: a bond has at most 8 members, and a mode of at most 32 characters")
+		}
+		for _, m := range b.Members {
+			if !portNameRE.MatchString(m.Name) || !speedRE.MatchString(m.Speed) || !mbitOK(m.Max) || !mbitOK(m.PartnerMax) || len(m.MII) > 16 || !m.Neighbor.ok() {
+				return badRequest("ports: a bond's member has a name (such as eth0), a speed such as 2500F, or none, and speeds it can go of 1 to 1000000 Mbit/s")
+			}
+		}
+	}
+	return nil
+}
+
+// check is one interface of a state report's on_air, as check has it.
+func (a onAirState) check() error {
+	if !netifdNameRE.MatchString(a.Interface) || (a.VLAN != nil && (*a.VLAN < 1 || *a.VLAN > 4094)) || len(a.SSIDs) > 32 {
+		return badRequest("on_air: each an interface's name, a VLAN from 1 to 4094 or none, and at most 32 SSIDs")
+	}
+	for _, s := range a.SSIDs {
+		if len(s) > 32 || !utf8.ValidString(s) {
+			return badRequest("on_air: interface %s: an SSID is at most 32 bytes", a.Interface)
+		}
+	}
+	return nil
+}
+
+// check is one of a state report's VLAN probes, as check has it.
+func (v vlanProbe) check() error {
+	if v.VLAN < 1 || v.VLAN > 4094 || v.Probe == nil {
+		return badRequest("vlan_probes: each has a VLAN from 1 to 4094 and what its probe found")
+	}
+	return v.Probe.check()
+}
+
+// check is one of the VLANs a state report says it watches on its uplink,
+// as check has it: that no two are one VLAN is check's.
+func (v uplinkVLAN) check() error {
+	if v.VLAN < 1 || v.VLAN > 4094 || !watchVerdicts[v.Verdict] || (v.HeardAgo != nil && *v.HeardAgo < 0) {
+		return badRequest("uplink_vlans: each is a distinct VLAN from 1 to 4094, with its verdict (present, silent or unknown) and seconds since it was heard, not negative")
+	}
+	return nil
+}
+
+// bssidCheck is one of a state report's own BSSIDs, as check has it.
+func bssidCheck(b string) error {
+	if !macRE.MatchString(b) {
+		return badRequest("bssids: each a MAC, such as 02:11:22:33:44:55")
+	}
+	return nil
+}
+
+func (st *stateReport) check() error {
+	if st.Version < 0 || st.Uptime < 0 {
+		return badRequest("version and uptime cannot be negative")
+	}
+	if len(st.FWCrashes) > fwCrashesMost {
+		return badRequest("fw_crashes: at most %d", fwCrashesMost)
+	}
+	if len(st.MixedLibs) > mixedLibsMost {
+		return badRequest("mixed_libs: at most %d", mixedLibsMost)
+	}
+	if err := st.Time.check(); err != nil {
+		return err
+	}
+	if err := st.Keys.check(); err != nil {
+		return err
+	}
+	if err := st.RRM.check(); err != nil {
+		return err
+	}
+	if len(st.BSSIDs) > 64 {
+		return badRequest("bssids: at most 64")
+	}
+	// Its own networks: those that are not well said are left out, and no
+	// more than 64 kept.
+	st.Others = slices.DeleteFunc(st.Others, func(o otherNetwork) bool { return !o.ok() })
+	if len(st.Others) > 64 {
+		st.Others = st.Others[:64]
+	}
+	st.Steer = st.Steer.clean()
+	st.Path = st.Path.clean()
+	st.FT = cleanFT(st.FT)
+	for _, b := range st.BSSIDs {
+		if err := bssidCheck(b); err != nil {
+			return err
+		}
+	}
+	if err := st.Agent.check(); err != nil {
+		return err
+	}
+	if err := plainText("openwrt", st.OpenWrt, maxText); err != nil {
+		return err
+	}
+	if len(st.Radios) > 8 {
+		return badRequest("at most 8 radios")
+	}
+	for _, rd := range st.Radios {
+		if err := rd.check(); err != nil {
+			return err
+		}
+	}
+	if len(st.Transports) > 64 {
+		return badRequest("at most 64 networks")
+	}
+	if g := st.Steering; g != nil {
+		if g.Interval < 0 || len(g.SSIDs) > 64 || len(g.BSS) > 64 {
+			return badRequest("steering: interval cannot be negative; at most 64 SSIDs and 64 BSSes")
+		}
+		for _, ssid := range g.SSIDs {
+			if len(ssid) > 32 {
+				return badRequest("steering: an SSID is at most 32 bytes")
+			}
+		}
+		for _, b := range g.BSS {
+			if !bands[b.Band] || len(b.SSID) > 32 || b.Clients < 0 || b.SteeredAway < 0 || b.SteeredIn < 0 {
+				return badRequest("steering: each BSS has a band (2g, 5g or 6g), an SSID of at most 32 bytes, and counts that are not negative")
+			}
+		}
+	}
+	if len(st.Ports) > 32 {
+		return badRequest("at most 32 ports")
+	}
+	names := map[string]bool{}
+	for _, p := range st.Ports {
+		if names[p.Name] {
+			return badRequest("ports: each has its own name (such as lan1), a speed such as 1000F, or none, and speeds it can go of 1 to 1000000 Mbit/s")
+		}
+		if err := p.check(); err != nil {
+			return err
+		}
+		names[p.Name] = true
+	}
+	if x := st.VXLAN; x != nil {
+		if len(x.Tunnels) > 64 || x.UplinkMTU < 0 || x.UplinkMTU > 65535 {
+			return badRequest("vxlan: at most 64 tunnels, and an uplink MTU from 0 to 65535")
+		}
+		for _, t := range x.Tunnels {
+			if t.VNI < 1 || t.VNI > 16777215 || t.Port < 1 || t.Port > 65535 || t.MTU < 0 || t.MTU > 9000 || net.ParseIP(t.Peer) == nil {
+				return badRequest("vxlan: each tunnel has a VNI from 1 to 16777215, its peer's IP address, a port and an MTU of at most 9000")
+			}
+			if t.FromVLAN < 0 || t.FromVLAN > 4094 || (t.FromAddress != "" && (t.FromVLAN == 0 || net.ParseIP(t.FromAddress).To4() == nil)) ||
+				(t.FromGateway != "" && (t.FromAddress == "" || net.ParseIP(t.FromGateway).To4() == nil)) || (t.FromGatewayAnswers != nil && t.FromGateway == "") {
+				return badRequest("vxlan: a tunnel starts from a VLAN from 1 to 4094, and the AP's address and gateway there are IPv4 addresses")
+			}
+			if len(t.FromShared) > 8 || ((len(t.FromShared) > 0 || t.FromPutBackAgo != nil) && t.FromVLAN == 0) || (t.FromPutBackAgo != nil && *t.FromPutBackAgo < 0) {
+				return badRequest("vxlan: a tunnel that starts from a VLAN names at most 8 other interfaces with an address there, and seconds since its routes were put back")
+			}
+			if (t.RemadeAgo != nil && *t.RemadeAgo < 0) || (t.Gone && t.Up) {
+				return badRequest("vxlan: a tunnel whose device is gone is not up, and seconds since its device was made again are not negative")
+			}
+			for _, name := range t.FromShared {
+				if !ifaceNameRE.MatchString(name) {
+					return badRequest("vxlan: %q is not an interface name", name)
+				}
+			}
+			if err := t.Probe.check(); err != nil {
+				return err
+			}
+		}
+		if len(x.Loops) > 32 {
+			return badRequest("vxlan: at most 32 loops")
+		}
+		for _, l := range x.Loops {
+			if !portNameRE.MatchString(l.Port) || !deviceRE.MatchString(l.Device) || (l.CameIn != "" && !deviceRE.MatchString(l.CameIn)) ||
+				l.VNI < 0 || l.VNI > 16777215 || l.Ago < 0 {
+				return badRequest("vxlan: each loop has its port's name, the devices the frame went out and came in on, a VNI and seconds ago")
+			}
+		}
+	}
+	for id, t := range st.Transports {
+		if !networkIDRE.MatchString(id) {
+			return badRequest("%q is not a network ID", id)
+		}
+		if !actives[t.Active] || !healths[t.Primary] || !healths[t.Fallback] {
+			return badRequest("network %s: active is primary, fallback or none; health is up, down, unverified, unknown or off", id)
+		}
+		if l := t.LastSwitch; l != nil && (!sides[l.From] || !sides[l.To] || l.From == l.To || l.Why == "" || len(l.Why) > 200 || l.Ago < 0) {
+			return badRequest("network %s: the last switch is from one transport to the other (primary or fallback), with why, in at most 200 characters, and seconds ago", id)
+		}
+		if len(t.CannotSwitch) > 200 {
+			return badRequest("network %s: why it cannot switch is at most 200 characters", id)
+		}
+	}
+	if len(st.OnAir) > 16 {
+		return badRequest("on_air: at most 16 interfaces")
+	}
+	for _, a := range st.OnAir {
+		if err := a.check(); err != nil {
+			return err
+		}
+	}
+	if len(st.OffAir) > 64 {
+		return badRequest("at most 64 networks that go off the air when lost")
+	}
+	for id, o := range st.OffAir {
+		if !networkIDRE.MatchString(id) {
+			return badRequest("off_air: %q is not a network ID", id)
+		}
+		if (o.Ago != nil && *o.Ago < 0) || len(o.Why) > 200 || len(o.Stopped) > 16 {
+			return badRequest("off_air: network %s is off or not, since seconds ago, why in at most 200 characters, and at most 16 interfaces", id)
+		}
+		for _, i := range o.Stopped {
+			if !deviceRE.MatchString(i) {
+				return badRequest("off_air: network %s: %q is not an interface", id, i)
+			}
+		}
+	}
+	if len(st.VLANProbes) > 64 {
+		return badRequest("at most 64 VLAN probes")
+	}
+	for _, v := range st.VLANProbes {
+		if err := v.check(); err != nil {
+			return err
+		}
+	}
+	if len(st.UplinkVLANs) > 64 {
+		return badRequest("at most 64 VLANs on the uplink")
+	}
+	seen := map[int]bool{}
+	for _, v := range st.UplinkVLANs {
+		if err := v.check(); err != nil {
+			return err
+		}
+		if seen[v.VLAN] {
+			return badRequest("uplink_vlans: each is a distinct VLAN from 1 to 4094, with its verdict (present, silent or unknown) and seconds since it was heard, not negative")
+		}
+		seen[v.VLAN] = true
+	}
+	if n := st.UplinkNeighbor; n != nil {
+		if err := n.check(); err != nil {
+			return err
+		}
+	}
+	if u := st.UplinkPort; u != nil {
+		if err := u.check(); err != nil {
+			return err
+		}
+	}
+	if len(st.DHCP) > 64 {
+		return badRequest("dhcp: at most 64 networks")
+	}
+	for id, d := range st.DHCP {
+		if err := d.check(id); err != nil {
+			return err
+		}
+	}
+	if len(st.Clients) > 256 {
+		return badRequest("clients: at most 256")
+	}
+	for _, c := range st.Clients {
+		if err := c.check(); err != nil {
+			return err
+		}
+	}
+	if len(st.Radius) > 64 {
+		return badRequest("radius: at most 64")
+	}
+	if err := st.Health.check(); err != nil {
+		return err
+	}
+	if err := st.ScanRadio.check(); err != nil {
+		return err
+	}
+	if err := st.Airscan.check(); err != nil {
+		return err
+	}
+	if err := st.BLE.check(); err != nil {
+		return err
+	}
+	st.BLEDevices, _ = st.BLEDevices.keep()
+	for _, r := range st.Radius {
+		if err := r.check(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// radiusState is how the RADIUS server one network signs its clients in
+// against is doing, from the AP (0114). The prober asks it for its status
+// (RFC 5997) every 30 seconds, and reads from hostapd what it answered the
+// clients' own sign-ins with, since the network was started. Its verdict is
+// up (it answered a status request, or a sign-in, within three asks' time),
+// silent (three asks went unanswered, and it used to answer, or a sign-in
+// timed out meanwhile: it is down, unreachable, or does not know the AP or
+// its secret), unverified (it never answered a status request, and no
+// client has needed it lately) or unknown (not asked three times yet).
+type radiusState struct {
+	Network     string   `json:"network"`
+	Server      string   `json:"server"`
+	Port        int      `json:"port"`
+	Verdict     string   `json:"verdict"`
+	RTT         *float64 `json:"rtt_ms"`
+	AnsweredAgo *int64   `json:"answered_ago"`
+	Requests    int64    `json:"requests"`
+	Accepts     int64    `json:"accepts"`
+	Rejects     int64    `json:"rejects"`
+	Timeouts    int64    `json:"timeouts"`
+	Bad         int64    `json:"bad"`
+}
+
+var radiusVerdicts = map[string]bool{"up": true, "silent": true, "unverified": true, "unknown": true}
+
+func (r radiusState) check() error {
+	if !networkIDRE.MatchString(r.Network) || len(r.Server) < 1 || len(r.Server) > 253 || !printable(r.Server) || strings.ContainsAny(r.Server, " /") ||
+		r.Port < 1 || r.Port > 65535 || !radiusVerdicts[r.Verdict] || (r.RTT != nil && (*r.RTT < 0 || *r.RTT > 60000)) ||
+		(r.AnsweredAgo != nil && *r.AnsweredAgo < 0) || r.Requests < 0 || r.Accepts < 0 || r.Rejects < 0 || r.Timeouts < 0 || r.Bad < 0 {
+		return badRequest("radius: each is a network, its server and port, a verdict (up, silent, unverified or unknown), a round trip of up to 60000 ms, seconds since it answered, and counts not negative")
+	}
+	return nil
+}
+
+// printable says whether s is printable ASCII, as the prober keeps the
+// switch's names (0064).
+func printable(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] < ' ' || s[i] > '~' {
+			return false
+		}
+	}
+	return true
+}
+
+func (p *probeState) check() error {
+	if p == nil {
+		return nil
+	}
+	bad := func(f *float64) bool { return f != nil && (*f < 0 || *f > 1e6) }
+	if !verdicts[p.Verdict] || p.Interval < 0 || p.Interval > 300 || len(p.Asks) > 8 || bad(p.UnderlayMS) || bad(p.RTTMS) ||
+		(p.AnsweredAgo != nil && *p.AnsweredAgo < 0) || (p.From != "" && net.ParseIP(p.From) == nil) {
+		return badRequest("vxlan: a tunnel's probe has a verdict (up, down, unverified, unknown or off), an interval of at most 300 seconds, at most 8 addresses it asks, times that are not negative, and the IP address that answered")
+	}
+	for _, a := range p.Asks {
+		if net.ParseIP(a) == nil {
+			return badRequest("vxlan: a probe asks IP addresses")
+		}
+	}
+	if l := p.Lease; l != nil {
+		ip := func(s string, need bool) bool { return (s == "" && !need) || net.ParseIP(s).To4() != nil }
+		if !ip(l.Address, true) || !ip(l.Server, false) || !ip(l.Router, false) || l.ExpiresIn < 0 || (l.MAC != "" && !macRE.MatchString(l.MAC)) {
+			return badRequest("vxlan: a probe's lease is an IPv4 address, from a server and with a gateway that are IPv4 addresses, and seconds left that are not negative")
+		}
+	}
+	return nil
+}
+
+// state records a state report: as much of it as can be taken (0290), its
+// lists without the elements that cannot be; what was left out, or a
+// report refused whole, kept for the AP's alerts.
+func (s *Server) state(w http.ResponseWriter, r *http.Request, c apCall) error {
+	req, trims, err := readReport(w, r)
+	if err != nil {
+		s.reports.note(c.ap, time.Now(), nil, err.Error())
+		return err
+	}
+	s.reports.note(c.ap, time.Now(), trims, "")
+	state := s.log.Snapshot()
+	if err := unadopted(state, c.ap); err != nil {
+		return err
+	}
+	req.identify(testClients(state))
+	report, err := json.Marshal(req)
+	if err != nil {
+		return err
+	}
+	// What its clients moved since its last report (0108), before this one
+	// is the last.
+	prev, err := s.conds.LatestState(c.ap)
+	if err != nil {
+		return err
+	}
+	moved := clientsMoved(prev, time.Now(), req.Clients)
+	// What happened to it since its last report, and how it is doing (0119).
+	name := func(id hierarchy.NodeID) string {
+		if n, ok := state.Org.Locations.Node(id); ok {
+			return n.Name
+		}
+		return string(id)
+	}
+	happened := changes(prev, time.Now(), &req, name)
+	if err := s.conds.RecordState(c.ap, req.Version, report); err != nil {
+		return err
+	}
+	s.ftNote(c.ap, time.Now(), req.FT)
+	// Power control's steps, each kept once (0206). One said to be from a
+	// time yet to come is of a clock not yet set, and one from before the
+	// steps are kept is let go: neither is kept.
+	if req.RRM != nil && len(req.RRM.APCEvents) > 0 {
+		now := time.Now()
+		evs := make([]conditions.APCEvent, 0, len(req.RRM.APCEvents))
+		for _, e := range req.RRM.APCEvents {
+			if e.fresh(now) {
+				evs = append(evs, e.kept())
+			}
+		}
+		if err := s.conds.RecordAPCEvents(c.ap, evs); err != nil {
+			return err
+		}
+	}
+	if err := s.conds.RecordHealth(c.ap, req.point(), happened); err != nil {
+		return err
+	}
+	// Its radios' beacons, for the beacons alert's half hour (0339).
+	if err := s.conds.RecordBeacons(c.ap, req.beacons()); err != nil {
+		return err
+	}
+	// The first report after an hour ended gives that hour's account of
+	// itself (0338).
+	if err := s.noteHour(c.ap, prev, s.conds.Now(), &req); err != nil {
+		return err
+	}
+	// Its clients on each band too, for the Clients overview (0166): those
+	// it lists that were active on another AP since are that AP's (0185).
+	gone := s.active.note(c.ap, s.conds.Now(), req.Clients)
+	bands := map[string]int{}
+	for _, b := range conditions.Bands {
+		bands[b] = 0
+	}
+	for _, cl := range req.Clients {
+		if _, ok := bands[cl.Band]; ok && !gone[cl.MAC] {
+			bands[cl.Band]++
+		}
+	}
+	if err := s.conds.RecordUse(c.ap, len(req.Clients)-len(gone), bands, moved); err != nil {
+		return err
+	}
+	// Every client it has is one more seen, or seen again (0118); not one
+	// active on another AP since, which is there now (0251).
+	seen := make([]conditions.ClientSeen, 0, len(req.Clients))
+	for _, cl := range req.Clients {
+		if gone[cl.MAC] {
+			continue
+		}
+		seen = append(seen, conditions.ClientSeen{MAC: strings.ToLower(cl.MAC), Network: cl.Network, SSID: cl.SSID, Host: cl.Host, User: cl.User, Address: cl.Address})
+	}
+	if err := s.conds.SeeClients(c.ap, seen); err != nil {
+		return err
+	}
+	// How long each network's RADIUS server took to answer it (0141), and
+	// what its own way out timed, under its management VLAN (0142): what
+	// was answered since its report before.
+	fresh := sinceBefore(prev, time.Now())
+	if err := s.conds.AddSteps(c.ap, time.Now(), radiusSteps(req.Radius, fresh)); err != nil {
+		return err
+	}
+	if err := s.conds.AddSteps(c.ap, time.Now(), pathSteps(req.Path, req.UplinkPort, fresh)); err != nil {
+		return err
+	}
+	// What its Bluetooth radio heard (0158), a device once each five
+	// minutes, and the rotating addresses counted.
+	if hs, cs := req.BLEDevices.heard(time.Now()); len(hs) > 0 || len(cs) > 0 {
+		if err := s.conds.RecordBluetooth(c.ap, hs, cs); err != nil {
+			return err
+		}
+	}
+	// What its steering asked of clients, each asking kept once (0139).
+	if _, err := s.conds.AddSteer(c.ap, req.Steer.askings(time.Now(), req.Uptime)); err != nil {
+		return err
+	}
+	// The rogues and suspects it hears (0160): the clients its scan radio
+	// heard on them are kept, and its next report lists those it hears then.
+	watch, of := s.rogueWatch(state, c.ap, report)
+	if err := s.conds.RecordRogueClients(c.ap, rogueClients(&req, of, time.Now())); err != nil {
+		return err
+	}
+	if err := s.conds.Running(c.ap, req.Version); err != nil {
+		return err
+	}
+	answer := map[string]any{"recorded": true, "watch": watch}
+	// What was left out of its lists (0290), for the agent to say.
+	if len(trims) > 0 {
+		out := make([]map[string]any, 0, len(trims))
+		for _, t := range trims {
+			out = append(out, map[string]any{"field": t.Field, "dropped": t.Dropped, "of": t.Of, "whole": t.Whole, "why": t.Why})
+		}
+		answer["left_out"] = out
+	}
+	writeJSON(w, http.StatusOK, answer)
+	return nil
+}
+
+// apHistory lists an AP's recent checks, applies and state reports, newest
+// first.
+func (s *Server) apHistory(w http.ResponseWriter, r *http.Request, c call) error {
+	id := hierarchy.NodeID(r.PathValue("ap"))
+	t := c.state.Org.Locations
+	if n, ok := t.Node(id); !ok || n.Kind != hierarchy.KindAP || !may(c, change.Locations, t, id, access.View) {
+		return errNotFound
+	}
+	limit := 20
+	if v := r.URL.Query().Get("limit"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > 200 {
+			return badRequest("limit must be 1 to 200")
+		}
+		limit = n
+	}
+	h, err := s.conds.History(id, limit)
+	if err != nil {
+		return err
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ap": id, "checks": h.Checks, "applies": h.Applies, "states": h.States})
+	return nil
+}
+
+// aps lists every AP the caller can view, with what the fleet view needs
+// (0042): where it is, its version, whether its config is ready, held or
+// unassigned, and when it was last seen and what it runs.
+func (s *Server) aps(w http.ResponseWriter, _ *http.Request, c call) error {
+	t := c.state.Org.Locations
+	out := []map[string]any{}
+	for _, id := range t.APs() {
+		if !may(c, change.Locations, t, id, access.View) {
+			continue
+		}
+		n, _ := t.Node(id)
+		version, _ := s.log.Version(id)
+		res, err := s.compose(c.state, id, s.reveal)
+		if err != nil {
+			return err
+		}
+		config := "ready"
+		switch {
+		case res.Unassigned:
+			config = "unassigned"
+		case len(res.Problems) > 0:
+			config = "held"
+		}
+		l, err := s.conds.Latest(id)
+		if err != nil {
+			return err
+		}
+		var inSync any
+		if l.Seen != nil && l.Seen.Running != nil {
+			inSync = *l.Seen.Running == version
+		}
+		var report json.RawMessage
+		if l.State != nil {
+			report = l.State.Report
+		}
+		ap := map[string]any{
+			"id": id, "name": n.Name, "ancestry": t.Ancestry(id), "version": version,
+			"config": config, "problems": len(res.Problems), "seen": l.Seen, "in_sync": inSync,
+			"agent": s.agentView(c.state, id, report),
+		}
+		if !res.Unassigned {
+			ap["template"] = templateView(c.state, id, res.Template)
+		}
+		if wirelessMissing(report) {
+			ap["wireless_missing"] = true
+		}
+		if at, down := s.live.down(id, time.Now()); down {
+			ap["down"] = at
+		}
+		out = append(out, ap)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"aps": out})
+	return nil
+}
+
+// apsAlive is which of the APs a person may view are down now (0165): GET
+// /v1/aps/alive, {down: {ap: since}}. It is light, so that a page may ask
+// it every few seconds, where it asks GET /v1/aps only as it draws.
+func (s *Server) apsAlive(w http.ResponseWriter, _ *http.Request, c call) error {
+	t := c.state.Org.Locations
+	now := time.Now()
+	down := map[hierarchy.NodeID]time.Time{}
+	for _, id := range t.APs() {
+		if !may(c, change.Locations, t, id, access.View) {
+			continue
+		}
+		if at, ok := s.live.down(id, now); ok {
+			down[id] = at
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"down": down})
+	return nil
+}
+
+// wirelessMissing says whether an AP's last report says netifd lost its
+// network.wireless object.
+func wirelessMissing(report json.RawMessage) bool {
+	var r struct {
+		WirelessMissing bool `json:"wireless_missing"`
+	}
+	return len(report) > 0 && json.Unmarshal(report, &r) == nil && r.WirelessMissing
+}
+
+// condition is what the manager knows of an AP's own account of itself, for
+// the AP's config view: last seen, what it runs, and whether that is its
+// current version.
+func (s *Server) condition(ap hierarchy.NodeID, version int64) (map[string]any, error) {
+	l, err := s.conds.Latest(ap)
+	if err != nil {
+		return nil, err
+	}
+	if l.Check != nil {
+		l.Check.UCI = "" // in the history; too long for a summary
+	}
+	out := map[string]any{"seen": l.Seen, "check": l.Check, "apply": l.Apply, "state": l.State, "in_sync": nil}
+	if l.Seen != nil && l.Seen.Running != nil {
+		out["in_sync"] = *l.Seen.Running == version
+	}
+	// The clients its report lists that were active on another AP since
+	// (0185): on that AP now, and not to be counted here.
+	if e := s.active.elsewhere(ap, l.State); len(e) > 0 {
+		out["elsewhere"] = e
+	}
+	// The clients its minutes put on it since that report (0251): on it
+	// now, before its next report lists them.
+	if a := s.active.arrived(ap, l.State); len(a) > 0 {
+		out["arrived"] = a
+	}
+	return out, nil
+}
+
+// fwCrash is one of an AP's radios whose firmware crashed (0310), as its
+// kernel's log says: how long ago, by the kernel's clock; the driver and
+// its device; why, where the driver says; whether the radio came back, as
+// the AP sees it now, and whether mac80211 said it lost it; the
+// radios of the device, with their bands, where the AP knows them; and
+// whether it is the AP's scan radio (0126).
+type fwCrash struct {
+	Ago       *int     `json:"ago"`
+	Driver    string   `json:"driver"`
+	Device    string   `json:"device"`
+	Why       *string  `json:"why"`
+	Recovered bool     `json:"recovered"`
+	Lost      bool     `json:"lost,omitempty"`
+	Radios    []string `json:"radios"`
+	Bands     []string `json:"bands"`
+	Scan      bool     `json:"scan,omitempty"`
+}
+
+// mixedLib is a library of which a process on the AP holds two builds at
+// once (0317): its name as libubox.so, the builds by their sonames' suffixes,
+// and the processes, by the script ucode runs or the program.
+type mixedLib struct {
+	Lib    string   `json:"lib"`
+	Builds []string `json:"builds"`
+	Procs  []string `json:"procs"`
+}
+
+// mixedLibsMost is the most libraries a report says.
+const mixedLibsMost = 8
+
+var (
+	mixedLibRE   = regexp.MustCompile(`^lib[A-Za-z0-9_.+-]{1,60}\.so$`)
+	mixedBuildRE = regexp.MustCompile(`^[0-9][0-9.]{0,23}$`)
+)
+
+func (m mixedLib) check() error {
+	bad := !mixedLibRE.MatchString(m.Lib) || len(m.Builds) < 2 || len(m.Builds) > 8 || len(m.Procs) < 1 || len(m.Procs) > 16
+	for _, b := range m.Builds {
+		bad = bad || !mixedBuildRE.MatchString(b)
+	}
+	for _, p := range m.Procs {
+		bad = bad || !fwDeviceRE.MatchString(p)
+	}
+	if bad {
+		return badRequest("mixed_libs: not a library as the agent writes it")
+	}
+	return nil
+}
+
+// fwCrashesMost is the most crashes a report says.
+const fwCrashesMost = 8
+
+var fwDeviceRE = regexp.MustCompile(`^[A-Za-z0-9_.:+-]{1,64}$`)
+
+func (c fwCrash) check() error {
+	bad := c.Ago == nil || *c.Ago < 0 || !fwDeviceRE.MatchString(c.Driver) || len(c.Driver) > 32 || !fwDeviceRE.MatchString(c.Device) ||
+		(c.Why != nil && len(*c.Why) > 60) || len(c.Radios) > 8 || len(c.Bands) > 8
+	for _, r := range c.Radios {
+		bad = bad || !fwDeviceRE.MatchString(r) || len(r) > 32
+	}
+	for _, b := range c.Bands {
+		bad = bad || (b != "2g" && b != "5g" && b != "6g" && b != "60g")
+	}
+	if bad {
+		return badRequest("fw_crashes: not a crash as the agent writes it")
+	}
+	return nil
+}

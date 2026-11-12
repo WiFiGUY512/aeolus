@@ -1,0 +1,77 @@
+{
+	"about": "The C-360 with 802.11r on a WPA2/WPA3 network and a WPA2/WPA3-Enterprise one (0224). Each BSS is a key holder by a NAS-Identifier of its own, its AP, radio and network's hash; hostapd pushes the keys of WPA3 and of WPA Enterprise to the others on the network, which it reads from the file the agent keeps for the BSS. Keys made of a passphrase are made on each AP still. The RADIUS server is told the NAS-Identifier set on the network, aeolus-c360. The Enterprise network keeps its clients' keys and takes sign-ins ahead of a roam.",
+	"current": "c360-current.json",
+	"facts": {
+		"uplink": "eth0",
+		"radios": {
+			"radio0": {
+				"htmodes": [
+					"HE20",
+					"HE40",
+					"HE80",
+					"HE160"
+				]
+			},
+			"radio1": {
+				"htmodes": [
+					"HE20",
+					"HE40"
+				]
+			},
+			"radio3": {
+				"htmodes": [
+					"HE20",
+					"HE40",
+					"HE80",
+					"HE160"
+				]
+			}
+		},
+		"eap": true,
+		"ap": "ap-30862def2fff"
+	},
+	"intent": {
+		"system": {
+			"country": "US",
+			"poll": 60
+		},
+		"network": {
+			"corp": {
+				"ssid": "Aeolus Corp",
+				"security": "wpa2-wpa3-enterprise",
+				"radius": {
+					"auth_server": "192.168.20.5",
+					"auth_secret": "fixture-radius-secret",
+					"acct_server": "192.168.20.5",
+					"nas_id": "aeolus-c360"
+				},
+				"transport": {
+					"primary": {
+						"type": "vlan",
+						"vlan": 20
+					}
+				},
+				"roaming": {
+					"ft": true
+				}
+			},
+			"home": {
+				"ssid": "Home Wi-Fi",
+				"security": "wpa2-wpa3",
+				"passphrase": "fixture-passphrase-1",
+				"roaming": {
+					"ft": true,
+					"rrm": true,
+					"btm": true
+				},
+				"transport": {
+					"primary": {
+						"type": "vlan",
+						"vlan": 20
+					}
+				}
+			}
+		}
+	},
+	"errors": []
+}

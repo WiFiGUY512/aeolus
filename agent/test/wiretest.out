@@ -1,0 +1,52 @@
+mac "0e:ef:2f:ff:00:20" "0e:ef:2f:ff:40:94" "0e:ef:2f:ff:00:50" "0e:ef:2f:ff:00:00" null null
+filter [ [ 32, 0, 0, 4294963204 ], [ 21, 16, 0, 4 ], [ 32, 0, 0, 0 ], [ 21, 0, 2, 250556415 ], [ 40, 0, 0, 4 ], [ 21, 13, 12, 32 ], [ 21, 0, 11, 4294967295 ], [ 40, 0, 0, 12 ], [ 21, 10, 0, 2054 ], [ 21, 0, 8, 2048 ], [ 48, 0, 0, 23 ], [ 21, 0, 6, 17 ], [ 40, 0, 0, 20 ], [ 69, 4, 0, 8191 ], [ 177, 0, 0, 14 ], [ 72, 0, 0, 16 ], [ 21, 2, 0, 68 ], [ 6, 0, 0, 0 ], [ 6, 0, 0, 0 ], [ 6, 0, 0, 262144 ] ]
+wanted { "ssid": "Aeolus Lab", "network": "lab", "eap": null, "bssids": [ ], "channels": [ ], "band": "wire", "speed": null, "dns_name": "openwrt.org", "ap": "ap-30862def2fff", "roam": [ ] }
+wanted { "ssid": "x", "band": "wire" }: null
+wanted { "ssid": "x", "network": "lab", "band": "wire" }: null
+wanted { "ssid": "x", "network": "lab", "band": "wire", "ap": "office-ap" }: null
+wanted { "ssid": "x", "network": "lab", "band": "wire", "ap": "ap-30862def2fff", "bssids": [ "20:05:b6:df:64:ec" ] }: null
+wanted { "ssid": "x", "network": "lab", "band": "wire", "ap": "ap-30862def2fff", "eap": { "method": "peap", "identity": "u", "password": "p" } }: null
+discover 342 bytes, to ff:ff:ff:ff:ff:ff from 0e:ef:2f:ff:00:20, flags 8000, options 3501013d07010eef2fff0020370501030633360c0b61656f6c75732d7465
+tagged for VLAN 20: 810000140800; untagged there: 0800; no VLAN: 0800
+request options 3501033d07010eef2fff00203204c0a8144d3604c0a81401370501030633360c0b61656f6c75732d7465
+release to d4:01:c3:00:00:01, IP 192.168.20.77 to 192.168.20.1, flags 0000, options 3501073d07010eef2fff00203604c0a8
+asked again after 4.7 s: secs 0004
+checksums add up: discover true, request true, release true
+offer { "type": "offer", "address": "192.168.20.77", "mask": 24, "router": "192.168.20.1", "dns": [ "192.168.20.1", "9.9.9.9" ], "server": "192.168.20.1", "lease": 43200 }
+ack { "type": "ack", "address": "192.168.20.77", "mask": 24, "router": "192.168.20.1", "dns": [ "192.168.20.1", "9.9.9.9" ], "server": "192.168.20.1", "lease": 43200 }
+nak "nak"
+another client null, another transaction null, no DHCP null
+masks 24 22 0 null null
+arp request 60 bytes: { "op": 1, "mac": "0e:ef:2f:ff:00:20", "ip": "192.168.20.77", "target": "192.168.20.1" }
+arp reply { "op": 2, "mac": "d4:01:c3:00:00:01", "ip": "192.168.20.1", "target": "192.168.20.77" }
+asked for its address, it answers { "op": 2, "mac": "0e:ef:2f:ff:00:20", "ip": "192.168.20.77", "target": "192.168.20.1" } to d4:01:c3:00:00:01
+asked for another null, its own request null, no ARP null
+probe { "op": 1, "mac": "0e:ef:2f:ff:00:20", "ip": "0.0.0.0", "target": "192.168.20.77" }
+another has it "7e:2a:ea:04:b1:8f"; the gateway asking for it null; the test itself null; no ARP null
+a gateway that answers for every address: for the test's "d4:01:c3:00:00:01", for its own "d4:01:c3:00:00:01"
+query 71 bytes to d4:01:c3:00:00:01: IP 450000399c4140004011b76bc0a8144d09090909, its checksum adds up true
+answer from 9.9.9.9 port 53: { "rcode": 0, "answers": 1, "address": "64.68.130.164" }
+to another port null, to another address null, no UDP null
+on link true false false true
+a VLAN { "device": "eth1", "vlan": 20, "tagged": true }
+a VLAN carried untagged { "device": "eth0", "vlan": 7, "tagged": false }
+a VLAN not watched { "why": "this AP does not watch VLAN 99 on its uplink, so it cannot say how it is carried" }
+on its tunnel { "device": "aeolus_50", "vni": 50 }
+on its fallback { "device": "eth0", "vlan": 50, "tagged": true }
+on neither { "why": "the network has no transport in its bridge now" }
+on a tunnel alone { "device": "aeolus_50", "vni": 50 }
+no uplink { "why": "this AP has no uplink port to test from" }, no VLAN { "why": "the network is on br-lan, which is no VLAN of the uplink's and no tunnel of Aeolus's" }, no interface { "why": "this AP has no interface for that network" }
+passed: passed: over the wire, address in 0.2 s, gateway answers ARP in 0.8 ms, DNS 14 ms
+no gateway: failed at gateway: its gateway, 192.168.20.1, does not answer
+no address: failed at dhcp: no DHCP server gave it an address
+echo: 84 bytes, type 8, checksum 2d07, id 1234, seq 7
+its answer 84, another number null, another ID null, a request null, not ICMP null, short null
+a full-size echo: 1500 bytes
+ping: 1514 bytes, to d401c3000001, flags 0000, ttl 64, proto 1, header sums to ffff, echo id 1234 seq 9
+its answer 84, a later fragment null, to another null, ARP null
+syn: ports 40000 to 443, seq 01020304, flags 02, header 24 bytes, option 020405b4, sums to ffff
+syn-ack { "from": "1.1.1.1", "sport": 443, "seq": 168496141, "ack": 16909061, "flags": 18, "mss": 1360 }
+no MSS null, another port null
+rst: flags 04, seq 01020305, sums to ffff
+black hole: failed at path: packets over 1408 bytes without DF are lost on the way out, and TCP here sends 1500, so IoT clients that send without DF stall: clamp TCP's MSS to 1368 or less at the internet router
+clamped: passed: over the wire, address in 0.2 s, gateway answers ARP in 0.8 ms, DNS 14 ms, packets out to 1408 bytes

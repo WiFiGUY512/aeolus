@@ -1,0 +1,7 @@
+clean { "trusted_ssid": [ "Home Wi-Fi", "Home_Wi-Fi_IoT" ], "trusted_bssid": [ "e4:d1:24:be:3a:40", "e6:d1:24:be:3a:40" ] }
+clean, not a doc null null
+listOf [ "a", "b" ] [ "a" ] [ ]
+first { "next": [ "00:11:22", "e4:d1:24:be:3a:40", "e6:d1:24:be:3a:40" ], "mine": [ "e6:d1:24:be:3a:40" ] }
+dropped { "next": [ "00:11:22", "e4:d1:24:be:3a:40" ], "mine": [ ] }
+none { "next": [ "00:11:22", "e4:d1:24:be:3a:40" ], "mine": [ ] }
+same true false true

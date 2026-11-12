@@ -1,0 +1,66 @@
+{
+	"about": "Channel compatibility (0232): ShedAP's 5 GHz at 40 MHz with compatibility turned off and a set that names the upper channels, 165-177: their blocks, 165/169 and 173/177, are in the list hostapd picks from and radio resource management moves within. With it on, as unless turned off, they are left out (see channels.json, whose set has none).",
+	"current": "shed-current.json",
+	"facts": {
+		"uplink": "wan",
+		"radios": {
+			"radio0": {
+				"htmodes": [
+					"HT20",
+					"HT40",
+					"VHT20",
+					"VHT40",
+					"VHT80",
+					"VHT80+80",
+					"VHT160"
+				]
+			},
+			"radio1": {
+				"htmodes": [
+					"HT20",
+					"HT40"
+				]
+			}
+		}
+	},
+	"intent": {
+		"system": {
+			"country": "US",
+			"poll": 60
+		},
+		"radio": {
+			"2g": {
+				"channel": "auto"
+			},
+			"5g": {
+				"channel": "auto",
+				"width": 40,
+				"compatible": false,
+				"channels": [
+					36,
+					40,
+					149,
+					153,
+					165,
+					169,
+					173,
+					177
+				]
+			}
+		},
+		"network": {
+			"lab": {
+				"ssid": "Aeolus Lab",
+				"security": "wpa2-psk",
+				"passphrase": "fixture-passphrase-1",
+				"transport": {
+					"primary": {
+						"type": "vlan",
+						"vlan": 20
+					}
+				}
+			}
+		}
+	},
+	"errors": []
+}

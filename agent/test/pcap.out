@@ -1,0 +1,74 @@
+a network, both sides:
+  phy0-ap4, wireless (Home_Wi-Fi_IoT, 2g): everything
+  phy1-ap4, wireless (Home_Wi-Fi_IoT, 5g): everything
+  eth0, wired (VLAN 10): vlan 10
+one client on it:
+  phy0-ap4, wireless (Home_Wi-Fi_IoT, 2g): ether host 7e:2a:ea:04:b1:8f
+  phy1-ap4, wireless (Home_Wi-Fi_IoT, 5g): ether host 7e:2a:ea:04:b1:8f
+  eth0, wired (VLAN 10): ether host 7e:2a:ea:04:b1:8f and vlan 10
+its Wi-Fi side alone, on 5 GHz:
+  phy1-ap4, wireless (Home_Wi-Fi_IoT, 5g): everything
+its wired side alone:
+  eth0, wired (VLAN 10): ether host 7e:2a:ea:04:b1:8f and vlan 10
+a network on the VLAN the uplink carries untagged:
+  phy1-ap5, wireless (First, 5g): ether host 7e:2a:ea:04:b1:8f
+  eth0, wired (VLAN 1, untagged): ether host 7e:2a:ea:04:b1:8f and not vlan
+a network in a tunnel:
+  phy0-ap0, wireless (Tunnelled, 2g): ether host 7e:2a:ea:04:b1:8f
+  phy1-ap0, wireless (Tunnelled, 5g): ether host 7e:2a:ea:04:b1:8f
+  aeolus_50, wired (the tunnel): ether host 7e:2a:ea:04:b1:8f
+a VLAN, both sides: every network on it:
+  phy0-ap1, wireless (Aeolus Lab, 2g): everything
+  phy1-ap1, wireless (Aeolus Lab, 5g): everything
+  eth0, wired (VLAN 20): vlan 20
+a VLAN, the wired side:
+  eth0, wired (VLAN 10): ether host 7e:2a:ea:04:b1:8f and vlan 10
+a VLAN the uplink does not carry: the ports that do:
+  lan2, wired (VLAN 30, untagged): not vlan
+  lan3, wired (VLAN 30): vlan 30
+a VLAN nothing carries:
+  refused: nothing on this AP carries that
+a VLAN no network is on, the Wi-Fi side:
+  refused: no Wi-Fi interface of this AP carries that
+a network the AP has not:
+  refused: this AP does not have that network
+a band it is not on:
+  refused: no Wi-Fi interface of this AP carries that
+a client that is no MAC:
+  refused: the client is not a MAC
+no side said:
+  refused: which side to take was not said
+a VLAN that is none:
+  refused: the VLAN is not one
+a VLAN on an AP whose uplink is in no bridge:
+  refused: the AP's uplink is in no bridge, so it carries no VLAN to take
+a network with an interface no AP names so:
+  phy0-ap1, wireless (Aeolus Lab, 2g): everything
+  phy1-ap1, wireless (Aeolus Lab, 5g): everything
+of 12 radios with the network, 8 interfaces are taken
+packets each of 3 interfaces may take: 48545 of headers, 10814 of whole packets; of 1 with little room: 200
+#!/bin/sh
+cd /tmp/aeolus-capture || exit 1
+tcpdump -i phy1-ap4 -p -n -U -s 128 -c 72817 -w 0.pcap 'ether host 7e:2a:ea:04:b1:8f' 2>0.err &
+echo $! >0.pid
+tcpdump -i eth0 -p -n -U -s 128 -c 72817 -w 1.pcap 'ether host 7e:2a:ea:04:b1:8f and vlan 10' 2>1.err &
+echo $! >1.pid
+sleep 60 &
+echo $! >timer.pid
+wait $!
+for p in *.pid; do [ "$p" = timer.pid ] || kill "$(cat "$p")" 2>/dev/null; done
+wait
+: >ended
+#!/bin/sh
+cd /tmp/aeolus-capture || exit 1
+tcpdump -i eth0 -p -n -U -s 262144 -c 32443 -w 0.pcap 'vlan 10' 2>0.err &
+echo $! >0.pid
+sleep 30 &
+echo $! >timer.pid
+wait $!
+for p in *.pid; do [ "$p" = timer.pid ] || kill "$(cat "$p")" 2>/dev/null; done
+wait
+: >ended
+{ "packets": 42, "dropped": 3 }
+{ "packets": 1, "dropped": 0 }, null
+"phy9-ap0: No such device exists"; null; null

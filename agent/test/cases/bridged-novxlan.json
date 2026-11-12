@@ -1,0 +1,65 @@
+{
+	"about": "A VNI carried into the AP's bridge (0335) on an AP without the vxlan package: refused, as a VXLAN transport is.",
+	"current": "shed-current.json",
+	"facts": {
+		"prober": true,
+		"veth": true,
+		"ap": "ap-a0046082275e",
+		"uplink": "wan",
+		"management": "lan",
+		"vxlan": false,
+		"nft_bridge": true,
+		"radios": {
+			"radio0": {
+				"htmodes": [
+					"HT20",
+					"HT40",
+					"VHT20",
+					"VHT40",
+					"VHT80",
+					"VHT80+80",
+					"VHT160"
+				]
+			},
+			"radio1": {
+				"htmodes": [
+					"HT20",
+					"HT40"
+				]
+			}
+		}
+	},
+	"intent": {
+		"system": {
+			"country": "US",
+			"poll": 60
+		},
+		"network": {
+			"lab": {
+				"ssid": "Aeolus Lab",
+				"security": "wpa2-psk",
+				"passphrase": "fixture-passphrase-1",
+				"transport": {
+					"primary": {
+						"type": "vlan",
+						"vlan": 20
+					}
+				}
+			}
+		},
+		"concentrators": {
+			"helios": {
+				"address": "192.168.1.44",
+				"port": 4789,
+				"mtu": 1450,
+				"probe_interval": 30,
+				"bridged": {
+					"untagged": {
+						"vni": 9003
+					}
+				}
+			}
+		}
+	},
+	"refused": true
+}

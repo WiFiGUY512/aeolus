@@ -1,0 +1,12 @@
+#!/bin/sh /etc/rc.common
+# After a sysupgrade, the packages Aeolus put in beyond the image go back
+# from the copies it kept, at the start of boot, before the network and the
+# Wi-Fi start: put back once they are up, the full wpad and vxlan restart
+# every radio (0248). On any other boot it does nothing.
+
+START=11
+
+boot() {
+	[ -x /usr/libexec/aeolus-packages ] && /usr/libexec/aeolus-packages early
+	return 0
+}

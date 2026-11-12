@@ -1,0 +1,631 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/WiFiGUY512/aeolus/internal/schema/v1.json",
+  "title": "Aeolus AP config, v1",
+  "description": "The fully resolved config an AP receives (0008). Every leaf is a field that can be set on a folder or an AP (0012). x-aeolus-tree says which tree owns each part (0013). writeOnly marks secrets (0027). readOnly parts are filled in by the manager, never set in a tree.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "radio": {
+      "x-aeolus-tree": "locations",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "2g": { "$ref": "#/$defs/radio2g" },
+        "5g": { "$ref": "#/$defs/radio5g" },
+        "6g": { "$ref": "#/$defs/radio6g" }
+      }
+    },
+    "system": {
+      "x-aeolus-tree": "locations",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "country": { "type": "string", "pattern": "^[A-Z]{2}$", "x-aeolus-enum": "countries", "description": "Regulatory country, ISO 3166 alpha-2: one of tzdata's list (0074)." },
+        "tz": { "type": "string", "minLength": 1, "maxLength": 64, "x-aeolus-enum": "zones", "description": "IANA time zone, such as America/Chicago: one of Aeolus's table, which gives each its rule for the AP's clock (0074)." },
+        "ntp": { "type": "array", "items": { "$ref": "#/$defs/host" }, "maxItems": 4 },
+        "captures": { "type": "boolean", "default": true, "description": "Keep a capture of each attempt to come online that fails (0135): the client's frames as the AP's radio heard and sent them, and those that crossed its wire side, as a file Wireshark opens. Each radio that serves has a monitor interface for it. On unless set off." },
+        "ble_proxy": { "type": "boolean", "default": false, "description": "Lend the AP's Bluetooth radio to Home Assistant (0156): the AP listens for Bluetooth LE advertisements and hands each to a Home Assistant that connects to it, as an ESPHome Bluetooth proxy does. Home Assistant adds the AP under ESPHome, by its address, port 6053, which asks no password. It only listens, unless Home Assistant asks it to scan actively. Off unless set on." },
+        "poll": { "type": "integer", "minimum": 10, "maximum": 3600, "description": "Seconds between config polls (0007)." },
+        "agent": { "type": "string", "pattern": "^(current|[A-Za-z0-9._-]{1,64})$", "default": "current", "description": "The agent release the APs run (0079): current, the manager's own, unless set, or a release the manager keeps, such as v0.49.0. Each AP updates itself, and rolls itself back if the new agent doesn't confirm itself." },
+        "syslog": { "$ref": "#/$defs/host", "description": "Remote syslog host, optionally host:port." },
+        "internet": { "type": "string", "maxLength": 253, "pattern": "^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$", "description": "What an AP asks, to say whether the internet answers and how long it takes (0142): a host name or an IPv4 address it pings every 30 seconds, shown on the AP's Path tab. Nothing of the internet is asked unless this is set." },
+        "speed_server": { "type": "string", "pattern": "^http://[A-Za-z0-9.-]{1,253}(:([1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5]))?/?$", "description": "The local speed server (0134): an OpenSpeedTest server on the site's own network, as http://host or http://host:port, the port 1 to 65535, that a client test measures against (0121): it moves bytes from its /downloading and to its /upload for a few seconds each way, which shows what the air and the wire carry. Plain HTTP, as the test's own interface sends it. Unset, a client test measures no local speed." },
+        "speed_server_remote": { "type": "string", "pattern": "^([a-z][a-z0-9-]{0,39}|http://[A-Za-z0-9.-]{1,253}(:([1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5]))?/?)$",
+          "x-aeolus-choices": [["cloudflare", "Cloudflare, the nearest of its sites"], ["librespeed-atlanta", "LibreSpeed, Atlanta (Clouvider)"], ["librespeed-los-angeles", "LibreSpeed, Los Angeles (Clouvider)"], ["librespeed-london", "LibreSpeed, London (Clouvider)"], ["librespeed-amsterdam", "LibreSpeed, Amsterdam (Clouvider)"], ["librespeed-frankfurt", "LibreSpeed, Frankfurt (Clouvider)"], ["librespeed-prague-cesnet", "LibreSpeed, Prague (CESNET)"], ["librespeed-prague-turris", "LibreSpeed, Prague (Turris)"], ["librespeed-belgrade", "LibreSpeed, Belgrade (SOX)"], ["tele2", "Tele2, Europe"]],
+          "x-aeolus-own": "An OpenSpeedTest server of your own",
+          "x-aeolus-own-as": "http://host or http://host:port",
+          "description": "The remote speed server (0134), out on the internet: a client test measures against it too, which shows the whole way out. One of the public servers by its name, as cloudflare, or an OpenSpeedTest server of one's own, as http://host or http://host:port. Plain HTTP. A name is any name: one the manager's list has no longer is kept, and measures nothing, so that a server taken from the list holds no AP's config back. A measurement moves as much as the link carries for some ten seconds: mind a link that is metered. Unset, a client test measures no remote speed." },
+        "ssh_keys": { "type": "array", "items": { "type": "string", "pattern": "^(ssh-ed25519|ecdsa-sha2-nistp256|ssh-rsa) [A-Za-z0-9+/=]+( .*)?$" } },
+        "dns_log": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "url": {"type": "string", "pattern": "^https?://[A-Za-z0-9.-]{1,253}(:([1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5]))?/?$", "description": "The DNS server whose own log says what each client here looks up (0154): a Technitium DNS Server's web console, as http://host:5380, with a query logs app installed. The manager asks it when someone opens a client's lookups, by the client's address, and keeps nothing of the answer. It is the manager's own to use: no AP is told it."},
+            "token": {"type": "string", "minLength": 8, "maxLength": 256, "pattern": "^[A-Za-z0-9._~+/=-]+$", "writeOnly": true, "description": "An API token of that server's, of a user who may view its logs. Sealed, and never sent to an AP."}
+          }
+        },
+        "updates": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "The manager's own releases (0183), set at the Org: it looks for a newer one once a day, and with automatic on, installs it by itself in the window. The manager's own: never sent to APs.",
+          "properties": {
+            "automatic": { "type": "boolean", "default": false, "description": "On, the manager installs a newer release by itself, in the window. Off, it says one is out, and an admin installs it with Update now." },
+            "window": { "type": "string", "pattern": "^([01][0-9]|2[0-3]):[0-5][0-9]-([01][0-9]|2[0-3]):[0-5][0-9]$", "default": "03:00-05:00", "description": "When it may install one by itself, in the Org's local time (system.tz at the Org), such as 03:00-05:00, the default. The manager restarts as it does, for a minute or so; the APs keep running." },
+            "channel": { "type": "string", "enum": ["stable", "testing"], "default": "stable", "description": "Which releases it takes (0282). stable, the default: only one promoted after it has run a while on testing. testing: each release as it is made. The APs take their agent from the manager, so they follow it." }
+          }
+        },
+        "advisor": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "The advisor (0205), a folder's (0212): a folder that sets key itself has an advisor of its own, which reviews that folder and what is below it, but a folder below with a key of its own, billed to that key; its other settings resolve at that folder. In a review Claude reads the manager's data as the account aeolus-advisor, a viewer held to that folder, and records what it finds wrong with clients, APs, networks and settings, with what to do. It never changes anything. What its tools return, the clients' MACs and host names among them, is sent to Anthropic's API under this key. The manager's own: never sent to APs.",
+          "properties": {
+            "enabled": { "type": "boolean", "default": false, "description": "On, the manager runs a review every so many hours. Off unless set; a review can still be asked for by an admin." },
+            "key": { "type": "string", "minLength": 20, "maxLength": 256, "pattern": "^[A-Za-z0-9_-]+$", "writeOnly": true, "x-aeolus-placeholder": "sk-ant-…", "description": "The Anthropic API key the reviews are made with, and billed to. Set at a folder, it gives that folder an advisor of its own (0212). Sealed, and never sent to an AP." },
+            "model": { "type": "string", "enum": ["claude-opus-5-5", "claude-sonnet-5-5"], "default": "claude-opus-5-5", "description": "The model that reviews: Claude Opus 5.5, the default, or Claude Sonnet 5.5, at about half the cost." },
+            "every": { "type": "integer", "minimum": 1, "maximum": 168, "default": 24, "description": "Hours between reviews. 24 unless set." },
+            "web": { "type": "boolean", "default": true, "description": "On, the default, a review may search the web a few times, for what is known of a device or its firmware." },
+            "budget": { "type": "number", "minimum": 0.1, "maximum": 50, "default": 2, "description": "The most a review may cost, in US dollars, at the model's prices: no request is made that would pass it. 2 unless set." }
+          }
+        },
+        "switches": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "addresses": { "type": "array", "items": { "$ref": "#/$defs/host" }, "maxItems": 16, "description": "The switches the manager reads to find a client's way out (0168): each an Arista switch's name or address, with :port where its eAPI is not on 443. The manager asks each, when someone opens a client's path, what its LLDP, MAC table, ARP and routes say, with show commands alone. Never sent to an AP." },
+            "user": { "type": "string", "pattern": "^[A-Za-z0-9._-]{1,32}$", "description": "The user the manager signs in to those switches as: one of their own, read-only (role network-operator)." },
+            "password": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[^\\x00-\\x1f]+$", "writeOnly": true, "description": "That user's password. Sealed, and never sent to an AP." }
+          }
+        },
+        "place": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Where a folder or an AP is, for its map (0169). Set on a folder, its APs are drawn there unless one is set on an AP itself. Never sent to an AP.",
+          "properties": {
+            "address": { "type": "string", "minLength": 1, "maxLength": 256, "pattern": "^[^\\x00-\\x1f]+$", "description": "Its street address, as a person writes it." },
+            "latitude": { "type": "number", "minimum": -90, "maximum": 90, "description": "Its latitude, in degrees north." },
+            "longitude": { "type": "number", "minimum": -180, "maximum": 180, "description": "Its longitude, in degrees east." }
+          }
+        },
+        "snmp": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Answering SNMP queries, read-only, through snmpd, which the agent's installer adds (0052).",
+          "properties": {
+            "enabled": { "type": "boolean", "default": false, "description": "Answer SNMP queries; unset, the AP does not." },
+            "community": { "type": "string", "pattern": "^[A-Za-z0-9._~!@#%^*+=:-]{1,64}$", "writeOnly": true, "description": "The read-only SNMP v2c community." },
+            "v3": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "user": { "type": "string", "pattern": "^[A-Za-z0-9._-]{1,32}$", "description": "The read-only SNMP v3 user." },
+                "auth": { "type": "string", "pattern": "^[^\"\\\\\\x00-\\x1f]{8,64}$", "writeOnly": true, "description": "The v3 user's authentication passphrase, used with SHA." },
+                "privacy": { "type": "string", "pattern": "^[^\"\\\\\\x00-\\x1f]{8,64}$", "writeOnly": true, "description": "The v3 user's privacy passphrase, used with AES." }
+              }
+            },
+            "location": { "type": "string", "pattern": "^[^\\x00-\\x1f]{0,128}$", "description": "sysLocation." },
+            "contact": { "type": "string", "pattern": "^[^\\x00-\\x1f]{0,128}$", "description": "sysContact." }
+          }
+        },
+        "management": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "vlan": { "type": "integer", "minimum": 0, "maximum": 4094, "description": "0 means untagged." },
+            "addressing": { "enum": ["dhcp", "static"] },
+            "address": { "type": "string", "pattern": "^[0-9A-Fa-f:.]+/[0-9]{1,3}$", "description": "CIDR, for static addressing." },
+            "gateway": { "$ref": "#/$defs/ip" },
+            "dns": { "type": "array", "items": { "$ref": "#/$defs/ip" }, "maxItems": 3 }
+          },
+          "allOf": [
+            { "if": { "properties": { "addressing": { "const": "static" } }, "required": ["addressing"] }, "then": { "required": ["address", "gateway"] } }
+          ]
+        }
+      }
+    },
+    "ports": {
+      "x-aeolus-tree": "locations",
+      "type": "object",
+      "propertyNames": { "pattern": "^[a-z][a-z0-9._-]{0,15}$" },
+      "additionalProperties": { "$ref": "#/$defs/port" }
+    },
+    "network": {
+      "x-aeolus-tree": "services",
+      "type": "object",
+      "propertyNames": { "$ref": "#/$defs/networkId" },
+      "additionalProperties": { "$ref": "#/$defs/network" }
+    },
+    "templates": { "x-aeolus-tree": "locations", "description": "AP templates, by board as OpenWrt names it (arista,c-360): the template the board's APs below take (0085). Not sent to APs: the manager applies the template.", "type": "object", "propertyNames": { "pattern": "^[a-z0-9][a-z0-9,_+-]{0,63}$" }, "additionalProperties": { "$ref": "#/$defs/templateId" } },
+    "boards": { "x-aeolus-tree": "locations", "description": "Settings for one kind of AP, by board as OpenWrt names it (arista,c-360) (0092): its APs take them in place of the plain ones set on the same folder or above it, so one kind's ports don't reach another's of the same name. Not sent to APs as they are: the manager folds them into each AP's own. Ports and the uplink, for now.", "type": "object", "propertyNames": { "pattern": "^[a-z0-9][a-z0-9,_+-]{0,63}$" }, "additionalProperties": { "$ref": "#/$defs/boardSettings" } },
+    "uplink": { "x-aeolus-tree": "locations", "$ref": "#/$defs/uplink" },
+    "notify": {
+      "x-aeolus-tree": "locations",
+      "description": "Where the manager sends alerts for the APs here (0101): the manager's own, never sent to APs. An alert is sent once it has lasted two minutes, and its end when its cause is gone.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "ntfy": { "type": "string", "pattern": "^https?://[^ ]+$", "maxLength": 512, "writeOnly": true, "x-aeolus-placeholder": "https://ntfy.sh/your-own-topic", "description": "An ntfy topic's URL, such as https://ntfy.sh/your-own-topic: each alert a push notification, its priority by severity. Sealed, as a topic is as good as a password." },
+        "webhook": { "type": "string", "pattern": "^https?://[^ ]+$", "maxLength": 512, "writeOnly": true, "x-aeolus-placeholder": "https://…", "description": "A URL each alert is POSTed to as JSON: {event: alert or resolved, alert: {ap, name, severity, kind, key, message, since}, at}. Sealed, as such a URL often holds a token." },
+        "severity": { "enum": ["critical", "warning", "info"], "default": "critical", "description": "The least severe alert sent: critical unless set." },
+        "resolved": { "type": "boolean", "default": true, "description": "Also send when an alert's cause is gone." }
+      }
+    },
+    "maintenance": {
+      "x-aeolus-tree": "locations",
+      "description": "The APs here are off or being worked on, on purpose (0218): their alerts are still worked out, listed and kept, said to be in maintenance, but none is sent and none is counted among those that need attention. With hold and until, a test window (0344): the APs also hold still until it ends.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "on": { "type": "boolean", "description": "In maintenance. Unset or off, the APs are in service." },
+        "until": { "type": "string", "pattern": "^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])(T([01][0-9]|2[0-3]):[0-5][0-9]Z)?$", "maxLength": 17, "x-aeolus-placeholder": "2026-11-01 or 2026-11-01T18:00Z", "description": "When it ends, in UTC: a day, as it begins, or a day and a time. Unset, it lasts until on is taken away." },
+        "why": { "type": "string", "maxLength": 200, "description": "What is being done, said with its alerts." },
+        "hold": { "type": "boolean", "description": "A test window (0344): the APs hold still until it ends, so a test on them is not disturbed. Radio resource management moves no channel and steps no power, steering asks nothing of clients, the manager offers them no other agent, and no client test is asked of them, or of another AP for their networks, on a schedule. Each AP ends it by its own clock, whether it reaches the manager or not, and through a sysupgrade. It needs until: without an end, nothing is held." }
+      }
+    },
+    "homes": {
+      "x-aeolus-tree": "locations",
+      "description": "Where a client belongs, by its MAC (0319): on a steered network, a client that is not on one of the APs named, or not on one of the bands named there, is moved there as sticky moves a client, where the network has a place for it there on a band it is known to use. A client only ever seen on 2.4 GHz is never sent to 5 or 6 GHz.",
+      "type": "object",
+      "propertyNames": { "pattern": "^[0-9a-f]{2}(:[0-9a-f]{2}){5}$" },
+      "maxProperties": 256,
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "aps": { "type": "array", "items": { "type": "string", "pattern": "^ap-[0-9a-f]{12}$" }, "minItems": 1, "maxItems": 8, "uniqueItems": true, "description": "The APs it belongs on, by ID; with nearest, the APs it may be sent to." },
+          "nearest": { "type": "boolean", "description": "On whichever AP hears it best (0321): the APs compare how strongly each hears it, by its probes and their scan radios, and it is sent to one that hears it 5 dB or more better than the AP it is on. With aps, only among those." },
+          "bands": { "type": "array", "items": { "type": "string", "enum": ["2g", "5g", "6g"] }, "minItems": 1, "uniqueItems": true, "description": "The bands it belongs on there. Unset, any." },
+          "hold": { "type": "integer", "minimum": 1, "maximum": 300, "description": "How long, in seconds, it is kept off an AP it does not belong on once put off: on every band of the network there. Unset, 30." }
+        }
+      }
+    },
+    "assurance": {
+      "x-aeolus-tree": "locations",
+      "description": "Service assurance (0123): the service tried from a client's side on a schedule, by the APs here that have a scan radio, and over the wire by any AP (0128). The manager's own, never sent to APs.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "tests": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "every": { "type": "integer", "enum": [0, 15, 30, 60, 180, 360, 720, 1440], "description": "How often, in minutes, an AP is asked for a client test, of the tests over says (0131): through the air, one with a scan radio, each time another of its networks, on itself or on an AP it hears well, on one band (0121); over the wire, any AP, each time another of its networks (0128). Unset or 0, none is asked on a schedule; 0 says so below a folder that sets one." },
+            "speed": { "type": "boolean", "default": false, "description": "On, a test on a schedule measures speed too, against the local speed server, where one is set. Off, it measures no local speed: a speed measurement fills the air for ten seconds." },
+            "speed_remote": { "type": "boolean", "default": false, "description": "On, a test on a schedule measures speed against the remote speed server too (0134), where one is set. Off, only a test asked by hand does: each measurement moves as much as the internet link carries for some ten seconds, every test." },
+            "over": { "enum": ["air", "wire", "both"], "default": "air", "description": "Which tests the APs here are asked for on a schedule (0131). Through the air (air): an AP with a scan radio joins its networks as a client would (0121). Over the wire (wire): any AP asks each of its networks, from its own uplink, on the network's VLAN or into its tunnel, for an address, the gateway and a name (0128); it joins nothing and uses no radio. Both: each AP all it can, the tests through the air first." },
+            "wire": { "type": "boolean", "default": false, "description": "The setting before over (0128): on, tests over the wire too, which is both where over is not set. Set over instead." },
+            "roam": { "type": "boolean", "default": false, "description": "On, each test through the air, once on and measured, roams to the other APs its AP tests the same network on, on that band, one after another, and back, as a client walking about would (0225): each roam timed, from asking until let on, and said how the client came by its keys there: by 802.11r, with a key it held, by the WPA2 key handshake, or by signing in again. Each roam is a second or two more of the scan radio." },
+            "bands": { "type": "array", "uniqueItems": true, "minItems": 1, "items": { "enum": ["2g", "5g", "6g"] }, "description": "The bands the tests on a schedule join on through the air (0181); unset, every band a network is on. Tests over the wire use no band." },
+            "window": { "type": "string", "pattern": "^([01][0-9]|2[0-3]):[0-5][0-9]-([01][0-9]|2[0-3]):[0-5][0-9]$", "description": "When the tests on a schedule are asked, in the AP's local time (system.tz), such as 01:00-05:00 (0181): out of it, none is asked, and the schedule takes up again when it comes round. It may run past midnight, as 18:00-08:00 keeps them out of working hours; one that starts where it ends is the whole day. Unset, at any time." },
+            "windows": {"type": "array", "maxItems": 8, "uniqueItems": true, "items": {"type": "string", "pattern": "^((mon|tue|wed|thu|fri|sat|sun)(-(mon|tue|wed|thu|fri|sat|sun))?(,(mon|tue|wed|thu|fri|sat|sun)(-(mon|tue|wed|thu|fri|sat|sun))?)* )?([01][0-9]|2[0-3]):[0-5][0-9]-([01][0-9]|2[0-3]):[0-5][0-9]$"}, "description": "Blocks of time the tests on a schedule are asked in, in the AP's local time (system.tz) (0188): each HH:MM-HH:MM, every day, or after the days it is for, such as \"mon-fri 08:00-17:00\", \"sat,sun 10:00-12:00\" or \"fri 22:00-02:00\" (past midnight, into the next day). Set, they take the window's place; out of all of them, none is asked."},
+            "until": {"type": "integer", "minimum": 0, "description": "When a run of tests on a schedule asked for a while ends, in Unix seconds (0188): from then on none is asked, as though paused. Unset, they run for as long as the schedule says."},
+            "per_hour": { "type": "integer", "minimum": 1, "maximum": 60, "description": "The most tests through the air a tester makes in an hour (0182): each takes its scan radio from airscan and rogue detection (0126, 0160). Every test through the air in the hour counts, those asked by hand too; only those on a schedule wait. Unset, as many as its schedule asks." },
+            "alert_after": { "type": "integer", "minimum": 1, "maximum": 10, "default": 2, "description": "How many failures running, of one network on one AP and band, make an alert (0182): two unless set. A network's own alert_after, where it sets one, comes first." },
+            "paused": { "type": "boolean", "default": false, "description": "On, no test is asked here or below on a schedule, and every, and the rest, are kept for when it is off again (0180). Tests and rounds asked by hand still run." },
+            "networks": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/networkId" }, "description": "The networks the tests on a schedule join, by ID (0180); unset, every network a test can join." },
+            "leave_out": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/networkId" }, "description": "Networks the tests on a schedule never join, by ID (0180): a guest network behind a captive portal, say." },
+            "on": { "enum": ["self", "heard", "listed"], "default": "heard", "description": "Which APs a tester with a scan radio joins a network on, on a schedule (0180): itself alone (self); itself and the APs it hears at the floor or better (heard); or those of listed it hears so (listed), itself among them only where listed names it." },
+            "listed": { "type": "array", "uniqueItems": true, "items": { "type": "string", "pattern": "^ap-[0-9a-f]{12}$" }, "description": "The APs a tester joins on, where on is listed (0180), by ID." },
+            "floor": { "type": "integer", "minimum": -95, "maximum": -40, "default": -75, "description": "The weakest, in dBm, a tester may hear another AP, and that AP hear the tester, to join a network on it (0180): weaker either way, a test fails for the distance and says nothing of the service. Where the AP has not said how it hears the tester, the tester's reading alone." },
+            "max_clients": { "type": "integer", "minimum": 0, "maximum": 1000, "description": "A test through the air is put off while the tester's radio, or the radio it joins, on that band carries more clients than this (0180); unset, however many." },
+            "max_busy": { "type": "integer", "minimum": 1, "maximum": 100, "description": "A test through the air is put off while the channel it joins on is busier than this share, in per cent, as the AP it joins last rated it (0180); unset, however busy." }
+          }
+        }
+      }
+    },
+    "test_network": {
+      "x-aeolus-tree": "locations",
+      "description": "A test network switched on here and below (0179): which, of the test networks the folders here offer, and until when. The APs leave it out once the time is up, by their own clocks, whether or not they reach the manager. Switched on for at most four hours at a time; unset, none is on.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "network": { "$ref": "#/$defs/networkId" },
+        "until": { "type": "integer", "minimum": 0, "description": "When it goes off, in Unix seconds." }
+      }
+    },
+    "rogues": {
+      "x-aeolus-tree": "locations",
+      "description": "What the manager makes of the networks the APs here hear that broadcast one of Aeolus's SSIDs (0105, 0106): the manager's own, never sent to APs.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "known": { "type": "array", "items": { "type": "string", "pattern": "^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$" }, "uniqueItems": true, "maxItems": 256, "description": "BSSIDs known not to be rogues, such as a neighbour's AP of the same name: heard here broadcasting one of Aeolus's SSIDs, they raise no alert." }
+      }
+    },
+    "concentrators": {
+      "x-aeolus-tree": "locations",
+      "description": "Tunnels, by name: the far end a VXLAN transport reaches (0055). A network picks one by name.",
+      "type": "object",
+      "propertyNames": { "$ref": "#/$defs/id" },
+      "additionalProperties": { "$ref": "#/$defs/concentrator" }
+    },
+    "ap": {
+      "readOnly": true,
+      "description": "What the manager fills in for the AP itself: its hostname, which is its name in Aeolus (0076).",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "hostname": { "type": "string", "pattern": "^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$" }
+      }
+    },
+    "rrm": {
+      "x-aeolus-tree": "locations",
+      "description": "Radio resource management (0073): the APs find the other Aeolus APs they hear, and keep neighbours with them over the wire.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean", "default": false, "description": "On, the AP marks its beacons as an Aeolus AP's, listens on its channels for the others, and exchanges hellos with the three it hears most strongly on each band. Unset, it does none of this." },
+        "moves": { "type": "boolean", "default": true, "description": "With RRM on, each AP moves a radio whose channel is automatic to its best channel: at once when the radio has just started or interference fills its channel, otherwise only in the window. Off, it only rates the channels." },
+        "window": { "type": "string", "pattern": "^([01][0-9]|2[0-3]):[0-5][0-9]-([01][0-9]|2[0-3]):[0-5][0-9]$", "default": "02:00-05:00", "description": "When planned moves may happen, in the AP's local time, such as 02:00-05:00 (the default). It may run past midnight; one that starts where it ends is the whole day." },
+        "margin": { "type": "integer", "minimum": 5, "maximum": 100, "default": 20, "description": "How much better, in rating points, a channel must rate than the radio's own for a move to it. 20 unless set." },
+        "apart": { "type": "integer", "minimum": 0, "maximum": 1000, "default": 250, "description": "How far apart, in MHz edge to edge, each AP keeps its own 5 GHz and 6 GHz channels (0327): a 6 GHz radio too near its own 5 GHz moves at once, and neither moves to a channel too near the other. Near, the one that sends deafens the other's receiver. 250 unless set; 0 is no rule. Set it per board with an AP template." }
+      }
+    },
+    "apc": {
+      "x-aeolus-tree": "locations",
+      "description": "Automatic power control (0077): each AP sets its radios' power so that its nearest neighbours hear it at the target. It needs RRM's neighbours.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean", "default": false, "description": "On, each AP raises a radio's power, a step at a time, until the neighbours it looks for hear it at the target, and lowers it where they all hear it well above. A power set for the radio is left alone. Off unless set." },
+        "neighbours": { "type": "integer", "minimum": 1, "maximum": 6, "default": 3, "description": "How many neighbours each AP looks for on each band. 3 unless set." },
+        "target": { "type": "integer", "minimum": -85, "maximum": -50, "default": -70, "description": "How strongly, in dBm, the weakest of those neighbours must hear the AP. -70 unless set." },
+        "clients": { "type": "string", "enum": ["guard", "ignore"], "description": "What power control does for clients (0206). guard: a client only this AP reaches holds the radio's power up so it hears the AP at the client floor, and an AP whose clients scan and leave after a step down steps back up and holds there. ignore: it steps by the neighbours alone. Unset: it steps by the neighbours, and a lonely client at the edge, or clients in distress after a step, are a warning that asks which." },
+        "client_floor": { "type": "integer", "minimum": -95, "maximum": -60, "default": -80, "description": "How strongly, in dBm, a client only one AP reaches should hear it (0206): weaker is marginal. -80 unless set." },
+        "hold": { "type": "integer", "minimum": 1, "maximum": 168, "default": 24, "description": "Hours a radio stays up after its clients' distress stepped it back, with clients guarded (0206). 24 unless set." }
+      }
+    }
+  },
+  "$defs": {
+    "templateId": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,63}$", "description": "An AP template's ID (0085)." },
+    "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,31}$" },
+    "ipAddress": {
+      "description": "An IPv4 or IPv6 address.",
+      "type": "string",
+      "maxLength": 45,
+      "pattern": "^([0-9]{1,3}(\\.[0-9]{1,3}){3}|[0-9A-Fa-f:.]*:[0-9A-Fa-f:.]*)$"
+    },
+    "ipv4Address": {
+      "description": "An IPv4 address.",
+      "type": "string",
+      "maxLength": 15,
+      "pattern": "^[0-9]{1,3}(\\.[0-9]{1,3}){3}$"
+    },
+    "probeAddress": {
+      "$ref": "#/$defs/ipv4Address",
+      "description": "An address on the segment for the AP to ask, by ARP, whether its traffic gets across: normally the segment's gateway (0059). Unset, the AP asks any IPv6 host there."
+    },
+    "networkId": {
+      "description": "A network's name. It starts with a letter, and vlan<number>, port-<anything> and n followed by 8 hex digits, each alone or followed by a hyphen and more, are kept for the names Aeolus gives its own sections on an AP (0054, 0061, 0063).",
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]{0,31}$",
+      "not": { "pattern": "^(vlan[0-9]+($|-)|port-|n[0-9a-f]{8}($|-))" }
+    },
+    "vlan": { "type": "integer", "minimum": 1, "maximum": 4094 },
+    "ip": { "type": "string", "pattern": "^[0-9A-Fa-f:.]+$" },
+    "host": { "type": "string", "minLength": 1, "maxLength": 253, "pattern": "^[A-Za-z0-9.:\\[\\]-]+$" },
+    "power": {
+      "description": "Transmit power in dBm, or auto.",
+      "oneOf": [{ "const": "auto" }, { "type": "integer", "minimum": 1, "maximum": 30 }]
+    },
+    "shortGI": {
+      "type": "boolean",
+      "default": true,
+      "description": "The short guard interval, 400 ns, for 802.11n and 802.11ac (0089): false holds them to the long one, 800 ns, which copes better with echoes indoors and out. Unset, OpenWrt's default, short where the radio can (short_gi_20, _40, _80 and _160)."
+    },
+    "heGI": {
+      "description": "The guard interval the AP sends 802.11ax with, in ns (0089): 800, 1600 or 3200, longer coping better with echoes; auto (the default) leaves it to the radio, which picks per frame. OpenWrt has no option for it: the agent sets it with iw on each network, and again whenever hostapd makes one anew.",
+      "oneOf": [{ "const": "auto" }, { "enum": [800, 1600, 3200] }]
+    },
+    "boardSettings": {
+      "description": "One kind of AP's own settings (0092): ports and the uplink, as the plain ones.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "ports": { "type": "object", "propertyNames": { "pattern": "^[a-z][a-z0-9._-]{0,15}$" }, "additionalProperties": { "$ref": "#/$defs/port" } },
+        "uplink": { "$ref": "#/$defs/uplink" }
+      }
+    },
+    "uplink": {
+      "description": "The AP's uplink: the bridge it is in, as a switch's (0095), and its bond (0096).",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "stp": { "type": "boolean", "description": "Spanning tree on the uplink's bridge, RSTP by ustp, which the agent installs (0095): the AP takes part as a switch does, and a second link to the same network is blocked rather than looped. ustp gives the AP the default bridge priority, 32768, so set the core switch's lower, as it should be, or an AP may be the root. Check the switch ports for BPDU guard first: one that has it shuts the port when the AP's first BPDU comes. Unset, the AP leaves it as it is." },
+        "bond": { "type": "boolean", "description": "The uplink's LACP bond, where the AP's image makes one, as the C-360's bond0 of eth0 and eth1 (0096). false takes it apart: each port joins the uplink's bridge on its own, carrying every VLAN the bond did, and the AP's uplink is whichever port is the path out, the first by default. Two ports in one bridge to the same network loop, so it needs spanning tree on (uplink.stp). The switch's ports must work without LACP: as plain trunks, or with LACP fallback to individual ports, its timeout well under 90 seconds, or the AP cannot reach the manager and puts the bond back. true, or unset, keeps the image's bond, and puts back one Aeolus took apart." }
+      }
+    },
+    "radio2g": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean", "description": "false turns the radio off; true on. Unset, the radio stays as the AP has it, which is on unless Aeolus turned it off (0238)." },
+        "channel": { "oneOf": [{ "const": "auto" }, { "type": "integer", "minimum": 1, "maximum": 14 }] },
+        "channels": { "type": "array", "items": { "type": "integer", "minimum": 1, "maximum": 13 }, "uniqueItems": true, "minItems": 1, "maxItems": 13, "description": "The channels an automatic channel may be (0075). Unset, 1, 6 and 11. At 40 MHz a channel is joined with the one four above it, from 1 to 6, or four below, from 7 up (0117)." },
+        "non_overlapping": { "type": "boolean", "description": "Keep an automatic channel to those of the set far enough apart not to overlap at the width (0117): five apart at 20 MHz, as 1, 6 and 11 are; at 40 MHz, where 2.4 GHz has room for one, or for two where channels 12 and 13 may be used. Unset, any of the set." },
+        "width": { "enum": [20, 40], "description": "MHz." },
+        "power": { "$ref": "#/$defs/power" },
+        "modes": { "type": "array", "items": { "enum": ["b", "g", "n", "ax", "be"] }, "uniqueItems": true, "minItems": 1, "description": "The 802.11 generations clients may use, one unbroken run (0089): the oldest is the least a client must support (OpenWrt's require_mode), the newest caps the mode the radio runs. 802.11b is its 1–11 Mbit/s rates (legacy_rates). Unset, every one the radio can do but 802.11b, which OpenWrt leaves off." },
+        "short_gi": { "$ref": "#/$defs/shortGI" },
+        "he_gi": { "$ref": "#/$defs/heGI" },
+        "min_signal": { "oneOf": [{ "const": "off" }, { "type": "integer", "minimum": -95, "maximum": -50 }], "description": "The weakest signal, in dBm, a client may be heard at and still join (0097): one further off is refused, so it keeps to a nearer AP rather than hold this radio at its slowest rates. -75 suits most offices; -80 a house. off takes it away. Unset, the AP keeps what it has." },
+        "beacon_interval": { "type": "integer", "minimum": 40, "maximum": 1000, "description": "Time between beacons, in TU of 1.024 ms (0097). 100, OpenWrt's default, suits nearly everything: longer saves a little airtime with many SSIDs, and makes clients slower to find the AP. Unset, the AP keeps what it has." },
+        "twt": { "type": "boolean", "description": "Target wake time (0191): whether the radio answers a client that asks to agree when it wakes (802.11ax; hostapd's he_twt_responder), so a phone or IoT device can sleep longer. It is the radio's, for every network on it: hostapd sets it a radio at a time. Off, the radio answers no such request. Unset, OpenWrt's default: on where the radio can, which a Qualcomm 802.11ax radio can and a MediaTek one cannot. A radio kept to 802.11n or older answers none either way." },
+        "bss_color": { "oneOf": [ { "enum": ["auto", "off"] }, { "type": "integer", "minimum": 1, "maximum": 63 } ], "description": "BSS color (0192): the 802.11ax mark a radio puts on its frames, so a client and the radio can tell their own from another AP's on the same channel and talk over a far one (spatial reuse). It is the radio's, for every network on it, as hostapd has it. auto, a color picked at random each time the radio starts, as OpenWrt does; a color, 1 to 63, that one always, for APs on one channel kept apart; off, none, and no spatial reuse. Unset, OpenWrt's default: on, a color picked at random each time the radio starts (0196). A radio kept to 802.11n or older has none either way." },
+        "beamformer": { "type": "boolean", "description": "Beamforming (0195): whether the radio steers what it sends toward the client it sends to, from the client's own report of the channel (single-user beamformer, in 802.11ax and be; hostapd's he_su_beamformer and eht_su_beamformer). It is the radio's, for every network on it. Off, it sends alike in every direction, and MU-MIMO is off too. Unset, OpenWrt's default: on where the radio can." },
+        "beamformee": { "type": "boolean", "description": "Whether the radio lets a client steer what it sends toward the radio (single-user beamformee, in 802.11ax and be; hostapd's he_su_beamformee and eht_su_beamformee) (0195). It is the radio's, for every network on it. Unset, OpenWrt's default: on where the radio can." },
+        "mu_mimo": { "type": "boolean", "description": "Downlink MU-MIMO (0195): whether the radio sends to several clients at once, a stream steered to each (multi-user beamformer, in 802.11ax and be; hostapd's he_mu_beamformer and eht_mu_beamformer). It rides on the beamformer: with beamformer off, it is off too. It is the radio's, for every network on it. Uplink MU-MIMO and OFDMA have no switch: the driver does them as its firmware will. Unset, OpenWrt's default: on where the radio can." }
+      }
+    },
+    "radio5g": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean", "description": "false turns the radio off; true on. Unset, the radio stays as the AP has it, which is on unless Aeolus turned it off (0238)." },
+        "channel": { "oneOf": [{ "const": "auto" }, { "enum": [36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144, 149, 153, 157, 161, 165, 169, 173, 177] }], "description": "At 40 MHz or more a channel names its block of the width, and the radio's primary, the one it beacons on, is the block's lowest: 153 at 40 MHz is 149, and 161 at 80 is 149 (0243). hostapd's overlap scan, which would swap the primary for the secondary, is off." },
+        "channels": { "type": "array", "items": { "enum": [36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144, 149, 153, 157, 161, 165, 169, 173, 177] }, "uniqueItems": true, "minItems": 1, "maxItems": 28, "description": "The channels an automatic channel may be, chosen in whole blocks of the width, each block's lowest as its primary (0075, 0243). Unset, any; DFS avoided still keeps it off 52–144." },
+        "width": { "enum": [20, 40, 80, 160], "description": "MHz." },
+        "power": { "$ref": "#/$defs/power" },
+        "compatible": { "type": "boolean", "default": true, "description": "Channel compatibility (0232): on (the default), no 5 GHz radio uses the upper channels, 165 to 177: 165, which some clients mishandle, and U-NII-4, 169 to 177, which is passive-scan only, where many clients send at reduced power and some cannot go at all. An automatic channel and a channel set leave them out, and a channel set to one by hand is refused. Off, they are channels like any other." },
+        "dfs": { "enum": ["allow", "avoid", "look-first"], "default": "allow", "description": "The DFS channels, 52–144, shared with radar (0328). avoid keeps an automatic channel off them; a channel or width that needs them is refused (0071). allow (the default) starts an automatic channel outside them where radio resource management moves radios, and RRM moves the radio to one that is clearly the best once it has looked, soon after the radio starts or in the window for moves; the move costs a minute off the air while the radio listens for radar (0120). At 160 MHz, where every 5 GHz block holds them, such a radio starts at 80 MHz outside them, and RRM widens it to 160 MHz in the window for moves (0329). Where RRM moves no radios, or the radio has no whole block outside them among its channels, the AP picks its channel at its start, and may pick one of them. look-first, from before 0328, is allow." },
+        "modes": { "type": "array", "items": { "enum": ["a", "n", "ac", "ax", "be"] }, "uniqueItems": true, "minItems": 1, "description": "The 802.11 generations clients may use, one unbroken run (0089): the oldest is the least a client must support (OpenWrt's require_mode), the newest caps the mode the radio runs. Unset, every one the radio can do." },
+        "short_gi": { "$ref": "#/$defs/shortGI" },
+        "he_gi": { "$ref": "#/$defs/heGI" },
+        "min_signal": { "oneOf": [{ "const": "off" }, { "type": "integer", "minimum": -95, "maximum": -50 }], "description": "The weakest signal, in dBm, a client may be heard at and still join (0097): one further off is refused, so it keeps to a nearer AP rather than hold this radio at its slowest rates. -75 suits most offices; -80 a house. off takes it away. Unset, the AP keeps what it has." },
+        "beacon_interval": { "type": "integer", "minimum": 40, "maximum": 1000, "description": "Time between beacons, in TU of 1.024 ms (0097). 100, OpenWrt's default, suits nearly everything: longer saves a little airtime with many SSIDs, and makes clients slower to find the AP. Unset, the AP keeps what it has." },
+        "twt": { "type": "boolean", "description": "Target wake time (0191): whether the radio answers a client that asks to agree when it wakes (802.11ax; hostapd's he_twt_responder), so a phone or IoT device can sleep longer. It is the radio's, for every network on it: hostapd sets it a radio at a time. Off, the radio answers no such request. Unset, OpenWrt's default: on where the radio can, which a Qualcomm 802.11ax radio can and a MediaTek one cannot. A radio kept to 802.11n or older answers none either way." },
+        "bss_color": { "oneOf": [ { "enum": ["auto", "off"] }, { "type": "integer", "minimum": 1, "maximum": 63 } ], "description": "BSS color (0192): the 802.11ax mark a radio puts on its frames, so a client and the radio can tell their own from another AP's on the same channel and talk over a far one (spatial reuse). It is the radio's, for every network on it, as hostapd has it. auto, a color picked at random each time the radio starts, as OpenWrt does; a color, 1 to 63, that one always, for APs on one channel kept apart; off, none, and no spatial reuse. Unset, OpenWrt's default: on, a color picked at random each time the radio starts (0196). A radio kept to 802.11n or older has none either way." },
+        "beamformer": { "type": "boolean", "description": "Beamforming (0195): whether the radio steers what it sends toward the client it sends to, from the client's own report of the channel (single-user beamformer, in 802.11ac, ax and be; hostapd's su_beamformer, he_su_beamformer and eht_su_beamformer). It is the radio's, for every network on it. Off, it sends alike in every direction, and MU-MIMO is off too. Unset, OpenWrt's default: on where the radio can." },
+        "beamformee": { "type": "boolean", "description": "Whether the radio lets a client steer what it sends toward the radio (single-user beamformee, in 802.11ac, ax and be; hostapd's su_beamformee, he_su_beamformee and eht_su_beamformee) (0195). It is the radio's, for every network on it. Unset, OpenWrt's default: on where the radio can." },
+        "mu_mimo": { "type": "boolean", "description": "Downlink MU-MIMO (0195): whether the radio sends to several clients at once, a stream steered to each (multi-user beamformer, in 802.11ac, ax and be; hostapd's mu_beamformer, he_mu_beamformer and eht_mu_beamformer). It rides on the beamformer: with beamformer off, it is off too. It is the radio's, for every network on it. Uplink MU-MIMO and OFDMA have no switch: the driver does them as its firmware will. Unset, OpenWrt's default: on where the radio can." }
+      }
+    },
+    "radio6g": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean", "description": "false turns the radio off; true on. Unset, the radio stays as the AP has it, which is on unless Aeolus turned it off (0238)." },
+        "channel": { "oneOf": [{ "const": "auto" }, { "enum": [1, 5, 9, 13, 17, 21, 25, 29, 33, 37, 41, 45, 49, 53, 57, 61, 65, 69, 73, 77, 81, 85, 89, 93, 97, 101, 105, 109, 113, 117, 121, 125, 129, 133, 137, 141, 145, 149, 153, 157, 161, 165, 169, 173, 177, 181, 185, 189, 193, 197, 201, 205, 209, 213, 217, 221, 225, 229, 233] }], "description": "At 40 MHz or more a channel names its block of the width, and the radio's primary is the block's second channel: at 80 and 160 MHz a preferred scanning channel, as 21 at 160 MHz is 5 (0243)." },
+        "channels": { "type": "array", "items": { "enum": [1, 5, 9, 13, 17, 21, 25, 29, 33, 37, 41, 45, 49, 53, 57, 61, 65, 69, 73, 77, 81, 85, 89, 93, 97, 101, 105, 109, 113, 117, 121, 125, 129, 133, 137, 141, 145, 149, 153, 157, 161, 165, 169, 173, 177, 181, 185, 189, 193, 197, 201, 205, 209, 213, 217, 221, 225, 229, 233] }, "uniqueItems": true, "minItems": 1, "maxItems": 59, "description": "The channels an automatic channel may be, chosen in whole blocks of the width, each block's second channel as its primary (0075, 0087, 0243). Unset, any." }, "non_overlapping": { "type": "boolean", "default": false, "description": "One channel to a block: an automatic channel is the primary of each whole block of the width, its second channel, the blocks apart (one 320 MHz family), so radios that pick different channels never share a block (0087, 0243)." }, "psc": { "type": "boolean", "default": false, "description": "Preferred scanning channels only: an automatic channel is one of 5, 21, 37 and every 16th to 229, which clients look for 6 GHz networks on by themselves (0087). Off (the default), any channel of the set." }, "width": { "enum": [20, 40, 80, 160, 320], "description": "MHz." },
+        "power": { "$ref": "#/$defs/power" },
+        "modes": { "type": "array", "items": { "enum": ["ax", "be"] }, "uniqueItems": true, "minItems": 1, "description": "The 802.11 generations clients may use, one unbroken run (0089): the oldest is the least a client must support (OpenWrt's require_mode), the newest caps the mode the radio runs. 6 GHz is 802.11ax and newer. Unset, every one the radio can do." },
+        "he_gi": { "$ref": "#/$defs/heGI" },
+        "min_signal": { "oneOf": [{ "const": "off" }, { "type": "integer", "minimum": -95, "maximum": -50 }], "description": "The weakest signal, in dBm, a client may be heard at and still join (0097): one further off is refused, so it keeps to a nearer AP rather than hold this radio at its slowest rates. -75 suits most offices; -80 a house. off takes it away. Unset, the AP keeps what it has." },
+        "beacon_interval": { "type": "integer", "minimum": 40, "maximum": 1000, "description": "Time between beacons, in TU of 1.024 ms (0097). 100, OpenWrt's default, suits nearly everything: longer saves a little airtime with many SSIDs, and makes clients slower to find the AP. Unset, the AP keeps what it has." },
+        "twt": { "type": "boolean", "description": "Target wake time (0191): whether the radio answers a client that asks to agree when it wakes (802.11ax; hostapd's he_twt_responder), so a phone or IoT device can sleep longer. It is the radio's, for every network on it: hostapd sets it a radio at a time. Off, the radio answers no such request. Unset, OpenWrt's default: on where the radio can, which a Qualcomm 802.11ax radio can and a MediaTek one cannot. A radio kept to 802.11n or older answers none either way." },
+        "bss_color": { "oneOf": [ { "enum": ["auto", "off"] }, { "type": "integer", "minimum": 1, "maximum": 63 } ], "description": "BSS color (0192): the 802.11ax mark a radio puts on its frames, so a client and the radio can tell their own from another AP's on the same channel and talk over a far one (spatial reuse). It is the radio's, for every network on it, as hostapd has it. auto, a color picked at random each time the radio starts, as OpenWrt does; a color, 1 to 63, that one always, for APs on one channel kept apart; off, none, and no spatial reuse. Unset, OpenWrt's default: on, a color picked at random each time the radio starts (0196). A radio kept to 802.11n or older has none either way." },
+        "beamformer": { "type": "boolean", "description": "Beamforming (0195): whether the radio steers what it sends toward the client it sends to, from the client's own report of the channel (single-user beamformer, in 802.11ax and be; hostapd's he_su_beamformer and eht_su_beamformer). It is the radio's, for every network on it. Off, it sends alike in every direction, and MU-MIMO is off too. Unset, OpenWrt's default: on where the radio can." },
+        "beamformee": { "type": "boolean", "description": "Whether the radio lets a client steer what it sends toward the radio (single-user beamformee, in 802.11ax and be; hostapd's he_su_beamformee and eht_su_beamformee) (0195). It is the radio's, for every network on it. Unset, OpenWrt's default: on where the radio can." },
+        "mu_mimo": { "type": "boolean", "description": "Downlink MU-MIMO (0195): whether the radio sends to several clients at once, a stream steered to each (multi-user beamformer, in 802.11ax and be; hostapd's he_mu_beamformer and eht_mu_beamformer). It rides on the beamformer: with beamformer off, it is off too. It is the radio's, for every network on it. Uplink MU-MIMO and OFDMA have no switch: the driver does them as its firmware will. Unset, OpenWrt's default: on where the radio can." }
+      }
+    },
+    "port": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean", "default": true, "description": "false turns the port off (0053); unset, the AP leaves it as it is, which is on unless Aeolus turned it off." },
+        "speed": { "description": "The speed the port links at, in Mbit/s, full duplex (0094): it offers the far end that speed alone, and still negotiates, so both ends agree on it. auto offers every speed it can; unset, the AP leaves it as it is. Never on the uplink.", "oneOf": [{ "const": "auto" }, { "enum": [10, 100, 1000, 2500, 5000, 10000] }] },
+        "uplink": { "type": "boolean", "description": "The port that reaches the manager: the tunnel source (0018) and where VLANs are detected (0020)." },
+        "mode": { "enum": ["trunk", "access", "native", "tunnel", "lacp"], "description": "access carries one VLAN, untagged; trunk an untagged VLAN and tagged ones (0053); native the uplink's untagged network, untagged, as a fresh OpenWrt's LAN ports are, which asks no VLAN of the uplink (0335); tunnel carries VNIs over tunnels instead, as vxlan maps them (0058). LACP is not applied yet." },
+        "untagged": { "type": "integer", "minimum": 0, "maximum": 4094, "description": "0 means no untagged VLAN." },
+        "tagged": { "type": "array", "items": { "$ref": "#/$defs/vlan" }, "uniqueItems": true, "description": "Only a trunk carries tagged VLANs." },
+        "bond": { "$ref": "#/$defs/id", "description": "The LACP bond this port belongs to." },
+        "vxlan": {
+          "description": "In tunnel mode, the VNIs the port carries, by the VLAN each is tagged with on the wire, or untagged (0058).",
+          "type": "object",
+          "propertyNames": { "pattern": "^(untagged|[1-9][0-9]{0,3})$" },
+          "additionalProperties": { "$ref": "#/$defs/portVNI" }
+        }
+      },
+      "allOf": [
+        { "if": { "properties": { "mode": { "const": "lacp" } }, "required": ["mode"] }, "then": { "required": ["bond"] } }
+      ]
+    },
+    "portVNI": {
+      "description": "One VNI a tunnel port carries (0058).",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "tunnel": { "$ref": "#/$defs/id", "description": "The tunnel it travels over, by name, as set in Locations (0055)." },
+        "vni": { "type": "integer", "minimum": 1, "maximum": 16777215 },
+        "probe": { "$ref": "#/$defs/probeAddress" }
+      }
+    },
+    "network": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean", "default": true, "description": "false turns off an inherited network in one place (0012); unset, it is on." },
+        "test": { "type": "boolean", "default": false, "description": "A test network (0179): never on the air until someone with the test SSID right switches it on in a place, for at most four hours (test_network), and off by itself when its time is up. Its SSID, security and transport are a network's like any other." },
+        "ssid": { "type": "string", "minLength": 1, "maxLength": 32 },
+        "hidden": { "type": "boolean" },
+        "bands": { "description": "The bands the network is offered on; unset, every band the AP serves. 6 GHz takes WPA3 or OWE only: a WPA2 or open network is never offered there, and naming 6g for one is refused (0086).", "type": "array", "items": { "enum": ["2g", "5g", "6g"] }, "minItems": 1, "uniqueItems": true },
+        "security": { "enum": ["open", "owe", "wpa2-psk", "wpa3-sae", "wpa2-wpa3", "wpa2-enterprise", "wpa3-enterprise", "wpa2-wpa3-enterprise"], "description": "The PSK modes sign every client in with the passphrase; the enterprise ones sign each in as itself, by 802.1X against the RADIUS server under radius (0098). 6 GHz takes WPA3 and OWE only." },
+        "passphrase": { "type": "string", "minLength": 8, "maxLength": 63, "writeOnly": true },
+        "isolation": { "type": "boolean", "description": "Client isolation." },
+        "replace_own": { "type": "boolean", "description": "Takes the place of an AP's own network that is this one over again (0137): a Wi-Fi network set on the AP itself and not by Aeolus, with this SSID, this security and, where there is one, this passphrase, on the radios this network is on. One that does what this network would not is left: another AP's uplink through it, a list of the only clients let on, passphrases or VLANs of its devices' own, an open network beside it for clients without OWE. The AP keeps what is taken out, as it was, in /etc/aeolus/removed. Set by importing such a network, and may be set by hand; unset, an AP's own networks are left as they are (0040)." },
+        "radius": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "The RADIUS server a WPA Enterprise network signs its clients in against, and accounting (0098). Each AP asks it itself, from its own address.",
+          "properties": {
+            "auth_server": { "$ref": "#/$defs/host", "description": "The RADIUS server clients sign in against, by IP address or name." },
+            "auth_port": { "type": "integer", "minimum": 1, "maximum": 65535, "default": 1812 },
+            "auth_secret": { "type": "string", "minLength": 1, "maxLength": 128, "writeOnly": true, "description": "The secret the APs share with it." },
+            "acct_server": { "$ref": "#/$defs/host", "description": "Where accounting goes, where it is wanted." },
+            "acct_port": { "type": "integer", "minimum": 1, "maximum": 65535, "default": 1813 },
+            "acct_secret": { "type": "string", "minLength": 1, "maxLength": 128, "writeOnly": true, "description": "Unset, the sign-in secret." },
+            "nas_id": { "type": "string", "minLength": 1, "maxLength": 48, "pattern": "^[ -~]+$", "description": "The NAS-Identifier the APs give the server." },
+            "mac_auth": { "type": "boolean", "default": false, "description": "On a network that is not WPA Enterprise: ask the server whether each device may join, by its MAC address, before it is let on (0112). For devices that cannot sign in themselves, such as printers and sensors. The server may put each in one of the VLANs below." },
+            "passphrases": { "type": "boolean", "default": false, "description": "With MAC authentication on a WPA2 network: each device joins with a passphrase of its own, the one the server gives for its MAC address as Tunnel-Password (0115). The network's own passphrase is not used, and a device the server gives none is refused." },
+            "vlans": { "type": "array", "items": { "$ref": "#/$defs/vlan" }, "uniqueItems": true, "maxItems": 64, "description": "The VLANs the server may put a client in, by its Tunnel-Private-Group-ID (0111). Each is carried tagged on the uplink. A VLAN the server names that is not here is refused." },
+            "vlan_required": { "type": "boolean", "default": false, "description": "Refuse a client the server puts in no VLAN. Unset, such a client is on the network's own transport." },
+            "das": {
+              "type": "object",
+              "additionalProperties": false,
+              "description": "Lets one server, such as a NAC, disconnect a client by an RFC 5176 Disconnect-Request (0111), so it signs in again: into another VLAN, or refused. Unset, nothing may.",
+              "properties": {
+                "client": { "$ref": "#/$defs/ip", "description": "The address the Disconnect-Requests come from." },
+                "secret": { "type": "string", "minLength": 1, "maxLength": 128, "writeOnly": true, "description": "Unset, the sign-in secret." },
+                "port": { "type": "integer", "minimum": 1, "maximum": 65535, "default": 3799, "description": "Where the AP listens for them." }
+              }
+            },
+            "test": {
+              "type": "object",
+              "additionalProperties": false,
+              "description": "The user a client test signs in as, on a network that signs clients in by 802.1X (0124): one made at the RADIUS server for this, with no more access than a test needs. Never part of an AP's config: the manager hands it to an AP with a test.",
+              "properties": {
+                "user": { "type": "string", "pattern": "^[\\x20-\\x7e]{1,128}$", "description": "Its name, as it signs in." },
+                "password": { "type": "string", "minLength": 1, "maxLength": 128, "writeOnly": true, "description": "Its password." },
+                "method": { "enum": ["peap", "ttls"], "default": "peap", "description": "How it signs in: peap, PEAP with MSCHAPv2, or ttls, TTLS with PAP." }
+              }
+            }
+          }
+        },
+        "blocked": { "type": "array", "items": { "type": "string", "pattern": "^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$" }, "uniqueItems": true, "maxItems": 1024, "description": "Clients refused on this network, on every band, by MAC (0100). A client with a private (random) MAC has one for each network, and may change it." },
+        "alert_after": { "type": "integer", "minimum": 1, "maximum": 10, "description": "How many failures running of a client test of this network make an alert (0182), wherever it is tested; unset, as the tester's folders say (assurance.tests.alert_after). The manager's own: not sent to APs." },
+        "dhcp_servers": { "type": "array", "items": { "type": "string", "pattern": "^(([0-9]{1,3}\\.){3}[0-9]{1,3}|[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5})$" }, "uniqueItems": true, "maxItems": 8, "x-aeolus-placeholder": "192.168.10.254", "description": "The DHCP servers this network has, each by its address or its MAC (0160): a failover pair, say. Set, only a server not among them is an alert, one alone too; unset, two servers or more answering are. The manager's own: not sent to APs." },
+        "max_clients": { "type": "integer", "minimum": 1, "maximum": 2007, "description": "The most clients at once on each of the network's Wi-Fi interfaces, one a band (0097). Unset, OpenWrt's own, which hostapd allows up to 2007." },
+        "dtim": { "type": "integer", "minimum": 1, "maximum": 255, "description": "Beacons between DTIMs, when sleeping clients wake for the multicast and broadcast kept for them (0097): higher saves their batteries, and delays that traffic. Unset, OpenWrt's 2." },
+        "multicast_to_unicast": { "type": "boolean", "description": "Send all multicast (ARP, IPv4, IPv6) to each client as unicast (0049). Unset: OpenWrt's default, which does so only for groups clients joined (IGMP/MLD snooping)." },
+        "disassoc_low_ack": { "type": "boolean", "description": "Send a client off as soon as the radio says it stopped acknowledging what it is sent (hostapd's disassoc_low_ack, 0257). Unset: OpenWrt's default, on. Off: such a client stays until the AP's own check finds it gone, after ap_max_inactivity (300 s): for devices whose radio sleeps, which a driver can take for gone (B122)." },
+        "transition_disable": { "type": "boolean", "description": "Tell each client that signs in with the network's WPA3 or OWE never again to use the older way on this SSID (WPA3's Transition Disable, 0297): WPA2-PSK on WPA2/WPA3 or WPA3 alone, WPA2-Enterprise on WPA2/WPA3 Enterprise or WPA3 Enterprise, open on OWE. A client that can do only the older way is not told, and still joins a network in transition. A client that was told keeps to it: a network that goes back to WPA2 alone, or open, loses such clients until each forgets the network. Unset, off. Not on WPA2 alone, WPA2 Enterprise or open, which have no newer way." },
+        "pmf": { "enum": ["optional", "required"], "description": "Protected management frames, 802.11w (0227), on a network that takes WPA2: optional, used with a client that can; required, of every client, so a WPA2 client that cannot is refused. Unset, OpenWrt's own: off on WPA2 alone, optional on WPA2/WPA3. WPA3 alone and OWE always require them, and so does every network on 6 GHz." },
+        "band_steering": { "type": "boolean", "description": "An older name for steering.suggest (0050), which it is read as where that is not set (0138)." },
+        "steering": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "How this network's clients are steered, each way a switch of its own (0138). The AP does it itself, by a daemon of the agent's that tells hostapd to wait for no listener: the manager is in none of it, and with the daemon stopped clients join as on a network that is not steered. What was asked of each client, and what came of it, is in the AP's report.",
+          "properties": {
+            "suggest": { "type": "boolean", "description": "A client that can use a higher band the AP has this network on, and is near enough for it, is asked to move there, by an 802.11v BSS transition request. It may say no, and is asked three times at most while it stays joined. Turns on 802.11k and 802.11v for this network." },
+            "community": { "type": "boolean", "description": "Community sharing (0299): the APs tell one another the bands each client of this network said it can use as it joined there, so an AP knows a client can use 6 GHz before the client first joins it; and suggest reaches other APs: a client its AP cannot take up a band it can use, here or near enough, is asked by 802.11k what it hears of this network's places on that band at other APs, and sent by 802.11v to the one it hears best, where it hears it at -60 dBm or better (6 GHz; -62 on 5 GHz). The APs tell one another by radio resource management, which must be on." },
+            "keep_6g": { "type": "boolean", "description": "Keep on 6 GHz (0300): a client on this network's 6 GHz on an AP, heard there at -72 dBm or better, is kept off the network's lower bands on that AP while it is so, as a phone's own roaming would take it back to a 5 GHz it hears more strongly. Every other AP stays open to it. It is let go as soon as it leaves that 6 GHz, or once heard under -72 two looks running. Only a client on 6 GHz at that moment is ever kept, so a device that cannot use 6 GHz never is. Unset, off." },
+            "hold_back": { "type": "boolean", "description": "A client known to use a higher band is kept off 2.4 GHz for two and a half seconds as it comes to join, so that it finds the higher band first; then 2.4 GHz is open to it again. Once in thirty seconds a client at most." },
+            "sticky": { "type": "boolean", "description": "Sticky clients are moved (0138, 0289). A client heard here under sticky_floor that another AP of the network hears, by its probes and on the same band, sticky_margin dB more strongly is told to go there; so is one that says, asked by 802.11k where it is under sticky_signal, gives beacon reports and no other AP hears it (every five minutes at first, less often each time it stays, up to two hours), that it hears the network elsewhere on its band sticky_margin dB more strongly than it says it hears this AP; and put off five seconds on if it is still there. A client whose signal stays under sticky_signal, while the network has a better place for it (a lower band on this AP, or the network on another AP), is told to go, and put off ten seconds on if it is still there and still weak. One put off is kept off for sticky_hold_down seconds: on every band of this AP where its place is on another AP. A client that takes no 802.11v request is put off at once. One that comes straight back is left alone for half an hour, and twice as long each time it does so again, up to a day. The APs tell one another how they hear clients by radio resource management, which must be on. Turns on 802.11k and 802.11v for this network." },
+            "sticky_signal": { "type": "integer", "minimum": -90, "maximum": -60, "description": "The signal, in dBm, under which a client is weak, for sticky. Unset, -80 (0292)." },
+            "sticky_margin": { "type": "integer", "minimum": 1, "maximum": 20, "description": "How much more strongly, in dB, another AP of the network must hear a client, on the client's band, for sticky to move it there (0289). Unset, 5." },
+            "sticky_floor": { "type": "integer", "minimum": -90, "maximum": -40, "description": "The signal here, in dBm, under which sticky moves a client another AP hears more strongly (0289): one heard well here is not moved for a few dB. Unset, -65." },
+            "sticky_hold_down": { "type": "integer", "minimum": 1, "maximum": 60, "description": "How long, in seconds, sticky keeps a client it put off away from this AP's network (0289): on every band, where its place is on another AP. Unset, 10." },
+            "sticky_scan": { "type": "boolean", "description": "Sticky also weighs what the APs' scan radios hear of a client (0324), each scan radio set against its own AP's radios: a client that sends no probes, as a TV that holds on, is heard by the other APs too. With sticky on." }
+          }
+        },
+        "roaming": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "ft": { "type": "boolean", "description": "802.11r." },
+            "rrm": { "type": "boolean", "description": "802.11k." },
+            "btm": { "type": "boolean", "description": "802.11v." }
+          }
+        },
+        "keys": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Per-user keys (0070).",
+          "properties": {
+            "vlans": { "type": "array", "items": { "$ref": "#/$defs/vlan" }, "uniqueItems": true, "maxItems": 512, "description": "The VLANs a per-user key may put its client in." }
+          }
+        },
+        "rate_limit": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "down_kbps": { "type": "integer", "minimum": 0, "description": "0 means no limit." },
+            "up_kbps": { "type": "integer", "minimum": 0, "description": "0 means no limit." }
+          }
+        },
+        "transport": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "primary": { "$ref": "#/$defs/transport" },
+            "fallback": { "$ref": "#/$defs/transport" },
+            "switching": { "enum": ["report", "automatic"], "default": "report", "description": "report (the default) probes both transports and never moves the network; automatic moves it to the fallback while the primary is down (0061)." },
+            "ha": { "type": "boolean", "description": "With automatic switching: keep a VXLAN fallback started and probed, so a switch is a re-attach; unset, it is started when the primary goes down (0022, 0061)." },
+            "failback": { "enum": ["revertive", "equal"], "default": "revertive", "description": "With automatic switching: revertive moves back to the primary after the hold-down; equal stays on the fallback until it fails (0022, 0061)." },
+            "holddown": { "type": "integer", "minimum": 0, "maximum": 3600, "default": 300, "description": "Seconds the primary must answer before a revertive switch back (0061)." },
+            "down_when_lost": { "type": "boolean", "description": "Take the network's SSID off the air on an AP while that AP cannot reach the network's way on (0201): its VLAN, which the AP probes by a lease of its own and the gateway's answer, or its tunnel's concentrator. Its clients are let go, and join another AP, or another network, rather than one that goes nowhere; it is on the air again the moment the way answers. With a fallback, only while the transport it is on is lost. Off (the default), the SSID stays up whatever happens beyond the AP." }
+          },
+          "required": ["primary"]
+        }
+      },
+      "required": ["ssid", "security", "transport"],
+      "allOf": [
+        { "if": { "properties": { "transition_disable": { "const": true } }, "required": ["transition_disable"] }, "then": { "properties": { "security": { "enum": ["wpa3-sae", "wpa2-wpa3", "wpa3-enterprise", "wpa2-wpa3-enterprise", "owe"] } } } },
+        { "if": { "properties": { "security": { "enum": ["wpa2-psk", "wpa3-sae", "wpa2-wpa3"] }, "radius": { "not": { "properties": { "passphrases": { "const": true } }, "required": ["passphrases"] } } }, "required": ["security"] }, "then": { "required": ["passphrase"] } }
+      ]
+    },
+    "transport": {
+      "description": "How a network's traffic gets where it is going (0018).",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": { "enum": ["vlan", "vxlan"] },
+        "vlan": { "$ref": "#/$defs/vlan" },
+        "concentrator": { "$ref": "#/$defs/id", "description": "The tunnel it travels over, by name, as set in Locations (0055)." },
+        "vni": { "type": "integer", "minimum": 1, "maximum": 16777215 },
+        "probe": { "$ref": "#/$defs/probeAddress" }
+      },
+      "required": ["type"],
+      "allOf": [
+        { "if": { "properties": { "type": { "const": "vlan" } }, "required": ["type"] }, "then": { "required": ["vlan"] } },
+        { "if": { "properties": { "type": { "const": "vxlan" } }, "required": ["type"] }, "then": { "required": ["concentrator", "vni"] } }
+      ]
+    },
+    "concentrator": {
+      "description": "A tunnel: the IP address of its far end, its UDP port and the MTU (0018, 0055).",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "address": { "$ref": "#/$defs/ipAddress" },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "mtu": { "type": "integer", "minimum": 1280, "maximum": 9000, "description": "The largest frame the tunnel carries. Unset, it is the default: 1450 over IPv4 and 1430 over IPv6, which a 1500-byte path carries (0056). Larger needs the AP's uplink to carry it plus 50 bytes, or 70 over IPv6." },
+        "probe_interval": { "type": "integer", "minimum": 5, "maximum": 300, "default": 30, "description": "Seconds between the AP's probes of each VNI on the tunnel, which keep it open at the concentrator and show whether it works (0059); three missed in a row and it is down." },
+        "underlay_vlan": { "type": "integer", "minimum": 0, "maximum": 4094, "description": "Where the tunnel starts on the AP (0063): 0, or unset, for the management VLAN; otherwise a VLAN on the AP's uplink, where the AP takes an address by DHCP for its tunnels. On an AP managed on that VLAN, its management interface (0084)." },
+        "bridged": {
+          "description": "VNIs the tunnel carries into the AP's own bridge (0335), by where: untagged, the uplink's untagged network, as a fresh OpenWrt's LAN is, or a VLAN of the bridge by its number. A monitoring server at the far end is then on that network as if plugged into it. Each VNI is the AP's own: no network or port there may use it.",
+          "type": "object",
+          "propertyNames": { "pattern": "^(untagged|[1-9][0-9]{0,3})$" },
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["vni"],
+            "properties": {
+              "vni": { "type": "integer", "minimum": 1, "maximum": 9999999, "description": "At most seven digits, as its device, aeolus_b and the VNI, may have at most 15 characters." }
+            }
+          }
+        }
+      },
+      "required": ["address", "port"]
+    },
+    "libraryConcentrator": {
+      "description": "A concentrator as the Org's library holds it (0023). Not part of an AP's config.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "address": { "$ref": "#/$defs/host" },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "mtu": { "type": "integer", "minimum": 1280, "maximum": 9000 },
+        "vnis": {
+          "description": "VNIs on this concentrator, keyed by VNI number, each with a label.",
+          "type": "object",
+          "propertyNames": { "pattern": "^[1-9][0-9]{0,7}$" },
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": { "label": { "type": "string", "minLength": 1, "maxLength": 64 } },
+            "required": ["label"]
+          }
+        },
+        "scope": {
+          "description": "Location folders where this concentrator can be used; empty means everywhere.",
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true
+        }
+      },
+      "required": ["name", "address", "port", "mtu"]
+    }
+  }
+}

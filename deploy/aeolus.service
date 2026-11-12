@@ -1,0 +1,50 @@
+[Unit]
+Description=Aeolus manager API
+Documentation=https://github.com/WiFiGUY512/aeolus
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=aeolus
+Group=aeolus
+# AEOLUS_HOSTS names the host in a self-signed certificate made on first start.
+# AEOLUS_KEEP_STATE_DAYS, if set, is how long AP state reports are kept (0039).
+# AEOLUS_KEEP_CONNECTION_DAYS, if set, is how long each client's attempts to come
+# online are kept, 90 days otherwise (0118).
+# AEOLUS_KEEP_TREND_DAYS, if set, is how long the trends are kept, each AP's
+# usage and health by the hour and each client's usage by the day, 400 days
+# otherwise (0140).
+# AEOLUS_RELAY_LISTEN and AEOLUS_KNOCK_LISTEN move the DHCP listeners from
+# :67 (UDP) and :15002 (TCP), or turn either off with "off" (0068).
+# AEOLUS_MDNS is the name under .local the manager answers to by multicast
+# DNS, for APs to find it by: aeolus otherwise, and "off" for none (0151).
+# AEOLUS_FEED_CACHE and AEOLUS_FEED_CACHE_MB move and size the cache of
+# OpenWrt's feeds that APs fetch packages through, by default
+# /var/lib/aeolus/feeds and 2048 MB; "off" turns it off (0069).
+# AEOLUS_KMOD_FEEDS moves the module feeds of images built with a kernel of
+# their own, by default /var/lib/aeolus/kmods; "off" turns them off (0171).
+# AEOLUS_SUGGEST_TO is an http or https URL that suggestions made on the
+# pages are sent on to; unset or "off", they are kept on this manager (0323).
+EnvironmentFile=/etc/aeolus/serve.env
+ExecStart=/opt/aeolus/bin/aeolus serve -hosts ${AEOLUS_HOSTS}
+Restart=on-failure
+RestartSec=5
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/aeolus /etc/aeolus
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictRealtime=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+# Only to bind UDP port 67, where DHCP relays send their copies (0068).
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target

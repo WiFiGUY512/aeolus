@@ -1,0 +1,49 @@
+{
+	"wireless": {
+		"radio0": { ".anonymous": false, ".type": "wifi-device", ".name": "radio0", ".index": 0, "type": "mac80211", "path": "soc/1b500000.pcie/pci0000:00/0000:00:00.0/0000:01:00.0", "band": "5g", "channel": "149", "htmode": "VHT80", "disabled": "0", "ucentral_path": "/radios/1", "txantenna": "15", "rxantenna": "15", "noscan": "1", "country": "US", "legacy_rates": "0", "maxassoc_ignore_probe": "0", "reconf": "1", "acs_exclude_dfs": "0" },
+		"radio1": { ".anonymous": false, ".type": "wifi-device", ".name": "radio1", ".index": 1, "type": "mac80211", "path": "soc/1b700000.pcie/pci0001:00/0001:00:00.0/0001:01:00.0", "band": "2g", "channel": "6", "htmode": "HT20", "disabled": "0", "ucentral_path": "/radios/0", "txantenna": "15", "rxantenna": "15", "noscan": "1", "country": "US", "legacy_rates": "0", "maxassoc_ignore_probe": "0", "reconf": "1", "acs_exclude_dfs": "0" },
+		"iot24": { ".anonymous": false, ".type": "wifi-iface", ".name": "iot24", ".index": 2, "device": "radio1", "network": "iot", "mode": "ap", "ssid": "Home_Wi-Fi_IoT", "encryption": "psk2", "key": "fixture-key-iot24" },
+		"trusted_radio0": { ".anonymous": false, ".type": "wifi-iface", ".name": "trusted_radio0", ".index": 3, "device": "radio0", "network": "trusted", "mode": "ap", "ssid": "Home Wi-Fi", "encryption": "psk2", "key": "fixture-key-trusted_radio0", "ieee80211r": "1", "ft_over_ds": "0", "ft_psk_generate_local": "1" },
+		"trusted_radio1": { ".anonymous": false, ".type": "wifi-iface", ".name": "trusted_radio1", ".index": 4, "device": "radio1", "network": "trusted", "mode": "ap", "ssid": "Home Wi-Fi", "encryption": "psk2", "key": "fixture-key-trusted_radio1", "ieee80211r": "1", "ft_over_ds": "0", "ft_psk_generate_local": "1" }
+	},
+	"network": {
+		"loopback": { ".anonymous": false, ".type": "interface", ".name": "loopback", ".index": 0, "device": "lo", "proto": "static", "ipaddr": "127.0.0.1", "ifname": "lo", "netmask": "255.0.0.0" },
+		"globals": { ".anonymous": false, ".type": "globals", ".name": "globals", ".index": 1, "dhcp_default_duid": "0004fixture", "ula_prefix": "fd59:2068:3844::/48", "packet_steering": "1" },
+		"cfg030f15": { ".anonymous": true, ".type": "device", ".name": "cfg030f15", ".index": 2, "name": "br-lan", "type": "bridge", "ports": ["lan1", "lan2", "lan3", "lan4", "wan"], "ipv6": "0" },
+		"lan": { ".anonymous": false, ".type": "interface", ".name": "lan", ".index": 3, "device": "br-lan.1", "proto": "dhcp", "multipath": "off" },
+		"vlan1": { ".anonymous": false, ".type": "bridge-vlan", ".name": "vlan1", ".index": 4, "device": "br-lan", "vlan": "1", "ports": ["wan:u*", "lan1:u*", "lan2:u*", "lan3:u*", "lan4:u*"] },
+		"vlan10": { ".anonymous": false, ".type": "bridge-vlan", ".name": "vlan10", ".index": 5, "device": "br-lan", "vlan": "10", "ports": ["wan:t"] },
+		"iot": { ".anonymous": false, ".type": "interface", ".name": "iot", ".index": 6, "proto": "none", "device": "br-lan.10" },
+		"vlan20": { ".anonymous": false, ".type": "bridge-vlan", ".name": "vlan20", ".index": 7, "device": "br-lan", "vlan": "20", "ports": ["wan:t"] },
+		"trusted": { ".anonymous": false, ".type": "interface", ".name": "trusted", ".index": 8, "proto": "none", "device": "br-lan.20" }
+	},
+	"system": {
+		"cfg01e48a": { ".anonymous": true, ".type": "system", ".name": "cfg01e48a", ".index": 0, "hostname": "OpenWrtnight", "timezone": "GMT0", "zonename": "UTC", "ttylogin": "0", "log_size": "128", "urandom_seed": "0", "compat_version": "1.1", "log_proto": "udp", "conloglevel": "8", "cronloglevel": "7" },
+		"ntp": { ".anonymous": false, ".type": "timeserver", ".name": "ntp", ".index": 1, "server": ["0.openwrt.pool.ntp.org", "1.openwrt.pool.ntp.org", "2.openwrt.pool.ntp.org", "3.openwrt.pool.ntp.org"] },
+		"led_wan": { ".anonymous": false, ".type": "led", ".name": "led_wan", ".index": 2, "name": "WAN", "sysfs": "white:wan", "trigger": "netdev", "mode": "link tx rx", "dev": "wan" }
+	},
+	"aeolus": {
+		"agent": { ".anonymous": false, ".type": "agent", ".name": "agent", ".index": 0, "url": "https://aeolus.example.com:8443", "uplink": "wan" }
+	},
+	"usteer": {
+		"cfg013ec2": { ".anonymous": true, ".type": "usteer", ".name": "cfg013ec2", ".index": 0, "network": "lan", "syslog": "1", "local_mode": "0", "ipv6": "0", "debug_level": "2", "band_steering_interval": "0" }
+	},
+	"snmpd": {
+		"cfg01a8b4": { ".anonymous": true, ".type": "agent", ".name": "cfg01a8b4", ".index": 0, "agentaddress": "UDP:161,UDP6:161" },
+		"all": { ".anonymous": false, ".type": "view", ".name": "all", ".index": 1, "viewname": "all", "type": "included", "oid": ".1" },
+		"cfg0bb8d7": { ".anonymous": true, ".type": "system", ".name": "cfg0bb8d7", ".index": 2, "sysLocation": "office", "sysContact": "bofh@example.com", "sysName": "HeartOfGold" },
+		"general": { ".anonymous": false, ".type": "snmpd", ".name": "general", ".index": 3, "enabled": "0" }
+	},
+	"firewall": {
+		"cfg01e63d": { ".anonymous": true, ".type": "defaults", ".name": "cfg01e63d", ".index": 0, "input": "REJECT", "output": "ACCEPT", "forward": "REJECT", "synflood_protect": "1" },
+		"cfg02dc81": { ".anonymous": true, ".type": "zone", ".name": "cfg02dc81", ".index": 1, "name": "lan", "input": "ACCEPT", "output": "ACCEPT", "forward": "ACCEPT", "network": ["lan"] },
+		"cfg03dc81": { ".anonymous": true, ".type": "zone", ".name": "cfg03dc81", ".index": 2, "name": "wan", "input": "REJECT", "output": "ACCEPT", "forward": "DROP", "masq": "1", "mtu_fix": "1" },
+		"cfg04ad58": { ".anonymous": true, ".type": "forwarding", ".name": "cfg04ad58", ".index": 3, "src": "lan", "dest": "wan" },
+		"cfg0692bd": { ".anonymous": true, ".type": "rule", ".name": "cfg0692bd", ".index": 4, "name": "Allow-Ping", "src": "wan", "proto": "icmp", "icmp_type": "echo-request", "family": "ipv4", "target": "ACCEPT" }
+	},
+	"dhcp": {
+		"cfg01411c": { ".anonymous": true, ".type": "dnsmasq", ".name": "cfg01411c", ".index": 0, "domainneeded": "1", "boguspriv": "1", "filterwin2k": "0", "localise_queries": "1", "rebind_protection": "1", "rebind_localhost": "1", "local": "/lan/", "domain": "lan", "expandhosts": "1", "nonegcache": "0", "cachesize": "1000", "authoritative": "1", "readethers": "1", "leasefile": "/tmp/dhcp.leases", "resolvfile": "/tmp/resolv.conf.d/resolv.conf.auto", "nonwildcard": "1", "localservice": "1", "ednspacket_max": "1232" },
+		"lan": { ".anonymous": false, ".type": "dhcp", ".name": "lan", ".index": 1, "interface": "lan", "start": "100", "limit": "150", "leasetime": "12h", "dhcpv4": "server", "ignore": "1" },
+		"odhcpd": { ".anonymous": false, ".type": "odhcpd", ".name": "odhcpd", ".index": 2, "maindhcp": "0", "leasefile": "/tmp/odhcpd.leases", "leasetrigger": "/usr/sbin/odhcpd-update", "loglevel": "4" }
+	}
+}

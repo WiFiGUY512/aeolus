@@ -1,0 +1,33 @@
+{
+	"about": "Every rule at once: radio settings, a new VLAN and a reused one, roaming, a hidden 2.4 GHz-only network, a disabled network, the time zone, the hostname (0076), NTP and syslog, and a leftover Aeolus section to remove.",
+	"current": "shed-current.json",
+	"stale": ["aeolus_gone_radio0"],
+	"facts": {
+		"prober": true,
+		"veth": true,
+		"uplink": "wan",
+		"radios": {
+			"radio0": { "htmodes": ["HT20", "HT40", "VHT20", "VHT40", "VHT80", "VHT80+80", "VHT160"] },
+			"radio1": { "htmodes": ["HT20", "HT40"] }
+		},
+		"timezone": "CST6CDT,M3.2.0,M11.1.0"
+	},
+	"intent": {
+		"ap": { "hostname": "Shed-AP" },
+		"radio": {
+			"2g": { "enabled": true, "channel": 11, "width": 20 },
+			"5g": { "channel": 36, "width": 160, "power": 20 },
+			"6g": { "width": 320 }
+		},
+		"system": { "country": "US", "tz": "America/Chicago", "ntp": ["time.example.com", "0.pool.ntp.org"], "syslog": "192.168.20.50:514", "poll": 30,
+			"snmp": { "enabled": true, "community": "fixture-community", "location": "Shed", "contact": "ops@example.com",
+				"v3": { "user": "monitor", "auth": "fixture-auth-1", "privacy": "fixture-privacy-1" } } },
+		"network": {
+			"sweet-lab": { "ssid": "Sweet Lab", "security": "wpa2-wpa3", "passphrase": "fixture-passphrase-2", "roaming": { "ft": true, "rrm": true, "btm": true }, "multicast_to_unicast": true, "transition_disable": true, "band_steering": true, "steering": { "community": true, "keep_6g": true },
+				"transport": { "primary": { "type": "vlan", "vlan": 30 }, "fallback": { "type": "vlan", "vlan": 20 }, "switching": "automatic", "failback": "equal" } },
+			"iot-lab": { "ssid": "IoT Lab", "security": "wpa2-psk", "passphrase": "fixture-passphrase-3", "bands": ["2g"], "hidden": true, "isolation": true, "multicast_to_unicast": false, "disassoc_low_ack": false, "band_steering": true,
+				"transport": { "primary": { "type": "vlan", "vlan": 10 } } },
+			"off": { "enabled": false, "ssid": "Off", "security": "open", "transport": { "primary": { "type": "vlan", "vlan": 40 } } }
+		}
+	}
+}

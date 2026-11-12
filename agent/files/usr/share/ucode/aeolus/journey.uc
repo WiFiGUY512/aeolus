@@ -1,0 +1,1183 @@
+// A Wi-Fi client coming online, step by step (0118): what hostapd's log
+// says of it, what its first frames show, and the record of the attempt
+// made from them. No I/O here: aeolus-journey listens and reads.
+//
+// An attempt runs from a client's authentication to its first traffic, or
+// to where it stopped. Its stages, in order: auth and assoc (802.11),
+// signin (802.1X, where the network has it), key (the handshake that makes
+// its keys), dhcp, gateway (ARP), dns, and internet (a first connection
+// answered).
+//
+// The key handshake is four messages (0133): the AP's first, m1; the
+// client's answer, m2, which shows whether it has the passphrase; the AP's
+// third, m3; and the client's last, m4. hostapd says each as it is sent or
+// comes where it logs at debug, which aeolus-journey asks of it; a step
+// that is of one of them names it, k. So does WPA3's authentication (SAE),
+// of which hostapd otherwise says nothing where the passphrase is wrong.
+
+'use strict';
+
+import { REASONS } from 'aeolus.capture';
+
+const STAGES = ['auth', 'assoc', 'signin', 'key', 'dhcp', 'gateway', 'dns', 'internet'];
+const EVENTS = 48;       // steps kept of one attempt
+const LOOKUPS = 4;       // DNS lookups kept of one attempt
+const CONNECTIONS = 2;   // first connections kept
+const IDLE = 20;         // seconds without a step before a client not yet let on is given up
+const SIGNIN_IDLE = 40;  // and before one that is signing in is: hostapd asks a second RADIUS server after 21 s without the first's answer, and waits 20 s for a client's
+const LET_ON = 120;      // seconds at most to be let on
+const WATCH = 30;        // seconds a client is watched after it is let on
+const LINGER = 4;        // seconds more after it is online, for its first lookups and connection
+const GAVE_UP_DHCP = 8;  // seconds without an answer to DHCP before a client's leaving is a failure
+const GAVE_UP_GATEWAY = 4;   // and without one from its gateway
+const SAME = 1;          // seconds after a client is let on in which "associated" again is the same association, said twice
+const DROPPED = 2;       // seconds after hostapd let go of a client not yet let on in which its coming must go on
+const CARRIED = 3;       // seconds before a coming in which what hostapd said of its asking is of it
+
+function get16(s, at) {
+	return ord(s, at) << 8 | ord(s, at + 1);
+}
+
+function get32(s, at) {
+	return get16(s, at) * 65536 + get16(s, at + 2);
+}
+
+function mac_text(s, at) {
+	return join(':', map([0, 1, 2, 3, 4, 5], i => sprintf('%02x', ord(s, at + i))));
+}
+
+function ip4_text(s, at) {
+	return join('.', map([0, 1, 2, 3], i => ord(s, at + i)));
+}
+
+// ip6_text is an IPv6 address's groups, written out in full.
+function ip6_text(s, at) {
+	return join(':', map([0, 2, 4, 6, 8, 10, 12, 14], i => sprintf('%x', get16(s, at + i))));
+}
+
+// text keeps what is printable of a string, at most n characters.
+function text(s, n) {
+	return substr(replace(s ?? '', /[^ -~]/g, '?'), 0, n);
+}
+
+// assemble makes a kernel packet filter from one written with named jumps.
+// Each step is [code, where to if true, where to if false, k]; a jump is a
+// label's name, or 0 for the next step. A string alone is a label.
+function assemble(steps) {
+	let at = {}, n = 0;
+	for (let s in steps) {
+		if (type(s) == 'string')
+			at[s] = n;
+		else
+			n++;
+	}
+	let out = [], i = 0;
+	for (let s in steps) {
+		if (type(s) == 'string')
+			continue;
+		let to = l => type(l) == 'string' ? at[l] - i - 1 : 0;
+		push(out, [s[0], to(s[1]), to(s[2]), s[3]]);
+		i++;
+	}
+	return out;
+}
+
+// capture is the kernel filter that keeps, of what crosses a Wi-Fi
+// interface, what tells how a client comes online: ARP from a client, and
+// an ARP answer going out to one; DHCP both ways; and, wide, while a client
+// is watched, DNS both ways (IPv4 and IPv6, over UDP) and the frames that
+// open a TCP connection. Narrow, when no client is watched, it lets the AP's
+// traffic be. (Not filter: a function of that name here would hide ucode's
+// own, which record uses.)
+function capture(wide) {
+	return assemble([
+		[0x28, 0, 0, 12],               // A = EtherType
+		[0x15, 'arp', 0, 0x0806],
+		[0x15, 'ip4', 0, 0x0800],
+		[0x15, wide ? 'ip6' : 'drop', 'drop', 0x86dd],
+		'arp',
+		[0x20, 0, 0, 0xfffff004],       // A = the packet's direction
+		[0x15, 0, 'keep', 4],           // coming in from a client: keep
+		[0x28, 0, 0, 20],               // A = ARP's operation
+		[0x15, 'keep', 'drop', 2],      // an answer going out: keep
+		'ip4',
+		[0x30, 0, 0, 23],               // A = the protocol
+		[0x15, 'udp4', 0, 17],
+		[0x15, wide ? 'tcp4' : 'drop', 'drop', 6],
+		'udp4',
+		[0x28, 0, 0, 20],               // A = flags and fragment offset
+		[0x45, 'drop', 0, 0x1fff],      // a later fragment: drop
+		[0xb1, 0, 0, 14],               // X = the IP header's length
+		[0x48, 0, 0, 14],               // A = the source port
+		[0x15, 'keep', 0, 67],
+		[0x15, 'keep', 0, 68],
+		[0x15, wide ? 'keep' : 0, 0, 53],
+		[0x48, 0, 0, 16],               // A = the destination port
+		[0x15, 'keep', 0, 67],
+		[0x15, 'keep', 0, 68],
+		[0x15, wide ? 'keep' : 'drop', 'drop', 53],
+		'tcp4',
+		[0x28, 0, 0, 20],
+		[0x45, 'drop', 0, 0x1fff],
+		[0xb1, 0, 0, 14],
+		[0x50, 0, 0, 27],               // A = TCP's flags
+		[0x45, 'keep', 'drop', 0x02],   // a SYN: keep
+		'ip6',
+		[0x30, 0, 0, 20],               // A = the next header
+		[0x15, 'udp6', 0, 17],
+		[0x15, 'tcp6', 'drop', 6],
+		'udp6',
+		[0x28, 0, 0, 54],               // A = the source port
+		[0x15, 'keep', 0, 53],
+		[0x28, 0, 0, 56],               // A = the destination port
+		[0x15, 'keep', 'drop', 53],
+		'tcp6',
+		[0x30, 0, 0, 67],               // A = TCP's flags
+		[0x45, 'keep', 'drop', 0x02],
+		'keep',
+		[0x06, 0, 0, 0x40000],
+		'drop',
+		[0x06, 0, 0, 0],
+	]);
+}
+
+// What hostapd's events mean for a client coming online: the stage, what
+// to say, whether it went well (true), badly (false) or neither, and the
+// message of the key handshake it is of, where it is of one.
+const EVENT = {
+	'AP-STA-CONNECTED': ['key', 'let on to the network', true],
+	// The client's answer to the first message did not check out against
+	// the passphrase, or any of them where each device has its own.
+	'AP-STA-POSSIBLE-PSK-MISMATCH': ['key', 'wrong passphrase', false, 'm2'],
+	'EAPOL-4WAY-HS-COMPLETED': ['key', 'key handshake completed', true],
+	'CTRL-EVENT-EAP-STARTED': ['signin', 'sign-in started', null],
+	'CTRL-EVENT-EAP-SUCCESS2': ['signin', 'the server accepted the sign-in', true],
+	'CTRL-EVENT-EAP-FAILURE2': ['signin', 'the server refused the sign-in', false],
+	'CTRL-EVENT-EAP-TIMEOUT-FAILURE2': ['signin', 'the sign-in timed out', false],
+	'CTRL-EVENT-EAP-RETRANSMIT2': ['signin', 'a sign-in message was sent again', null],
+	'CTRL-EVENT-SAE-UNKNOWN-PASSWORD-IDENTIFIER': ['key', 'unknown password identifier', false],
+};
+
+// fine reads what hostapd says of a client only where it logs at debug
+// (0133): a message of the key handshake, sent or come, with k, which, and
+// k on nothing else; its giving the handshake up, with gave, the message
+// of its own it had no answer to; WPA3's authentication, with sae, how
+// far; and that a client is authenticated, which it says in no other way
+// of one that came by WPA3 or by a fast roam. False for a line that is
+// known and says nothing another does not; null for one that is not known.
+function fine(e, sub, t) {
+	let m;
+	if (sub == 'WPA') {
+		if ((m = match(t, /^sending ([13])\/4 msg of 4-Way Handshake/)))
+			return { ...e, stage: 'key', k: 'm' + m[1], what: `message ${m[1]} of 4 sent to it`, sent: true };
+		if ((m = match(t, /^received EAPOL-Key frame \(([24])\/4 Pairwise\)/)))
+			return { ...e, stage: 'key', k: 'm' + m[1], what: `message ${m[1]} of 4 came from it` };
+		// The AP waits a second for an answer, and sends its message again:
+		// after so many it gives the client up. That failed: the client
+		// that goes of its own accord says so.
+		if ((m = match(t, /^(PTKSTART|PTKINITNEGOTIATING): Retry limit [0-9]+ reached/)))
+			return { ...e, stage: 'key', what: 'gave up waiting for its answer', ok: false, gave: m[1] == 'PTKSTART' ? 1 : 3 };
+		// What these say, a step that follows says: the passphrase is
+		// wrong, or the message is sent again.
+		if (match(t, /^(invalid MIC in msg 2\/4|EAPOL-Key timeout)/))
+			return false;
+	}
+	if (sub == 'IEEE 802.11' && (m = match(t, /^(start )?SAE authentication \(RX (commit|confirm)/)))
+		return { ...e, stage: 'auth', sae: m[2], alg: 'sae', what: m[2] == 'commit' ? 'starts WPA3 authentication (SAE commit)' : 'sends its WPA3 confirm (SAE confirm)' };
+	// Said of every client as it is authenticated, however it came: of one
+	// by open authentication just before hostapd's own word for it. One
+	// that comes by a fast transition (802.11r) from another AP is said so
+	// here, and has no key handshake after.
+	if (sub == 'MLME' && (m = match(t, /^MLME-AUTHENTICATE\.indication\([0-9a-f:]+, ([A-Za-z_]+)\)/)))
+		return m[1] == 'FT' ? { ...e, stage: 'auth', what: 'authenticated, by a fast transition from another AP (802.11r)', ok: true, alg: 'ft' }
+			: m[1] == 'OPEN_SYSTEM' ? { ...e, stage: 'auth', what: 'authenticated', ok: true, alg: 'open' }
+			: { ...e, stage: 'auth', what: 'authenticated', ok: true };
+	if (sub == 'MLME' && match(t, /^MLME-AUTHENTICATE\.indication\(/))
+		return { ...e, stage: 'auth', what: 'authenticated', ok: true };
+	// How it came (0136), each said beside an attempt's own steps (aside):
+	// none begins one. It asked to be taken over, as one that is on the
+	// network already, at another AP or this one.
+	if (sub == 'MLME' && match(t, /^MLME-REASSOCIATE\.indication\(/))
+		return { ...e, stage: 'assoc', what: 'it asked as one already on the network (a reassociation)', re: true, aside: true };
+	// The AP still holds the client as on, and where management frames
+	// are protected (802.11w) asks the one it remembers to prove itself
+	// before it takes the newcomer: a second's wait for a client that
+	// left without a word and is back.
+	if (sub == 'IEEE 802.11' && (m = match(t, /^association SA Query attempt ([0-9]+)/)))
+		return { ...e, stage: 'assoc', what: 'the AP still holds it as on, and asks the client it remembers to prove itself (SA Query)', saq: int(m[1]), aside: true };
+	if (sub == 'IEEE 802.11' && match(t, /^association SA Query timed out/))
+		return { ...e, stage: 'assoc', what: 'no proof came, as from a client that had left: it is taken as new', aside: true, asking: true };
+	// Its key from a sign-in before is taken, as it asks to associate, and
+	// it need not sign in again: one this AP holds from the client's last
+	// time here, or one made from its sign-in at another AP (opportunistic
+	// key caching), of which hostapd says that first and the other after.
+	if (sub == 'WPA' && match(t, /^OKC match for PMKID/))
+		return { ...e, stage: 'assoc', what: 'its key from its sign-in at another AP is taken here (OKC): no sign-in again', pmk: 'okc', aside: true };
+	if (sub == 'WPA' && match(t, /^PMKID found from PMKSA cache/))
+		return { ...e, stage: 'assoc', what: 'its key from its last time here is still held (PMKSA cache): no sign-in again', pmk: 'pmksa', aside: true };
+	// A fast transition brings its keys with it, and no handshake follows.
+	if (sub == 'WPA' && match(t, /^FT authentication already completed/))
+		return { ...e, stage: 'key', what: 'its keys came with the fast transition: no handshake', ok: true, on: true, alg: 'ft' };
+	// What these say, the lines above or hostapd's own words do.
+	if (sub == 'IEEE 802.11' && match(t, /^(authentication OK|association OK)/))
+		return false;
+	return null;
+}
+
+// log_event reads one line of the system log for what hostapd says of a
+// client: { bss, mac, stage, what, ok } and, where it is the client being
+// let on, on; where it is the client leaving, end. A line that names a
+// client and is not known is kept as it reads, with no stage: it may be the
+// one that explains a failure. Null for any other line. A line hostapd
+// says only at debug, by its priority where it has one, is read where it
+// is known, as a client's own leaving is; one that is not known is
+// nothing, as there are many of those.
+//
+// With framed, the steps come from hostapd's frames (0254, air_event), and
+// the lines they say are nothing: every line at debug, and of IEEE 802.11
+// those of authentication, association and leaving.
+function log_event(line, framed) {
+	let m = match(line ?? '', /hostapd: ([A-Za-z0-9_.-]+): (.*)$/);
+	if (!m)
+		return null;
+	let bss = m[1], rest = m[2];
+	let pri = match(line, /^<([0-9]+)>/);
+	let debug = pri != null && (int(pri[1]) & 7) == 7;
+	if (framed && debug)
+		return null;
+	let s = match(rest, /^STA ([0-9a-f]{2}:[0-9a-f]{2}:[0-9a-f]{2}:[0-9a-f]{2}:[0-9a-f]{2}:[0-9a-f]{2}) ([A-Za-z0-9. ]+): (.*)$/);
+	if (s) {
+		let e = { bss: bss, mac: s[1], stage: null, what: text(s[3], 120), ok: null }, sub = s[2], t = s[3];
+		if (framed && sub == 'IEEE 802.11' && match(t, /^(authenticated|associated|disassociated|deauthenticated|.*did not acknowledge (authentication|association) response)/))
+			return null;
+		let f = fine(e, sub, t);
+		if (f)
+			return f;
+		if (f === false)
+			return null;
+		// A line that is not known, kept as it reads: not one said at debug.
+		let kept = (as) => debug ? null : as;
+		if (sub == 'IEEE 802.11') {
+			// Said of open authentication alone: of WPA3's and of a fast
+			// transition hostapd has other words, at debug.
+			if (t == 'authenticated')
+				return { ...e, stage: 'auth', ok: true, alg: 'open' };
+			if (match(t, /^associated/))
+				return { ...e, stage: 'assoc', what: 'associated', ok: true };
+			if (match(t, /^(disassociated|deauthenticated)/))
+				return { ...e, stage: 'end', end: true };
+			if (match(t, /did not acknowledge authentication response/))
+				return { ...e, stage: 'auth', what: 'did not acknowledge the AP\'s answer', ok: false };
+			if (match(t, /did not acknowledge association response/))
+				return { ...e, stage: 'assoc', what: 'did not acknowledge the AP\'s answer', ok: false };
+			return kept(e);
+		}
+		if (sub == 'WPA') {
+			// Its keys in place, it is let on, said or not: of a client
+			// it still holds as on, as one that went without a word and
+			// is back, hostapd says the handshake and not that it is
+			// connected, which to it the client never ceased to be.
+			if (match(t, /^pairwise key handshake completed/))
+				return { ...e, stage: 'key', what: 'key handshake completed', ok: true, on: true };
+			if (match(t, /^group key handshake completed/))
+				return null;
+			return kept({ ...e, stage: 'key' });
+		}
+		if (sub == 'IEEE 802.1X') {
+			let a = match(t, /^authenticated - EAP type: [0-9]+ \(([A-Za-z0-9_-]+)\)/);
+			if (a)
+				return { ...e, stage: 'signin', what: 'signed in with ' + a[1], ok: true };
+			if (match(t, /^authentication (failed|timeout)/))
+				return { ...e, stage: 'signin', ok: false };
+			return kept({ ...e, stage: 'signin' });
+		}
+		if (sub == 'RADIUS') {
+			if (match(t, /accounting session/))
+				return null;
+			// What the server's answer was refused for, of a device it is
+			// asked about before the AP answers its authentication (MAC
+			// authentication, a passphrase from RADIUS): hostapd then
+			// refuses it, and this is its only line. It begins an attempt.
+			if (match(t, /^(Invalid VLAN .* received from RADIUS server|invalid hex string .* in Tunnel-Password)/))
+				return { ...e, stage: 'signin', starts: true };
+			return kept({ ...e, stage: 'signin' });
+		}
+		return sub == 'MLME' ? null : kept(e);
+	}
+	let c = match(rest, /^([A-Z][A-Z0-9-]+) ([0-9a-f]{2}:[0-9a-f]{2}:[0-9a-f]{2}:[0-9a-f]{2}:[0-9a-f]{2}:[0-9a-f]{2})( .*)?$/);
+	if (!c)
+		return null;
+	// Said only of a client hostapd held as let on (held): see on_log.
+	if (c[1] == 'AP-STA-DISCONNECTED')
+		return { bss: bss, mac: c[2], stage: 'end', what: 'disconnected', ok: null, end: true, held: true };
+	let k = EVENT[c[1]];
+	if (!k)
+		return null;
+	let e = { bss: bss, mac: c[2], stage: k[0], what: k[1], ok: k[2] };
+	if (k[3])
+		e.k = k[3];
+	// Let on, hostapd says how it was authenticated, at any level: ft for
+	// a fast transition, sae for WPA3, open for the rest.
+	let alg = c[1] == 'AP-STA-CONNECTED' ? match(c[3] ?? '', /auth_alg=([a-z0-9]{1,12})( |$)/) : null;
+	if (alg)
+		e.alg = alg[1];
+	if (c[1] == 'AP-STA-CONNECTED' || c[1] == 'EAPOL-4WAY-HS-COMPLETED')
+		e.on = true;
+	// hostapd says a client is connected only as it goes from not on to
+	// on: of one that is not being followed, that is a client that came,
+	// as one whose sign-in outlasted the wait for it. And a client refused
+	// for a password identifier the AP has not is said in this line alone.
+	if (c[1] == 'AP-STA-CONNECTED' || c[1] == 'CTRL-EVENT-SAE-UNKNOWN-PASSWORD-IDENTIFIER')
+		e.starts = true;
+	return e;
+}
+
+const DHCP_KINDS = [null, 'discover', 'offer', 'request', 'decline', 'ack', 'nak', 'release', 'inform'];
+const RCODES = ['NOERROR', 'FORMERR', 'SERVFAIL', 'NXDOMAIN', 'NOTIMP', 'REFUSED'];
+const QTYPES = { '1': 'A', '5': 'CNAME', '12': 'PTR', '28': 'AAAA', '33': 'SRV', '64': 'SVCB', '65': 'HTTPS' };
+
+// dhcp reads a DHCP message at b in a frame: its kind, the client's MAC,
+// the address given, the server's ID, and of an offer or an ack the router
+// and the first DNS servers; of a client's, the host name it gives.
+function dhcp(f, b) {
+	if (length(f) < b + 240 || get32(f, b + 236) != 0x63825363 || ord(f, b + 2) != 6)
+		return null;
+	let opts = {};
+	for (let at = b + 240; at + 1 < length(f) && ord(f, at) != 255; ) {
+		if (ord(f, at) == 0) {
+			at++;
+			continue;
+		}
+		opts[ord(f, at)] = substr(f, at + 2, ord(f, at + 1));
+		at += 2 + ord(f, at + 1);
+	}
+	let type = opts[53] != null ? DHCP_KINDS[ord(opts[53], 0)] : null;
+	if (!type)
+		return null;
+	let ip = k => length(opts[k] ?? '') >= 4 ? ip4_text(opts[k], 0) : null;
+	let dns = [];
+	for (let i = 0; i + 4 <= length(opts[6] ?? '') && i < 12; i += 4)
+		push(dns, ip4_text(opts[6], i));
+	let given = ip4_text(f, b + 16);
+	return {
+		kind: 'dhcp', mac: mac_text(f, b + 28), type: type,
+		address: given != '0.0.0.0' ? given : null, server: ip(54), router: ip(3), dns: dns,
+		host: opts[12] != null ? text(opts[12], 64) || null : null,
+	};
+}
+
+// dns reads a DNS message at b: whether it asks or answers, its ID, the
+// name and type asked, and of an answer how it went and how many records
+// came. The name is kept to 64 characters.
+function dns(f, b) {
+	if (length(f) < b + 17)
+		return null;
+	let flags = get16(f, b + 2);
+	if (get16(f, b + 4) < 1)
+		return null;
+	let labels = [], at = b + 12;
+	while (at < length(f) && ord(f, at) > 0 && ord(f, at) < 64 && length(labels) < 32) {
+		push(labels, substr(f, at + 1, ord(f, at)));
+		at += 1 + ord(f, at);
+	}
+	if (at + 2 >= length(f) || ord(f, at) != 0)
+		return null;
+	let qtype = get16(f, at + 1);
+	return {
+		kind: 'dns', id: get16(f, b), answer: (flags & 0x8000) != 0,
+		name: lc(text(join('.', labels), 64)) || '.', type: QTYPES['' + qtype] ?? 'type ' + qtype,
+		rcode: RCODES[flags & 15] ?? 'error ' + (flags & 15), records: get16(f, b + 6),
+	};
+}
+
+// frame reads a frame from a Wi-Fi interface for what it tells of a client
+// coming online; out says it was going out to the client. It names the
+// client by its MAC. Null for a frame that tells nothing.
+function frame(f, out) {
+	if (length(f ?? '') < 42)
+		return null;
+	let client = mac_text(f, out ? 0 : 6);
+	let type = get16(f, 12);
+	if (type == 0x0806) {
+		if (get16(f, 16) != 0x0800 || ord(f, 18) != 6 || ord(f, 19) != 4)
+			return null;
+		let op = get16(f, 20), from = ip4_text(f, 28), about = ip4_text(f, 38);
+		if (out)
+			return op == 2 ? { kind: 'arp', mac: mac_text(f, 32), what: 'answer', address: from, holder: mac_text(f, 22) } : null;
+		if (from == '0.0.0.0')
+			return null;   // looking whether an address is free: it has none yet
+		return { kind: 'arp', mac: mac_text(f, 22), what: op == 1 && about != from ? 'ask' : 'tell', address: from, about: about };
+	}
+	let l4, proto, from, to;
+	if (type == 0x0800) {
+		if (get16(f, 20) & 0x1fff)
+			return null;
+		l4 = 14 + (ord(f, 14) & 15) * 4;
+		proto = ord(f, 23);
+		from = ip4_text(f, 26);
+		to = ip4_text(f, 30);
+	} else if (type == 0x86dd && length(f) >= 62) {
+		l4 = 54;
+		proto = ord(f, 20);
+		from = ip6_text(f, 22);
+		to = ip6_text(f, 38);
+	} else
+		return null;
+	if (length(f) < l4 + 8)
+		return null;
+	let sport = get16(f, l4), dport = get16(f, l4 + 2);
+	if (proto == 17) {
+		if (type == 0x0800 && (sport in [67, 68] || dport in [67, 68]))
+			return dhcp(f, l4 + 8);
+		if (sport != 53 && dport != 53)
+			return null;
+		let d = dns(f, l4 + 8);
+		// A lookup is the client's to a server; an answer, a server's to it.
+		if (!d || d.answer != !!out || (out ? sport : dport) != 53)
+			return null;
+		d.mac = client;
+		d.server = out ? from : to;
+		if (!out)
+			d.own = from;
+		return d;
+	}
+	if (proto != 6 || length(f) < l4 + 14)
+		return null;
+	let flags = ord(f, l4 + 13);
+	if (!(flags & 2))
+		return null;
+	if (!out && !(flags & 16))
+		return { kind: 'tcp', mac: client, what: 'open', address: to, port: dport, own: from };
+	if (out && (flags & 16))
+		return { kind: 'tcp', mac: client, what: 'answer', address: from, port: sport };
+	return null;
+}
+
+// begins says whether what hostapd said of a client that is not being
+// followed begins an attempt: its authentication, or its association,
+// which every client that comes has, said at any level; and the few lines
+// that are all hostapd says of a client it refuses before those, or that
+// it says only of a client that came (starts). Nothing else does. A client
+// long on has its keys made again, or signs in again, by 802.1X every hour
+// unless set otherwise: the key messages and the sign-in, with no
+// authentication and no association before them, are not a client coming
+// online, and were each recorded as one that failed.
+function begins(e) {
+	return !e.end && !e.aside && !e.nobegin && (e.stage == 'auth' || e.stage == 'assoc' || e.starts === true);
+}
+
+// again says whether what hostapd said of a client that is being followed,
+// at, is its coming anew, which ends the attempt it is followed in and
+// begins another (0136). An attempt is watched for a while after the client
+// is let on, and for a moment after it left; a client back within that, as
+// one that left without a word and returned, or was put off and came
+// straight back, was written into the attempt before, and its coming back
+// was lost.
+//
+// A coming is an authentication, an association that was taken, or
+// hostapd's word that a client is connected: not a line that says
+// something failed, which after an attempt that ended is the last of that
+// one; and not what hostapd says beside an attempt. "associated" again
+// within a second of the client's being let on is the same association,
+// whose answer the client asked for twice.
+function again(a, e, at) {
+	if (e.end || e.aside)
+		return false;
+	if (a.ended != null)
+		return (e.stage == 'auth' && e.ok !== false) || (e.stage == 'assoc' && e.ok === true) || e.starts === true;
+	if (a.on == null)
+		return false;
+	if (e.stage == 'assoc')
+		return e.ok === true && at - a.on >= SAME;
+	return e.stage == 'auth' && e.ok !== false;
+}
+
+// carried is what hostapd said, in the seconds before a client that was
+// let on came again, that is of that coming and not of the stay it was
+// held in: that it asks the one it remembers for proof, or takes a key
+// from before, which it says only of a new asking by a client it holds as
+// on, and before it says the association. Each with when it was said. The
+// new attempt begins with them. Where no coming follows, as when the
+// asking was not the client's own, they are steps of the attempt the
+// client is in, and nothing more.
+function carried(a, at) {
+	return filter(a.late ?? [], l => at - l.at <= CARRIED);
+}
+
+// begin starts the record of an attempt: who, on which network, and when,
+// at by the AP's steady clock in seconds and wall by the calendar's in ms.
+function begin(who, at, wall) {
+	return {
+		bss: who.bss, mac: who.mac, network: who.network ?? '', ssid: who.ssid ?? '', band: who.band ?? '',
+		started: at, wall: wall, last: at, events: [], more: 0,
+		done: {}, failed: null, on: null, ended: null, left: null, online: null,
+		sent: {}, sae: null, how: {}, own: false, held: null, assoc: null, silent: false, dropped: null, late: [],
+		address: null, host: null, router: null, signal: null, probes: null,
+		dhcp: { asked: 0, first: null, offer: false, ack: false, nak: false },
+		arp: { asked: null, at: null, answered: false }, lookups: {}, dns: { asked: 0, answered: 0, kept: 0 },
+		tcp: { opened: {}, kept: 0, answered: false },
+	};
+}
+
+// step adds one step to an attempt: its stage, what happened, whether it
+// went well, and any more to say of it. One like the last, within a second
+// of it, is not said twice: hostapd says some things twice over. Past
+// EVENTS, steps are only counted.
+function step(a, at, stage, what, ok, more) {
+	a.last = at;
+	let t = max(0, int((at - a.started) * 1000 + 0.5));
+	let last = a.events[length(a.events) - 1];
+	if (last && last.stage == stage && last.what == what && t - last.t < 1000)
+		return;
+	if (length(a.events) >= EVENTS) {
+		a.more++;
+		return;
+	}
+	let e = { t: t, stage: stage, what: what };
+	if (ok != null)
+		e.ok = ok;
+	for (let k, v in more ?? {})
+		if (v != null)
+			e[k] = v;
+	push(a.events, e);
+}
+
+// cut ends an attempt whose client has come again: it left this one, to
+// come anew, and is judged as a client that left is. One that had asked
+// for an address a second before has failed nothing.
+function cut(a, at) {
+	if (a.ended != null)
+		return;
+	step(a, at, 'end', 'it came again', null);
+	a.ended = at;
+	a.left = 'it came again';
+}
+
+// reached notes what makes a client online: an address, and something
+// beyond itself that answered it.
+function reached(a, at) {
+	if (a.online == null && a.on != null && a.address && (a.arp.answered || a.dns.answered > 0 || a.tcp.answered))
+		a.online = at;
+}
+
+// on_log takes what hostapd said of the client into its attempt.
+function on_log(a, e, at) {
+	// hostapd says a client is disconnected only of one it held as let on.
+	// Said in an attempt that is not yet let on, and in which nothing has
+	// gone wrong, it is of the client's stay before, which hostapd lets go
+	// of as the client comes again: not the end of this attempt, if its
+	// coming goes on. If nothing follows it was the end after all: see
+	// due and record. In an attempt that has failed it is the end,
+	// whatever it is of.
+	if (e.end && e.held && a.on == null && !a.failed) {
+		step(a, at, 'assoc', 'the AP let go of what it held of the client from before', null);
+		a.dropped = at;
+		return;
+	}
+	// Its coming goes on: by a line of its own, not one said beside it.
+	if (!e.end && !e.aside)
+		a.dropped = null;
+	if (e.end) {
+		step(a, at, 'end', e.what, null, { air: e.air });
+		a.ended = at;
+		a.left = e.what;
+		return;
+	}
+	// The AP's giving the handshake up, read from its frames (0254), is at
+	// the last of its messages it sent.
+	if (e.gave === 0)
+		e = { ...e, gave: a.sent.m3 ? 3 : 1 };
+	let what = e.what, why = e.what;
+	// A message of the key handshake sent again says which try it is.
+	if (e.sent) {
+		a.sent[e.k] = (a.sent[e.k] ?? 0) + 1;
+		if (a.sent[e.k] > 1)
+			what += `, try ${a.sent[e.k]}`;
+	}
+	// The AP gave the handshake up: which of its messages had no answer,
+	// and how often it was sent, as counted, where it was.
+	if (e.gave) {
+		let n = a.sent['m' + e.gave], which = e.gave == 1 ? 'first' : 'third';
+		let times = n ? `, sent ${n == 1 ? 'once' : n + ' times'}` : '';
+		what = `gave up: no answer it could use to its ${which} message${times}`;
+		why = `no answer the AP could use to the ${which} message of the key handshake${times}`;
+	}
+	if (e.sae)
+		a.sae = e.sae;
+	// Said after the client was let on, of a new asking: a step here, no
+	// part of how this coming came, and kept for the coming that may
+	// follow (carried).
+	let late = a.on != null && e.aside && (e.saq != null || e.pmk != null || e.asking === true);
+	if (late) {
+		// The latest are kept: they are the ones of a coming that follows.
+		if (length(a.late) >= 8)
+			shift(a.late);
+		push(a.late, { e: e, at: at });
+	}
+	// How it came (0136): by which authentication, by a reassociation,
+	// with a key from before, and how often the AP asked the client it
+	// remembered to prove itself. An authentication is a new try: what
+	// was known of the one before, as that it was a fast transition, is
+	// not said of this one. What hostapd says of its coming just after it
+	// is let on, as that it asked as one already on the network, is still
+	// of how it came; an authentication or an association after that is
+	// its coming again, and another attempt (again).
+	if (late) {
+		step(a, at, e.stage ?? 'note', what, e.ok, { air: e.air });
+		return;
+	}
+	if (e.stage == 'auth' && e.alg && e.alg != a.how.alg) {
+		// WPA3's exchange, done, and then open authentication: what
+		// a client does that the AP told to come back in a second,
+		// as it does one it still holds as on, while it asks for
+		// proof. The client came by WPA3's exchange, and the key it
+		// then offers is the one that exchange just made, no key
+		// from before.
+		if (a.how.alg == 'sae' && a.sae == 'confirm' && a.done.auth && e.alg == 'open')
+			a.own = true;
+		else {
+			// How often the AP asked for proof is of the attempt,
+			// whichever try it was in.
+			a.how = a.how.saq ? { alg: e.alg, saq: a.how.saq } : { alg: e.alg };
+			a.own = false;
+		}
+	} else if (e.alg && !(a.own && e.alg == 'open'))
+		a.how.alg = e.alg;
+	if (e.re)
+		a.how.re = true;
+	// Of a key made from a sign-in elsewhere hostapd says that, and then
+	// that the key was found, as of one of its own: said once.
+	if (e.pmk == 'pmksa' && a.how.pmk == 'okc')
+		return;
+	// The key its own exchange just made is no key from its last time
+	// here.
+	if (a.own && e.pmk == 'pmksa')
+		what = 'the key its WPA3 exchange just made is taken: no exchange again';
+	if (e.pmk && !(a.own && e.pmk == 'pmksa'))
+		a.how.pmk = e.pmk;
+	if (e.saq)
+		a.how.saq = min(64, max(a.how.saq ?? 0, e.saq));
+	// Whether anything is said after its association but what is said
+	// beside it: see record.
+	if (!e.aside)
+		a.silent = false;
+	step(a, at, e.stage ?? 'note', what, e.ok, { k: e.k, air: e.air });
+	if (e.stage && e.ok === true)
+		a.done[e.stage] = true;
+	// Associated, it is authenticated, said or not; and a handshake that
+	// follows is another, counted afresh.
+	if (e.stage == 'assoc' && e.ok === true) {
+		a.done.auth = true;
+		a.sent = {};
+		a.assoc = at;
+		a.silent = true;
+		// By a fast transition its keys came with it: associated, it is
+		// on. hostapd says so only of a client it did not already hold as
+		// on: one that went without a word and is back by 802.11r has no
+		// key handshake to complete, and nothing more is said of it.
+		if (a.how.alg == 'ft')
+			e = { ...e, on: true };
+	}
+	// What goes wrong after a client has left is not what its attempt came
+	// to: it left, and that is said of the answer it did not wait for.
+	if (e.stage && e.ok === false && !a.failed && a.ended == null)
+		a.failed = { stage: e.stage, why: why };
+	if (e.on && a.on == null) {
+		a.on = at;
+		a.how.on_ms = max(0, int((at - a.started) * 1000 + 0.5));
+		// Let on, what went wrong on the way was got over: as a wrong
+		// passphrase, and then the right one.
+		a.failed = null;
+	}
+	reached(a, at);
+}
+
+// on_frame takes one of the client's first frames into its attempt; a
+// frame that told nothing, null, changes nothing.
+function on_frame(a, p, at) {
+	if (!p)
+		return;
+	if (p.kind == 'dhcp') {
+		if (p.type in ['discover', 'request']) {
+			a.dhcp.asked++;
+			a.dhcp.first ??= at;
+			if (p.host)
+				a.host = p.host;
+			step(a, at, 'dhcp', p.type == 'discover' ? 'asks for an address (discover)' : 'asks to use the address (request)', null);
+		} else if (p.type == 'offer') {
+			a.dhcp.offer = true;
+			step(a, at, 'dhcp', 'offered ' + p.address, null, { server: p.server });
+		} else if (p.type == 'ack') {
+			a.dhcp.ack = true;
+			a.done.dhcp = true;
+			// The network's part is done once it has given the address
+			// (0322): what the client does next is its own.
+			a.ready ??= at;
+			if (p.address)
+				a.address = p.address;
+			a.router = p.router ?? a.router;
+			step(a, at, 'dhcp', 'given ' + (p.address ?? 'its address'), true,
+				{ server: p.server, router: p.router, dns: length(p.dns) ? join(' ', p.dns) : null });
+		} else if (p.type == 'nak') {
+			a.dhcp.nak = true;
+			step(a, at, 'dhcp', 'the server refused the request (nak)', false, { server: p.server });
+		}
+	} else if (p.kind == 'arp') {
+		if (p.what == 'answer') {
+			if (!a.arp.answered || p.address == a.router) {
+				a.done.gateway = true;
+				step(a, at, 'gateway', p.address + (p.address == a.router ? ', its gateway,' : '') + ' answers', true, { holder: p.holder });
+			}
+			a.arp.answered = true;
+		} else {
+			// The address the client speaks from is the one it uses, given
+			// by DHCP or kept from before.
+			if (!a.address && p.address) {
+				a.address = p.address;
+				if (!a.dhcp.ack)
+					step(a, at, 'dhcp', 'uses ' + p.address + ', which it had already', true);
+			}
+			if (p.what == 'ask' && (a.arp.asked == null || p.about == a.router)) {
+				// How long it waited is counted from its first asking for
+				// this address, not for one it asked for before.
+				if (a.arp.asked != p.about)
+					a.arp.at = at;
+				a.arp.asked = p.about;
+				step(a, at, 'gateway', 'asks who has ' + p.about + (p.about == a.router ? ', its gateway' : ''), null);
+			}
+		}
+	} else if (p.kind == 'dns') {
+		if (!a.address && p.own)
+			a.address = p.own;
+		let k = p.id + ' ' + p.name + ' ' + p.type;
+		if (!p.answer) {
+			a.dns.asked++;
+			if (a.lookups[k] == null && a.dns.kept < LOOKUPS) {
+				a.lookups[k] = at;
+				a.dns.kept++;
+				step(a, at, 'dns', 'asks ' + p.server + ' for ' + p.name + ' (' + p.type + ')', null);
+			}
+		} else {
+			a.dns.answered++;
+			a.done.dns = true;
+			if (a.lookups[k] != null) {
+				let ms = int((at - a.lookups[k]) * 1000 + 0.5);
+				a.lookups[k] = null;
+				step(a, at, 'dns', p.server + ' answers ' + p.name + ': ' +
+					(p.rcode == 'NOERROR' ? p.records + (p.records == 1 ? ' record' : ' records') : p.rcode), p.rcode in ['NOERROR', 'NXDOMAIN'], { ms: ms });
+			}
+		}
+	} else if (p.kind == 'tcp') {
+		if (!a.address && p.own)
+			a.address = p.own;
+		let k = p.address + ' ' + p.port;
+		if (p.what == 'open') {
+			if (a.tcp.opened[k] == null && a.tcp.kept < CONNECTIONS) {
+				a.tcp.opened[k] = at;
+				a.tcp.kept++;
+				step(a, at, 'internet', 'opens a connection to ' + p.address + ' port ' + p.port, null);
+			}
+		} else if (a.tcp.opened[k] != null) {
+			let ms = int((at - a.tcp.opened[k]) * 1000 + 0.5);
+			a.tcp.opened[k] = null;
+			a.tcp.answered = true;
+			a.done.internet = true;
+			step(a, at, 'internet', p.address + ' answers', true, { ms: ms });
+		}
+	}
+	reached(a, at);
+}
+
+// offers_key says whether a (re)association request, f, offers a key from
+// before: its RSN element names a PMKID. at is where its elements begin.
+function offers_key(f, at) {
+	for (let i = at; i + 2 <= length(f);) {
+		let id = ord(f, i), l = ord(f, i + 1);
+		if (i + 2 + l > length(f))
+			return false;
+		if (id == 48) {
+			let b = substr(f, i + 2, l);
+			let n16 = (p) => p + 2 <= l ? ord(b, p) | (ord(b, p + 1) << 8) : 0;
+			// Its version and group cipher, the pairwise ciphers, the key
+			// managements and the capabilities; then the PMKIDs.
+			let p = 6;
+			p += 2 + 4 * n16(p);
+			p += 2 + 4 * n16(p);
+			p += 2;
+			return n16(p) > 0;
+		}
+		i += 2 + l;
+	}
+	return false;
+}
+
+// air_event reads one of hostapd's frames (0254), an entry of its rings as
+// capture.said has it, for the steps of a client's attempt it stands for:
+// { mac, events }, each event as log_event gives one of the line hostapd
+// says of it at debug, and marked air; null for a frame of no one client's
+// attempt. net is the network's { sae, eap }: whether it has WPA3, and
+// whether clients sign in by 802.1X. state is what was heard of each of
+// its clients that a later frame needs, by its MAC, kept by the caller.
+//
+// The AP's answers make the steps: its authentication's ok is that a
+// client is authenticated, and its association's that it is associated;
+// a refusal is a step that failed, and begins no attempt. Of WPA3, the
+// client's commit and its confirm. A reassociation, a key offered from
+// before (on WPA3, after plain authentication: a key this AP held), and
+// the AP asking a client it remembers for proof are said beside the
+// attempt. A key message, sent or come, as its number; one the client did
+// not acknowledge, and the AP's answer not acknowledged, are said. A
+// deauthentication or disassociation is the end, with its reason; the
+// AP's for a handshake that timed out is its giving the handshake up.
+function air_event(e, net, state) {
+	let f = e?.frame;
+	if (type(f) != 'string')
+		return null;
+	let sent = e.what != 'heard';
+	let out = (mac, list) => ({ mac: mac, events: map(list, x => ({ mac: mac, ok: null, ...x, air: true })) });
+	if (e.key) {
+		// The pairwise key's four messages: the AP's first and third,
+		// the client's second and fourth.
+		if (e.proto != 0x888e || length(f) < 7 || ord(f, 1) != 3 || !match(e.peer ?? '', /^[0-9a-f]{2}(:[0-9a-f]{2}){5}$/))
+			return null;
+		let info = (ord(f, 5) << 8) | ord(f, 6);
+		if (!(info & 0x08))
+			return null;
+		let n = (info & 0x80) ? ((info & 0x100) ? 3 : 1) : ((info & 0x200) ? 4 : 2);
+		if (sent != (n == 1 || n == 3))
+			return null;
+		if (e.what == 'status')
+			return e.acked || e.unasked ? null : out(e.peer, [{ stage: 'key', what: sprintf('message %d of 4 sent to it: not acknowledged', n) }]);
+		return out(e.peer, [n == 1 || n == 3
+			? { stage: 'key', k: 'm' + n, what: sprintf('message %d of 4 sent to it', n), sent: true }
+			: { stage: 'key', k: 'm' + n, what: sprintf('message %d of 4 came from it', n) }]);
+	}
+	if (length(f) < 24)
+		return null;
+	let who = sent ? 4 : 10, sub = (ord(f, 0) >> 4) & 15;
+	let u16 = at => length(f) >= at + 2 ? ord(f, at) | (ord(f, at + 1) << 8) : 0;
+	if (ord(f, who) & 1) {
+		// The AP's deauthentication or disassociation to every station:
+		// its network going down (0255), for the leavings that follow.
+		if (sent && e.what != 'status' && (sub == 10 || sub == 12))
+			return { mac: null, events: [], all: { frame: sub == 12 ? 'deauth' : 'disassoc', reason: u16(24) } };
+		return null;
+	}
+	let mac = mac_text(f, who);
+	let st = state[mac] ??= {};
+	st.at = time();
+	if (e.what == 'status') {
+		if (e.acked || e.unasked || !(sub in [1, 3, 11]))
+			return null;
+		return out(mac, [{ stage: sub == 11 ? 'auth' : 'assoc', what: "did not acknowledge the AP's answer", ok: false }]);
+	}
+	switch (sub) {
+	case 11: {
+		let alg = u16(24), seq = u16(26), status = u16(28);
+		if (!sent) {
+			if (alg == 3 && seq in [1, 2]) {
+				st.alg = 'sae';
+				return out(mac, [{ stage: 'auth', sae: seq == 1 ? 'commit' : 'confirm', alg: 'sae',
+					what: seq == 1 ? 'starts WPA3 authentication (SAE commit)' : 'sends its WPA3 confirm (SAE confirm)' }]);
+			}
+			if (alg == 0 || alg == 2)
+				st.alg = alg == 2 ? 'ft' : 'open';
+			return null;
+		}
+		// WPA3's own commit, and its asking for a token or saying how its
+		// commit is made, are not yet an answer.
+		if (alg == 3 && (status == 76 || status == 126 || (status == 0 && seq == 1)))
+			return null;
+		if (status != 0)
+			return out(mac, [{ stage: 'auth', ok: false, nobegin: true,
+				what: alg == 3 && status == 15 ? 'its WPA3 confirm did not check out: a wrong passphrase'
+					: sprintf('the AP refused its %sauthentication, status %d', alg == 3 ? 'WPA3 ' : '', status) }]);
+		if (alg == 3)
+			return out(mac, [{ stage: 'auth', what: 'authenticated', ok: true }]);
+		if (alg == 2)
+			return out(mac, [{ stage: 'auth', what: 'authenticated, by a fast transition from another AP (802.11r)', ok: true, alg: 'ft' }]);
+		return out(mac, [{ stage: 'auth', what: 'authenticated', ok: true, alg: 'open' }]);
+	}
+	case 0:
+	case 2:
+		if (sent)
+			return null;
+		st.key = offers_key(f, sub == 2 ? 34 : 28);
+		return sub == 2 ? out(mac, [{ stage: 'assoc', what: 'it asked as one already on the network (a reassociation)', re: true, aside: true }]) : null;
+	case 1:
+	case 3: {
+		if (!sent)
+			return null;
+		let status = u16(26), list = [];
+		// Put off a moment while the AP asks the client it remembers for
+		// proof (802.11w): no answer yet.
+		if (status == 30)
+			return out(mac, [{ stage: 'assoc', what: 'told to come back in a moment, as the AP asks for proof (status 30)', aside: true }]);
+		if (status != 0)
+			return out(mac, [{ stage: 'assoc', ok: false, nobegin: true, what: sprintf('the AP refused its association, status %d', status) }]);
+		if (st.saq && !st.proved)
+			push(list, { stage: 'assoc', what: 'no proof came, as from a client that had left: it is taken as new', aside: true, asking: true });
+		if (st.key && st.alg == 'open' && net?.sae && !net?.eap)
+			push(list, { stage: 'assoc', what: 'its key from its last time here is still held (PMKSA cache): no sign-in again', pmk: 'pmksa', aside: true });
+		push(list, { stage: 'assoc', what: 'associated', ok: true });
+		// A fast transition brings its keys with it, and no handshake follows.
+		if (st.alg == 'ft')
+			push(list, { stage: 'key', what: 'its keys came with the fast transition: no handshake', ok: true, on: true, alg: 'ft' });
+		delete state[mac];
+		return out(mac, list);
+	}
+	case 10:
+	case 12: {
+		let reason = u16(24), name = sub == 12 ? 'deauthentication' : 'disassociation';
+		let r = REASONS['' + reason], list = [];
+		if (sent && reason == 15)
+			push(list, { stage: 'key', what: 'gave up waiting for its answer', ok: false, gave: 0 });
+		push(list, { stage: 'end', end: true, what: sprintf('%s %s, reason %d%s', name, sent ? 'to it' : 'from it', reason, r ? ' (' + r + ')' : ''),
+			by: sent ? 'ap' : 'client', frame: sub == 12 ? 'deauth' : 'disassoc', reason: reason });
+		delete state[mac];
+		return out(mac, list);
+	}
+	case 13:
+		// SA Query (802.11w): the AP asking for proof, and the answer.
+		if (ord(f, 24) != 8 || length(f) < 26)
+			return null;
+		if (sent && ord(f, 25) == 0) {
+			st.saq = (st.saq ?? 0) + 1;
+			st.proved = false;
+			return out(mac, [{ stage: 'assoc', what: 'the AP still holds it as on, and asks the client it remembers to prove itself (SA Query)', saq: st.saq, aside: true }]);
+		}
+		if (!sent && ord(f, 25) == 1)
+			st.proved = true;
+		return null;
+	}
+	return null;
+}
+
+// due says whether an attempt is over: the client left; it was not let on,
+// and nothing more came for IDLE seconds, or LET_ON passed; or it was let
+// on and has been watched long enough.
+function due(a, at) {
+	if (a.ended != null)
+		return true;
+	// Let go of by hostapd, and nothing after: that was its end.
+	if (a.dropped != null && at - a.dropped > DROPPED)
+		return true;
+	if (a.on == null) {
+		// A sign-in may say nothing for longer than anything else does:
+		// given up sooner, a client that then gets on has an attempt that
+		// failed for its record.
+		let signing = a.done.assoc && !a.done.signin && length(filter(a.events, e => e.stage == 'signin')) > 0;
+		return at - a.last > (signing ? SIGNIN_IDLE : IDLE) || at - a.started > LET_ON;
+	}
+	if (a.online != null && at - a.online >= LINGER)
+		return true;
+	return at - a.on > WATCH;
+}
+
+// silent says whether an attempt got as far as its association and has had
+// nothing said of it since, but what is said beside one. Of such a client
+// hostapd is to be asked, before its record is made, whether it holds it as
+// let on: the daemon does, and puts the answer in held, on, off (there, and
+// not let on) or gone. See record.
+function silent(a) {
+	return a.on == null && a.ended == null && a.dropped == null && !a.failed && a.silent && a.assoc != null;
+}
+
+// record is the attempt as it is reported. Its outcome: online, an address
+// and an answer from beyond itself; connected, let on, with nothing more
+// seen of it, as a device that keeps its address and says little; failed,
+// with the stage it stopped at and why; left, gone of its own accord before
+// anything failed, wherever it had got to.
+function record(a, at) {
+	// Let go of by hostapd before it was let on, and nothing followed: it
+	// was disconnected, as hostapd said.
+	if (a.dropped != null && a.on == null && a.ended == null) {
+		a.ended = a.dropped;
+		a.left = 'disconnected';
+	}
+	// Associated, and nothing said after: it is on, where hostapd holds it
+	// so. A client that is to have keys has a handshake, which hostapd
+	// says completed, or gives up on, sending the client off, and of one
+	// that signs in it says the sign-in began: each at any level. Nothing
+	// at all is a client whose keys came with it, by a fast transition, to
+	// an AP that still held it as on, of which hostapd then says no more,
+	// having no change to report; where it logs at debug it says the fast
+	// transition, and the client is let on by that. It is also a client
+	// that went of itself before its keys, which hostapd says at debug
+	// alone: so hostapd is asked. One it no longer has went without a
+	// word; one it has and has not let on was never let on. Where it could
+	// not be asked, the client is taken to be on.
+	if (silent(a)) {
+		if (a.held == null || a.held == 'on') {
+			a.on = a.assoc;
+			a.how.on_ms = max(0, int((a.assoc - a.started) * 1000 + 0.5));
+		} else if (a.held == 'gone') {
+			a.ended = a.assoc;
+			a.left = 'gone, with nothing said of its going';
+		}
+	}
+	// Where no line said its authentication, its time to be let on is
+	// from its association, and less than it took: said, for whoever
+	// would compare it with one timed from the authentication.
+	if (a.on != null && !length(filter(a.events, e => e.stage == 'auth')))
+		a.how.began = 'assoc';
+	let outcome, stage = null, reason = '';
+	let furthest = null;
+	for (let s in STAGES)
+		if (a.done[s])
+			furthest = s;
+	// Where a client not let on stopped: the stage after the last it got
+	// through. A network that signs clients in has that between association
+	// and the keys.
+	let signin = length(filter(a.events, e => e.stage == 'signin')) > 0;
+	let stopped = a.done.assoc ? (signin && !a.done.signin ? 'signin' : 'key') : a.done.auth ? 'assoc' : 'auth';
+	let no_dhcp = a.dhcp.nak ? 'the DHCP server refused its request'
+		: a.dhcp.offer ? 'an address was offered, and its request for it was not answered'
+		: 'no answer to its ' + a.dhcp.asked + (a.dhcp.asked == 1 ? ' DHCP request' : ' DHCP requests');
+	let no_gateway = a.arp.asked + (a.arp.asked == a.router ? ', its gateway,' : '') + ' did not answer';
+	if (a.failed) {
+		outcome = 'failed';
+		stage = a.failed.stage;
+		reason = a.failed.why;
+	} else if (a.online != null) {
+		outcome = 'online';
+	} else if (a.ended != null) {
+		// It left before it was seen online. That is a failure only where it
+		// was refused, or had waited for an answer that never came; a client
+		// that goes of its own accord, as one that picks another AP, has
+		// failed nothing.
+		if (a.on != null && a.dhcp.asked > 0 && !a.dhcp.ack && (a.dhcp.nak || a.ended - a.dhcp.first >= GAVE_UP_DHCP)) {
+			outcome = 'failed';
+			stage = 'dhcp';
+			reason = no_dhcp + ', and it left';
+		} else if (a.on != null && a.address && a.arp.asked != null && !a.arp.answered && a.ended - a.arp.at >= GAVE_UP_GATEWAY) {
+			outcome = 'failed';
+			stage = 'gateway';
+			reason = no_gateway + ', and it left';
+		} else {
+			outcome = 'left';
+			if (a.on == null)
+				stage = stopped;
+			reason = a.on == null ? 'before it was let on: ' + (a.left ?? '') : a.left ?? '';
+		}
+	} else if (a.on == null) {
+		outcome = 'failed';
+		stage = stopped;
+		// WPA3 proves the passphrase before anything else: a confirm the
+		// AP did not take is a wrong one, and hostapd says no more of it.
+		reason = stopped == 'auth' && a.sae == 'confirm' ? 'its WPA3 confirm did not check out: a wrong passphrase' : 'it was never let on';
+	} else if (a.dhcp.asked > 0 && !a.dhcp.ack) {
+		outcome = 'failed';
+		stage = 'dhcp';
+		reason = no_dhcp;
+	} else if (a.address && a.arp.asked != null && !a.arp.answered) {
+		outcome = 'failed';
+		stage = 'gateway';
+		reason = no_gateway;
+	} else if (a.address && a.dns.asked > 0 && a.dns.answered == 0) {
+		outcome = 'failed';
+		stage = 'dns';
+		reason = 'no answer to its ' + a.dns.asked + (a.dns.asked == 1 ? ' DNS lookup' : ' DNS lookups');
+	} else {
+		outcome = 'connected';
+	}
+	// How long it took to come online is how long the network took to do
+	// its part (0322): let on, and given its address where it asked for one;
+	// one that kept its address is ready once let on. What answered it
+	// after, its gateway or a name or a server, says it is online, but not
+	// when: a device may say nothing for seconds once it has its address.
+	// The Garage Door Opener had its address 36 ms after authenticating and
+	// asked for its gateway at 7,963 ms, and IoT clients came online in
+	// "typically 4.8 s" by that, where the network had them on in 50
+	// (2026-11-05).
+	let end = outcome == 'online' ? max(a.ready ?? a.on, a.on ?? a.started) : a.online ?? a.ended ?? at;
+	let r = {
+		mac: a.mac, bss: a.bss, network: a.network, ssid: a.ssid, band: a.band,
+		started: a.wall, took_ms: max(0, int((end - a.started) * 1000 + 0.5)),
+		outcome: outcome, stage: stage ?? furthest ?? 'auth', reason: text(reason, 160),
+		// Which steps came from frames is the daemon's to know, and no more.
+		events: map(a.events, e => {
+			if (!e.air)
+				return e;
+			let c = { ...e };
+			delete c.air;
+			return c;
+		}),
+	};
+	if (a.more)
+		r.more = a.more;
+	for (let k in ['address', 'host', 'signal', 'probes'])
+		if (a[k] != null)
+			r[k] = a[k];
+	// How it came, where anything is known of it (0136).
+	if (length(a.how))
+		r.how = a.how;
+	return r;
+}
+
+// log_time is when the log took a line in, where the line says (logread
+// -t, "[seconds.ms]"), on the clocks the daemon keeps: at and wall_at are
+// when the line reached the daemon, by the steady clock in seconds and by
+// the calendar's in ms, and the answer is the same two for when it was
+// logged. Lines reach the daemon a few at a time, and the messages of a
+// handshake are milliseconds apart. A line that says no time, or one that
+// cannot be right, as where the clock was just set, has the times it came
+// at.
+function log_time(line, at, wall_at) {
+	let m = match(line ?? '', /^<[0-9]+>[^\[]{0,24}\[([0-9]{1,12})\.([0-9]{3})\] /);
+	if (!m)
+		return [at, wall_at];
+	let off = (+m[1] * 1000 + (+('1' + m[2]) - 1000)) - wall_at;
+	if (off <= -5000 || off >= 5000)
+		return [at, wall_at];
+	return [at + off / 1000.0, wall_at + off];
+}
+
+// moved is the news a client's coming or going is (0252), for aeolus-live
+// to send the manager at once: joined, let on to a network here, or left,
+// as hostapd let go of one it held as on. where is the network's
+// { network, ssid, band }, at when, by the calendar's clock in ms, and
+// signal how strongly the AP hears one that joined, where it is known.
+function moved(kind, mac, where, at, signal, why) {
+	if (!(kind in ['joined', 'left']) || !where?.band)
+		return null;
+	let n = { t: 'news', kind: kind, mac: mac, at: int(at), ssid: where.ssid ?? '', band: where.band };
+	if (where.network)
+		n.network = where.network;
+	if (kind == 'joined' && type(signal) == 'int')
+		n.signal = signal;
+	// Why it left (0255), as left_why has it: none of its fields is one of
+	// the news' own.
+	if (kind == 'left' && type(why) == 'object')
+		for (let k, v in why)
+			if (v != null && n[k] == null)
+				n[k] = v;
+	return n;
+}
+
+// LEFT_NEAR is how long before hostapd lets go of a client, in ms, a
+// frame is of its leaving (0255): hostapd lets go as it sends or hears one.
+const LEFT_NEAR = 5000;
+
+// left_why is why a client left (0255), for the news of its leaving, as
+// raw as it was known, for the manager to name: by whom, aeolus where one
+// of Aeolus's own daemons sent it off (aeolus, its word: sentoff), with
+// the frame and reason where one came; by the client or the AP, with the
+// frame and its reason; by the AP to every station (all), its network
+// going down; or by none, where no frame came near it. frame is the
+// client's latest leaving frame, { by, frame, reason, at }, down the
+// network's latest to every station, { frame, reason, at }, and at when
+// hostapd let go of it, each in ms by the calendar's clock.
+function left_why(frame, down, aeolus, at) {
+	let near = (x) => type(x?.at) in ['int', 'double'] && at - x.at >= -1000 && at - x.at <= LEFT_NEAR;
+	let f = near(frame) ? frame : null;
+	if (aeolus)
+		return { by: 'aeolus', aeolus: aeolus, frame: f?.frame, reason: f?.reason };
+	if (f)
+		return { by: f.by, frame: f.frame, reason: f.reason };
+	if (near(down))
+		return { by: 'ap', frame: down.frame, reason: down.reason, all: true };
+	return { by: 'none' };
+}
+
+export { STAGES, WATCH, assemble, capture, log_event, log_time, frame, begins, again, carried, cut, begin, on_log, on_frame, air_event, due, silent, record, moved, left_why };

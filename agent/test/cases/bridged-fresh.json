@@ -1,0 +1,94 @@
+{
+	"about": "The fresh-bridge case with a VNI carried into the AP's bridge (0335): adopted, br-lan is made to filter VLANs and the AP's interface moves to VLAN 1 of it (0152); aeolus_b9003 joins br-lan untagged in that VLAN, the uplink's untagged network, so the monitoring server is on the AP's own network.",
+	"current": "c360-fresh-current.json",
+	"facts": {
+		"uplink": "eth0",
+		"radios": {
+			"radio0": {
+				"htmodes": [
+					"HE20",
+					"HE40",
+					"HE80",
+					"HE160"
+				]
+			},
+			"radio1": {
+				"htmodes": [
+					"HE20",
+					"HE40"
+				]
+			},
+			"radio3": {
+				"htmodes": [
+					"HE20",
+					"HE40",
+					"HE80",
+					"HE160"
+				]
+			}
+		},
+		"management": "lan",
+		"vxlan": true,
+		"nft_bridge": true
+	},
+	"intent": {
+		"system": {
+			"country": "US",
+			"poll": 60
+		},
+		"rrm": {
+			"enabled": true
+		},
+		"radio": {
+			"2g": {
+				"enabled": true,
+				"channel": 6,
+				"width": 20
+			},
+			"5g": {
+				"enabled": true,
+				"channel": 36,
+				"width": 80
+			},
+			"6g": {
+				"enabled": true,
+				"channel": 37,
+				"width": 80
+			}
+		},
+		"network": {
+			"lab": {
+				"ssid": "Aeolus Lab",
+				"security": "wpa3-sae",
+				"passphrase": "fixture-passphrase-1",
+				"transport": {
+					"primary": {
+						"type": "vlan",
+						"vlan": 20
+					}
+				}
+			}
+		},
+		"concentrators": {
+			"helios": {
+				"address": "192.168.1.44",
+				"port": 4789,
+				"mtu": 1450,
+				"probe_interval": 30,
+				"bridged": {
+					"untagged": {
+						"vni": 9003
+					}
+				}
+			}
+		}
+	},
+	"kept": [
+		"wireless.radio2",
+		"wireless.default_radio2",
+		"aeolus.aeolus_rrm"
+	],
+	"gone": [
+		"wireless.aeolus_lab_radio2"
+	]
+}

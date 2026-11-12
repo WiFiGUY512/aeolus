@@ -1,0 +1,97 @@
+{
+	"about": "The primary channel (0243): a channel set is its block's primary at the radio's width. 5 GHz set to 153 at 40 MHz runs on 149, its block's lowest, and 6 GHz set to 21 at 160 MHz on 5, its block's second, a preferred scanning channel. Every 5 GHz radio has hostapd's overlap scan off (noscan), so it keeps the primary it is given.",
+	"current": "c360-current.json",
+	"facts": {
+		"uplink": "eth0",
+		"radios": {
+			"radio0": {
+				"htmodes": [
+					"HE20",
+					"HE40",
+					"HE80",
+					"HE160"
+				]
+			},
+			"radio1": {
+				"htmodes": [
+					"HE20",
+					"HE40"
+				]
+			},
+			"radio3": {
+				"htmodes": [
+					"HE20",
+					"HE40",
+					"HE80",
+					"HE160"
+				]
+			}
+		}
+	},
+	"intent": {
+		"system": {
+			"country": "US",
+			"poll": 60
+		},
+		"network": {
+			"home": {
+				"ssid": "Home",
+				"security": "wpa2-psk",
+				"passphrase": "fixture-passphrase-1",
+				"transport": {
+					"primary": {
+						"type": "vlan",
+						"vlan": 20
+					}
+				}
+			},
+			"mixed": {
+				"ssid": "Mixed",
+				"security": "wpa2-wpa3",
+				"passphrase": "fixture-passphrase-2",
+				"transport": {
+					"primary": {
+						"type": "vlan",
+						"vlan": 20
+					}
+				}
+			},
+			"guest": {
+				"ssid": "Guest",
+				"security": "owe",
+				"transport": {
+					"primary": {
+						"type": "vlan",
+						"vlan": 20
+					}
+				}
+			},
+			"cafe": {
+				"ssid": "Cafe",
+				"security": "open",
+				"transport": {
+					"primary": {
+						"type": "vlan",
+						"vlan": 20
+					}
+				}
+			}
+		},
+		"radio": {
+			"5g": {
+				"channel": 153,
+				"width": 40
+			},
+			"6g": {
+				"channel": 21,
+				"width": 160
+			}
+		}
+	},
+	"errors": [],
+	"kept": [
+		"wireless.radio2",
+		"wireless.default_radio2"
+	],
+	"gone": []
+}
